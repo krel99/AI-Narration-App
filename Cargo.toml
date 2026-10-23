@@ -1,0 +1,31 @@
+[package]
+name = "narration-studio"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Native Linux desktop app that turns long prose into multi-voice narration via ElevenLabs, with per-segment review."
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+directories = "6.0.0"
+eframe = "0.37"
+env_logger = "0.11.11"
+hex = "0.4.3"
+hound = "3.5"
+log = "0.4.34"
+rand = "0.10.3"
+reqwest = { version = "0.13", features = ["json"] }
+rfd = "0.17.2"
+rodio = { version = "0.23", default-features = false, features = ["playback", "mp3"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.dev.package."*"]
+opt-level = 2
