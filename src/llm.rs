@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::lang::Language;
-use crate::model::{Character, NARRATOR, SegmentKind, SegmentationSettings};
+use crate::model::{AudioTagSettings, Character, NARRATOR, SegmentKind, SegmentationSettings};
 use crate::segment::ProposedSegment;
 
 pub const API_URL: &str = "https://api.anthropic.com/v1/messages";
@@ -263,23 +263,25 @@ impl ClaudeClient {
         }
     }
 
-    pub async fn attribute(
+    /// One Messages API call with a JSON-schema-constrained answer.
+    /// Returns the answer text and (input, output) token counts.
+    async fn call(
         &self,
         settings: &SegmentationSettings,
-        lang: &Language,
-        registry: &[Character],
-        paragraphs: &[PromptParagraph],
-    ) -> Result<Attribution, LlmError> {
+        system: &str,
+        user: String,
+        schema: Value,
+    ) -> Result<(String, u64, u64), LlmError> {
         let body = json!({
             "model": settings.model,
             "max_tokens": 32000,
             "fallbacks": "default",
             "output_config": {
                 "effort": settings.effort,
-                "format": {"type": "json_schema", "schema": output_schema()}
+                "format": {"type": "json_schema", "schema": schema}
             },
-            "system": SYSTEM_PROMPT,
-            "messages": [{"role": "user", "content": build_user_prompt(lang, registry, paragraphs)}]
+            "system": system,
+            "messages": [{"role": "user", "content": user}]
         });
         let resp = self
             .http
@@ -333,14 +335,185 @@ impl ClaudeClient {
             .filter(|b| b["type"] == "text")
             .filter_map(|b| b["text"].as_str())
             .collect();
+        Ok((
+            out,
+            v["usage"]["input_tokens"].as_u64().unwrap_or(0),
+            v["usage"]["output_tokens"].as_u64().unwrap_or(0),
+        ))
+    }
+
+    pub async fn attribute(
+        &self,
+        settings: &SegmentationSettings,
+        lang: &Language,
+        registry: &[Character],
+        paragraphs: &[PromptParagraph],
+    ) -> Result<Attribution, LlmError> {
+        let user = build_user_prompt(lang, registry, paragraphs);
+        let (out, input_tokens, output_tokens) = self
+            .call(settings, SYSTEM_PROMPT, user, output_schema())
+            .await?;
         let (paragraphs, characters) = parse_output(&out).map_err(LlmError::Transient)?;
         Ok(Attribution {
             paragraphs,
             characters,
-            input_tokens: v["usage"]["input_tokens"].as_u64().unwrap_or(0),
-            output_tokens: v["usage"]["output_tokens"].as_u64().unwrap_or(0),
+            input_tokens,
+            output_tokens,
         })
     }
+
+    /// Ask for audio tags on `segments`. Returns segment id → tagged text, for
+    /// the segments the model chose to tag.
+    pub async fn direct(
+        &self,
+        settings: &SegmentationSettings,
+        tags: &AudioTagSettings,
+        lang: &Language,
+        context: &[String],
+        segments: &[DirectionSegment],
+    ) -> Result<Direction, LlmError> {
+        let user = build_direction_prompt(lang, tags, context, segments);
+        let (out, input_tokens, output_tokens) = self
+            .call(settings, DIRECTION_PROMPT, user, direction_schema())
+            .await?;
+        let performances = parse_direction(&out).map_err(LlmError::Transient)?;
+        Ok(Direction {
+            performances,
+            input_tokens,
+            output_tokens,
+        })
+    }
+}
+
+/// A segment offered to the direction pass.
+#[derive(Debug, Clone)]
+pub struct DirectionSegment {
+    pub id: i64,
+    pub paragraph: usize,
+    pub kind: SegmentKind,
+    pub speaker: String,
+    pub text: String,
+}
+
+#[derive(Debug, Default)]
+pub struct Direction {
+    pub performances: BTreeMap<i64, String>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+const DIRECTION_PROMPT: &str = "You direct the voice performance of an audiobook read by ElevenLabs \
+text-to-speech (Eleven v3/v4). You do this by inserting audio tags: short cues in square brackets that \
+the voice performs instead of reading aloud.
+
+Useful tags (you may also combine qualities, e.g. [whispering, fearful]):
+- emotion and attitude: [thoughtful], [sad], [angry], [excited], [nervous], [curious], [sarcastic], \
+[resigned], [serious], [warmly], [coldly], [cheerfully], [tense]
+- voice: [whispers], [softly], [quietly], [shouting], [loudly]
+- pacing: [short pause], [pause], [long pause], [slowly], [rushed]
+- reactions: [sighs], [laughs], [chuckles], [gasps], [clears throat], [exhales], [gulps]
+
+Rules:
+- Only insert tags. Every word, punctuation mark and quote character of the segment must stay exactly as \
+given and in order. Never add, remove, translate or correct anything.
+- A tag shapes the text after it, so put it before the words it applies to. Never end a segment with a tag.
+- Tag narration as well as dialogue: narration tags shape the narrator's pacing and mood (a [long pause] \
+before a dramatic beat, [thoughtful] before reflection); dialogue tags shape the character's delivery.
+- Only voice performance: no sound effects, music or stage directions.
+- Fit the tags to the scene and the requested density, and vary them; a repeated tag loses its effect.
+- Return only the segments you add at least one tag to, with the full segment text including your tags.";
+
+fn direction_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["segments"],
+        "properties": {
+            "segments": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["id", "performance"],
+                    "properties": {
+                        "id": {"type": "integer"},
+                        "performance": {"type": "string"}
+                    }
+                }
+            }
+        }
+    })
+}
+
+fn density_hint(density: &str) -> &'static str {
+    match density {
+        "light" => {
+            "light: only where the text clearly calls for it (a whisper, a shout, a dramatic pause); most segments get no tag"
+        }
+        "rich" => {
+            "rich: an expressive performance, with cues on most dialogue and pacing pauses in the narration"
+        }
+        _ => {
+            "moderate: mark emotional shifts and dramatic beats, roughly one tag every few sentences"
+        }
+    }
+}
+
+pub fn build_direction_prompt(
+    lang: &Language,
+    tags: &AudioTagSettings,
+    context: &[String],
+    segments: &[DirectionSegment],
+) -> String {
+    let mut s = format!(
+        "Language: {} ({}). Write tags in English.\nDensity: {}.\n",
+        lang.name,
+        lang.code,
+        density_hint(&tags.density)
+    );
+    if !tags.direction.trim().is_empty() {
+        s.push_str(&format!("Director's notes: {}\n", tags.direction.trim()));
+    }
+    if !context.is_empty() {
+        s.push_str("\nPreceding text, for context only:\n");
+        for c in context {
+            s.push_str(c);
+            s.push_str("\n\n");
+        }
+    }
+    s.push_str("\nSegments (id | paragraph | speaker):\n");
+    for seg in segments {
+        let who = match seg.kind {
+            SegmentKind::Narration => seg.speaker.clone(),
+            SegmentKind::Dialogue => format!("{}, dialogue", seg.speaker),
+        };
+        s.push_str(&format!(
+            "[S{} | P{} | {}] {}\n",
+            seg.id, seg.paragraph, who, seg.text
+        ));
+    }
+    s
+}
+
+#[derive(Deserialize)]
+struct RawPerformance {
+    id: i64,
+    performance: String,
+}
+
+#[derive(Deserialize)]
+struct RawDirection {
+    segments: Vec<RawPerformance>,
+}
+
+pub fn parse_direction(text: &str) -> Result<BTreeMap<i64, String>, String> {
+    let raw: RawDirection =
+        serde_json::from_str(text.trim()).map_err(|e| format!("invalid JSON: {e}"))?;
+    Ok(raw
+        .segments
+        .into_iter()
+        .map(|p| (p.id, p.performance))
+        .collect())
 }
 
 #[cfg(test)]
@@ -368,6 +541,30 @@ mod tests {
         assert_eq!(chars[0].aliases, vec!["the old man"]);
         assert!(parse_output("{\"segments\":[{\"paragraph\":0,\"kind\":\"dialogue\",\"speaker\":\"a\",\"text\":\"b\"}]}").is_err());
         assert!(parse_output("not json").is_err());
+    }
+
+    #[test]
+    fn direction_prompt_and_output() {
+        let segs = vec![DirectionSegment {
+            id: 42,
+            paragraph: 3,
+            kind: SegmentKind::Dialogue,
+            speaker: "vale".into(),
+            text: "\"Hold position.\"".into(),
+        }];
+        let tags = AudioTagSettings {
+            direction: "Military sci-fi; the narrator stays calm.".into(),
+            ..Default::default()
+        };
+        let p = build_direction_prompt(by_code("en"), &tags, &["Earlier.".into()], &segs);
+        assert!(p.contains("[S42 | P3 | vale, dialogue] \"Hold position.\""));
+        assert!(p.contains("Director's notes: Military sci-fi"));
+        assert!(p.contains("Density: moderate"));
+        let out = parse_direction(
+            r#"{"segments":[{"id":42,"performance":"\"[tense] Hold position.\""}]}"#,
+        )
+        .unwrap();
+        assert_eq!(out[&42], "\"[tense] Hold position.\"");
     }
 
     #[test]

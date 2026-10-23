@@ -47,71 +47,73 @@ pub const LANGUAGES: &[Language] = &[
         code: "en",
         name: "English",
         quotes: &[q('“', '”'), STRAIGHT],
-        default_tts_model: "eleven_multilingual_v2",
+        default_tts_model: "eleven_v4",
     },
     Language {
         code: "cs",
         name: "Czech",
         quotes: &[q('„', '“'), q('»', '«'), STRAIGHT],
-        default_tts_model: "eleven_multilingual_v2",
+        default_tts_model: "eleven_v4",
     },
     Language {
         code: "sk",
         name: "Slovak",
         quotes: &[q('„', '“'), q('»', '«'), STRAIGHT],
-        default_tts_model: "eleven_multilingual_v2",
+        default_tts_model: "eleven_v4",
     },
     Language {
         code: "de",
         name: "German",
         quotes: &[q('„', '“'), q('»', '«'), STRAIGHT],
-        default_tts_model: "eleven_multilingual_v2",
+        default_tts_model: "eleven_v4",
     },
     Language {
         code: "pl",
         name: "Polish",
         quotes: &[q('„', '”'), q('«', '»'), STRAIGHT],
-        default_tts_model: "eleven_multilingual_v2",
+        default_tts_model: "eleven_v4",
     },
     Language {
         code: "fr",
         name: "French",
         quotes: &[q('«', '»'), q('“', '”'), STRAIGHT],
-        default_tts_model: "eleven_multilingual_v2",
+        default_tts_model: "eleven_v4",
     },
     Language {
         code: "it",
         name: "Italian",
         quotes: &[q('«', '»'), q('“', '”'), STRAIGHT],
-        default_tts_model: "eleven_multilingual_v2",
+        default_tts_model: "eleven_v4",
     },
     Language {
         code: "es",
         name: "Spanish",
         quotes: &[q('«', '»'), q('“', '”'), STRAIGHT],
-        default_tts_model: "eleven_multilingual_v2",
+        default_tts_model: "eleven_v4",
     },
     Language {
         code: "ru",
         name: "Russian",
         quotes: &[q('«', '»'), q('„', '“'), STRAIGHT],
-        default_tts_model: "eleven_multilingual_v2",
+        default_tts_model: "eleven_v4",
     },
     Language {
         code: "nl",
         name: "Dutch",
         quotes: &[q('“', '”'), q('„', '”'), STRAIGHT],
-        default_tts_model: "eleven_multilingual_v2",
+        default_tts_model: "eleven_v4",
     },
 ];
 
 /// TTS models offered in project settings.
 pub const TTS_MODELS: &[(&str, &str)] = &[
+    ("eleven_v4", "Eleven v4 (most expressive, audio tags)"),
+    ("eleven_v4_turbo", "Eleven v4 Turbo (faster, audio tags)"),
+    ("eleven_v3", "Eleven v3 (audio tags)"),
     (
         "eleven_multilingual_v2",
-        "Multilingual v2 (stable, supports request stitching)",
+        "Multilingual v2 (stable, no audio tags)",
     ),
-    ("eleven_v3", "Eleven v3 (most expressive)"),
     ("eleven_turbo_v2_5", "Turbo v2.5"),
     ("eleven_flash_v2_5", "Flash v2.5"),
 ];
@@ -137,7 +139,12 @@ pub fn by_code(code: &str) -> &'static Language {
 
 /// Whether the model accepts `language_code` to force the language.
 pub fn model_accepts_language_code(model: &str) -> bool {
-    model.contains("v2_5") || model.contains("v3")
+    model.contains("v2_5") || model.contains("v3") || model.contains("v4")
+}
+
+/// Whether the model performs audio tags like `[whispers]` instead of reading them.
+pub fn model_supports_tags(model: &str) -> bool {
+    model.starts_with("eleven_v3") || model.starts_with("eleven_v4")
 }
 
 #[cfg(test)]
@@ -148,6 +155,15 @@ mod tests {
     fn unknown_code_falls_back_to_english() {
         assert_eq!(by_code("xx").code, "en");
         assert_eq!(by_code("cs").name, "Czech");
+    }
+
+    #[test]
+    fn tag_capable_models() {
+        assert!(model_supports_tags("eleven_v4"));
+        assert!(model_supports_tags("eleven_v4_turbo"));
+        assert!(model_supports_tags("eleven_v3"));
+        assert!(!model_supports_tags("eleven_multilingual_v2"));
+        assert!(!model_supports_tags("eleven_flash_v2_5"));
     }
 
     #[test]

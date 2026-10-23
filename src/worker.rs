@@ -21,6 +21,7 @@ use crate::lang;
 use crate::llm::{self, ClaudeClient, LlmError, PromptParagraph};
 use crate::model::*;
 use crate::segment::{self, DraftSegment, UNKNOWN_SPEAKER};
+use crate::tags;
 use crate::tts::{ElevenLabsClient, TtsError, TtsRequest, VoiceInfo};
 
 /// Seed of a segment's first take. Fixed, so identical lines with the same
@@ -38,6 +39,11 @@ pub enum Command {
     /// Attribute every paragraph of the chapter whose segments are all still
     /// untouched drafts (or that has none yet).
     SegmentChapter {
+        chapter_id: Id,
+    },
+    /// Ask Claude for audio tags on the chapter's draft segments (replacing
+    /// earlier tags on those drafts).
+    DirectChapter {
         chapter_id: Id,
     },
     /// Generate audio. `reroll` forces a new random seed.
@@ -100,6 +106,18 @@ pub enum Event {
         duration_ms: u64,
     },
     Voices(Vec<VoiceInfo>),
+    DirectionProgress {
+        chapter_id: Id,
+        done: usize,
+        total: usize,
+    },
+    DirectionFinished {
+        chapter_id: Id,
+        tagged: usize,
+        rejected: usize,
+        input_tokens: u64,
+        output_tokens: u64,
+    },
 }
 
 pub struct WorkerHandle {
@@ -225,7 +243,16 @@ pub fn spawn(
 
 async fn run(ctx: &Ctx, cmd: Command) -> Result<()> {
     match cmd {
-        Command::SegmentChapter { chapter_id } => segment_chapter(ctx, chapter_id).await,
+        Command::SegmentChapter { chapter_id } => {
+            segment_chapter(ctx, chapter_id).await?;
+            let project = ctx.db(|db| db.project(db.chapter(chapter_id)?.project_id))?;
+            if project.settings.audio_tags.enabled && lang::model_supports_tags(&project.tts_model)
+            {
+                direct_chapter(ctx, chapter_id, true).await?;
+            }
+            Ok(())
+        }
+        Command::DirectChapter { chapter_id } => direct_chapter(ctx, chapter_id, false).await,
         Command::Generate {
             segment_ids,
             reroll,
@@ -557,6 +584,167 @@ async fn segment_chapter(ctx: &Ctx, chapter_id: Id) -> Result<()> {
     Ok(())
 }
 
+// ---- audio tags -----------------------------------------------------------
+
+/// Insert audio tags into the chapter's draft segments. With `untagged_only`
+/// (the automatic run after segmentation) segments that already carry tags
+/// are left alone; otherwise their tags are replaced.
+async fn direct_chapter(ctx: &Ctx, chapter_id: Id, untagged_only: bool) -> Result<()> {
+    let started = ctx.epoch.load(Ordering::SeqCst);
+    let key = ctx
+        .keys
+        .read()
+        .map(|k| k.anthropic.clone())
+        .unwrap_or_default();
+    if key.is_empty() {
+        return Err(anyhow!(
+            "set the Anthropic API key in Settings to add audio tags"
+        ));
+    }
+    let (project, paragraphs, segments) = ctx.db(|db| {
+        let chapter = db.chapter(chapter_id)?;
+        Ok((
+            db.project(chapter.project_id)?,
+            db.paragraphs(chapter_id)?,
+            db.chapter_segments(chapter_id)?,
+        ))
+    })?;
+    let lang = lang::by_code(&project.language);
+    let settings = project.settings.segmentation.clone();
+    let para_index: HashMap<Id, usize> = paragraphs
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.id, i))
+        .collect();
+    // Only drafts without audio: tagging changes what is spoken.
+    let targets: Vec<&Segment> = segments
+        .iter()
+        .filter(|s| s.status == SegmentStatus::Draft && s.current_take_id.is_none())
+        .filter(|s| !(untagged_only && s.performance.is_some()))
+        .collect();
+    let total = targets.len();
+    let claude = ClaudeClient::new(ctx.http.clone(), key, &ctx.endpoints.anthropic);
+    let chunk = settings.chunk_paragraphs.max(1);
+
+    // Work queue of paragraph windows; a too-long answer splits its window.
+    let mut windows: Vec<(usize, usize)> = (0..paragraphs.len())
+        .step_by(chunk)
+        .map(|lo| (lo, (lo + chunk).min(paragraphs.len())))
+        .rev()
+        .collect();
+    let (mut done, mut tagged, mut rejected) = (0usize, 0usize, 0usize);
+    let (mut input_tokens, mut output_tokens) = (0u64, 0u64);
+    ctx.out.emit(Event::DirectionProgress {
+        chapter_id,
+        done,
+        total,
+    });
+    while let Some((lo, hi)) = windows.pop() {
+        if ctx.cancelled(started) {
+            break;
+        }
+        let batch: Vec<&Segment> = targets
+            .iter()
+            .copied()
+            .filter(|s| {
+                para_index
+                    .get(&s.paragraph_id)
+                    .is_some_and(|&p| p >= lo && p < hi)
+            })
+            .collect();
+        if batch.is_empty() {
+            continue;
+        }
+        let context: Vec<String> = paragraphs[lo.saturating_sub(settings.overlap_paragraphs)..lo]
+            .iter()
+            .map(|p| p.text.clone())
+            .collect();
+        let offered: Vec<llm::DirectionSegment> = batch
+            .iter()
+            .map(|s| llm::DirectionSegment {
+                id: s.id,
+                paragraph: para_index[&s.paragraph_id] + 1,
+                kind: s.kind,
+                speaker: s.speaker.clone(),
+                text: s.text.clone(),
+            })
+            .collect();
+        let mut attempt = 0;
+        let result = loop {
+            match claude
+                .direct(
+                    &settings,
+                    &project.settings.audio_tags,
+                    lang,
+                    &context,
+                    &offered,
+                )
+                .await
+            {
+                Err(LlmError::Transient(e)) if attempt < settings.max_retries => {
+                    log::warn!("Claude: {e}");
+                    tokio::time::sleep(backoff(attempt)).await;
+                    attempt += 1;
+                }
+                other => break other,
+            }
+        };
+        match result {
+            Ok(direction) => {
+                input_tokens += direction.input_tokens;
+                output_tokens += direction.output_tokens;
+                ctx.db(|db| {
+                    for s in &batch {
+                        let new = match direction.performances.get(&s.id) {
+                            Some(perf) => match tags::validate(&s.text, perf) {
+                                Ok(p) => p,
+                                Err(why) => {
+                                    log::warn!("segment {}: tags rejected: {why}", s.id);
+                                    rejected += 1;
+                                    continue;
+                                }
+                            },
+                            None => None,
+                        };
+                        tagged += new.is_some() as usize;
+                        db.set_segment_performance(s.id, new.as_deref())?;
+                    }
+                    Ok(())
+                })?;
+                done += batch.len();
+            }
+            Err(LlmError::TooLong) if hi - lo > 1 => {
+                let mid = lo + (hi - lo) / 2;
+                windows.push((mid, hi));
+                windows.push((lo, mid));
+                continue;
+            }
+            Err(e) => {
+                ctx.out.emit(Event::Error(format!(
+                    "Audio tags for P{}–P{}: {e}",
+                    lo + 1,
+                    hi
+                )));
+                break;
+            }
+        }
+        ctx.out.emit(Event::DirectionProgress {
+            chapter_id,
+            done,
+            total,
+        });
+        ctx.out.emit(Event::SegmentsChanged { chapter_id });
+    }
+    ctx.out.emit(Event::DirectionFinished {
+        chapter_id,
+        tagged,
+        rejected,
+        input_tokens,
+        output_tokens,
+    });
+    Ok(())
+}
+
 // ---- generation ---------------------------------------------------------
 
 struct Job {
@@ -750,8 +938,9 @@ async fn generate_one(
             }
         }
     };
+    let spoken = seg.spoken_text(&project.tts_model).to_string();
     let hash = take_hash(
-        &seg.text,
+        &spoken,
         &voice_id,
         &settings,
         &project.tts_model,
@@ -786,7 +975,7 @@ async fn generate_one(
     let mut req = TtsRequest {
         voice_id,
         output_format: format.clone(),
-        text: seg.text.clone(),
+        text: spoken.clone(),
         model_id: project.tts_model.clone(),
         voice_settings: settings,
         seed,
@@ -837,9 +1026,7 @@ async fn generate_one(
     };
     let path = abs_path.clone();
     tokio::task::spawn_blocking(move || audio::write_wav(&path, &pcm)).await??;
-    let credits = resp
-        .character_cost
-        .unwrap_or(seg.text.chars().count() as i64);
+    let credits = resp.character_cost.unwrap_or(spoken.chars().count() as i64);
     ctx.db(|db| {
         let take_id = db.insert_take(&NewTake {
             segment_id: seg.id,
@@ -1202,6 +1389,138 @@ mod tests {
         assert_eq!(
             ctx.db(|db| db.chapter(cid)).unwrap().status,
             ChapterStatus::Segmented
+        );
+    }
+
+    const VALE: &str = "\"Hold position,\" said Lieutenant Vale. Commander Voss looked at the countdown. Three minutes.\n\n***\n\nIt would not.";
+
+    #[test]
+    fn audio_tags_are_validated_and_spoken() {
+        let (claude, claude_reqs) = serve(|_, _, body| {
+            let v: serde_json::Value = serde_json::from_str(body).unwrap();
+            let prompt = v["messages"][0]["content"].as_str().unwrap();
+            assert!(v["system"].as_str().unwrap().contains("audio tags"));
+            assert!(prompt.contains("Density: rich"));
+            assert!(prompt.contains("Director's notes: Keep Voss calm."));
+            let id = |text: &str| -> i64 {
+                let line = prompt.lines().find(|l| l.ends_with(text)).unwrap();
+                line[2..line.find(' ').unwrap()].parse().unwrap()
+            };
+            claude_reply(serde_json::json!({"segments": [
+                {"id": id("\"Hold position,\""), "performance": "\"[tense] Hold position,\""},
+                {"id": id("Three minutes."), "performance": "said Lieutenant Vale. [thoughtful] Commander Voss looked at the countdown. [long pause] Three minutes."},
+                // Rewrites a word: must be rejected.
+                {"id": id("It would not."), "performance": "[short pause] It did not."}
+            ]}))
+        });
+        let (eleven, eleven_reqs) = serve(|n, _, _| {
+            (
+                200,
+                vec![("request-id".into(), format!("r{n}"))],
+                vec![0u8; 480],
+            )
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let lib = Library::new(dir.path().to_path_buf());
+        let (ctx, events) = test_ctx(&lib, &claude, &eleven);
+        let cid = ctx
+            .db(|db| {
+                let pid = db.create_project("Book", "en")?;
+                let mut p = db.project(pid)?;
+                p.voice_map.insert(NARRATOR.into(), "vn".into());
+                p.voice_map.insert("vale".into(), "vv".into());
+                p.settings.audio_tags.density = "rich".into();
+                p.settings.audio_tags.direction = "Keep Voss calm.".into();
+                db.update_project(&p)?;
+                let cid = db.import_chapter(pid, "One", VALE)?;
+                for par in db.paragraphs(cid)? {
+                    let segs = segment::parse_paragraph(&par.text, lang::by_code("en"));
+                    store_segments(db, &par, &segs)?;
+                }
+                for s in db.chapter_segments(cid)? {
+                    if s.kind == SegmentKind::Dialogue {
+                        db.set_segment_speaker(s.id, "vale")?;
+                    }
+                }
+                Ok(cid)
+            })
+            .unwrap();
+
+        rt().block_on(direct_chapter(&ctx, cid, false)).unwrap();
+        assert_eq!(claude_reqs.lock().unwrap().len(), 1);
+        let segs = ctx.db(|db| db.chapter_segments(cid)).unwrap();
+        let perf: Vec<Option<&str>> = segs.iter().map(|s| s.performance.as_deref()).collect();
+        assert_eq!(
+            perf,
+            vec![
+                Some("\"[tense] Hold position,\""),
+                Some(
+                    "said Lieutenant Vale. [thoughtful] Commander Voss looked at the countdown. [long pause] Three minutes."
+                ),
+                None,
+            ]
+        );
+        let finished = events.try_iter().find_map(|e| match e {
+            Event::DirectionFinished {
+                tagged, rejected, ..
+            } => Some((tagged, rejected)),
+            _ => None,
+        });
+        assert_eq!(finished, Some((2, 1)));
+
+        // A tag-capable model receives the tagged text; the hash follows it.
+        let ids: Vec<Id> = segs.iter().map(|s| s.id).collect();
+        rt().block_on(generate(&ctx, ids, false)).unwrap();
+        let sent: Vec<String> = eleven_reqs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, b)| {
+                serde_json::from_str::<serde_json::Value>(b).unwrap()["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert!(sent.contains(&"\"[tense] Hold position,\"".to_string()));
+        assert!(sent.contains(&"It would not.".to_string()));
+        let narr: serde_json::Value = eleven_reqs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, b)| serde_json::from_str::<serde_json::Value>(b).unwrap())
+            .find(|v| {
+                v["text"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("said Lieutenant Vale.")
+            })
+            .unwrap();
+        assert!(
+            narr["text"]
+                .as_str()
+                .unwrap()
+                .contains("[long pause] Three minutes.")
+        );
+        assert_eq!(
+            narr["previous_text"], "\"Hold position,\"",
+            "context stays plain text"
+        );
+
+        // Automatic runs leave already-tagged drafts alone.
+        let before = claude_reqs.lock().unwrap().len();
+        ctx.db(|db| {
+            for s in db.chapter_segments(cid)? {
+                db.set_segment_performance(s.id, Some(&format!("[softly] {}", s.text)))?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        rt().block_on(direct_chapter(&ctx, cid, true)).unwrap();
+        assert_eq!(
+            claude_reqs.lock().unwrap().len(),
+            before,
+            "nothing left to tag"
         );
     }
 

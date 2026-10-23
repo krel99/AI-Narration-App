@@ -1,10 +1,11 @@
-//! The egui UI: project/chapter sidebar, the keyboard-first review list, the
-//! segment detail panel and the settings windows.
+//! The egui UI. One chapter is worked on at a time, in two tabs: Text (the
+//! chapter as plain prose) and Review (the keyboard-first segment list with
+//! its detail panel).
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use eframe::egui::{self, Color32, Key, RichText, Sense, UiBuilder, Vec2};
+use eframe::egui::{self, Color32, Key, RichText, Sense, Stroke, UiBuilder, Vec2};
 
 use crate::audio;
 use crate::config::AppConfig;
@@ -14,10 +15,18 @@ use crate::lang;
 use crate::model::*;
 use crate::player::Player;
 use crate::segment::{self, UNKNOWN_SPEAKER};
+use crate::tags;
+use crate::theme::{self, Palette, primary_button, speaker_color};
 use crate::tts::VoiceInfo;
 use crate::worker::{self, Command, Event, WorkerHandle};
 
-const ROW_H: f32 = 44.0;
+const ROW_H: f32 = 46.0;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Text,
+    Review,
+}
 
 #[derive(Default)]
 struct ChapterView {
@@ -55,6 +64,31 @@ impl ChapterView {
             + 1;
         start..end
     }
+
+    fn has_audio(&self) -> bool {
+        !self.take_counts.is_empty()
+    }
+}
+
+/// The Text tab's editable copy of the chapter.
+#[derive(Default)]
+struct TextDraft {
+    /// `None` while writing a new chapter that has not been saved yet.
+    chapter_id: Option<Id>,
+    title: String,
+    text: String,
+    saved_title: String,
+    saved_text: String,
+}
+
+impl TextDraft {
+    fn text_dirty(&self) -> bool {
+        self.text != self.saved_text
+    }
+
+    fn dirty(&self) -> bool {
+        self.text_dirty() || self.title != self.saved_title
+    }
 }
 
 struct GeneratePlan {
@@ -84,7 +118,6 @@ struct VoiceEditor {
 #[derive(Default)]
 struct Dialogs {
     new_project: Option<(String, String)>,
-    paste: Option<(String, String)>,
     settings: Option<AppConfig>,
     project_settings: Option<Project>,
     voices: Option<VoiceEditor>,
@@ -92,9 +125,16 @@ struct Dialogs {
     generate: Option<GeneratePlan>,
     delete_chapter: Option<Id>,
     delete_project: Option<Id>,
-    rename_chapter: Option<(Id, String)>,
     resegment: Option<Id>,
+    resplit: bool,
     log: bool,
+}
+
+/// The audio-tag editor in the detail panel.
+struct TagEdit {
+    segment_id: Id,
+    text: String,
+    error: Option<String>,
 }
 
 pub struct App {
@@ -104,22 +144,26 @@ pub struct App {
     worker: WorkerHandle,
     player: Player,
 
+    tab: Tab,
     projects: Vec<Project>,
     project: Option<Project>,
     characters: Vec<Character>,
     chapters: Vec<Chapter>,
     stats: HashMap<Id, ChapterStats>,
     view: ChapterView,
+    draft: TextDraft,
     selected: Option<usize>,
     scroll_to_selected: bool,
     scroll_offset: f32,
     viewport_h: f32,
     takes: Vec<Take>,
     takes_for: Option<Id>,
+    tag_edit: Option<TagEdit>,
 
     in_flight: HashSet<Id>,
     failures: HashMap<Id, String>,
     segmenting: Option<(Id, usize, usize)>,
+    directing: Option<(Id, usize, usize)>,
     generating: Option<(usize, usize)>,
     exporting: bool,
     log: Vec<(bool, String)>,
@@ -129,28 +173,68 @@ pub struct App {
     dialogs: Dialogs,
 }
 
-fn speaker_color(key: &str) -> Color32 {
-    if key == NARRATOR {
-        return Color32::from_gray(150);
+fn status_icon(s: SegmentStatus, p: &Palette) -> (&'static str, Color32) {
+    match s {
+        SegmentStatus::Draft => ("○", p.draft),
+        SegmentStatus::Generated => ("●", p.generated),
+        SegmentStatus::Approved => ("✔", p.approved),
+        SegmentStatus::Rejected => ("✖", p.rejected),
     }
-    let h = key
-        .bytes()
-        .fold(7u32, |a, b| a.wrapping_mul(31).wrapping_add(b as u32));
-    egui::ecolor::Hsva::new((h % 360) as f32 / 360.0, 0.55, 0.85, 1.0).into()
 }
 
-fn status_icon(s: SegmentStatus) -> (&'static str, Color32) {
-    match s {
-        SegmentStatus::Draft => ("○", Color32::from_gray(140)),
-        SegmentStatus::Generated => ("●", Color32::from_rgb(90, 150, 230)),
-        SegmentStatus::Approved => ("✔", Color32::from_rgb(80, 190, 100)),
-        SegmentStatus::Rejected => ("✖", Color32::from_rgb(220, 80, 80)),
+/// Segment text as a layout job, with audio tags drawn as soft chips.
+fn tagged_job(
+    ui: &egui::Ui,
+    text: &str,
+    size: f32,
+    strong: bool,
+    italic: bool,
+) -> egui::text::LayoutJob {
+    let p = theme::palette(ui);
+    let base = if strong {
+        ui.visuals().strong_text_color()
+    } else {
+        ui.visuals().text_color()
+    };
+    let mut job = egui::text::LayoutJob::default();
+    for (is_tag, piece) in tags::pieces(text) {
+        let format = if is_tag {
+            egui::TextFormat {
+                font_id: egui::FontId::proportional(size - 1.5),
+                color: p.tag,
+                background: p.tag_bg,
+                italics: true,
+                ..Default::default()
+            }
+        } else {
+            egui::TextFormat {
+                font_id: egui::FontId::proportional(size),
+                color: base,
+                italics: italic,
+                ..Default::default()
+            }
+        };
+        job.append(piece, 0.0, format);
     }
+    job
+}
+
+/// A small rounded label with a coloured outline.
+fn chip(ui: &mut egui::Ui, text: impl Into<String>, color: Color32) -> egui::Response {
+    egui::Frame::new()
+        .stroke(Stroke::new(1.0, color.gamma_multiply(0.6)))
+        .corner_radius(10)
+        .inner_margin(egui::Margin::symmetric(8, 2))
+        .show(ui, |ui| {
+            ui.label(RichText::new(text.into()).color(color).small())
+        })
+        .response
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> anyhow::Result<Self> {
         let cfg = AppConfig::load();
+        theme::apply(&cc.egui_ctx, cfg.dark_mode);
         let lib = Library::new(cfg.library_dir());
         let db = lib.open()?;
         let ctx = cc.egui_ctx.clone();
@@ -161,21 +245,25 @@ impl App {
             db,
             worker,
             player: Player::new(),
+            tab: Tab::Text,
             projects: vec![],
             project: None,
             characters: vec![],
             chapters: vec![],
             stats: HashMap::new(),
             view: ChapterView::default(),
+            draft: TextDraft::default(),
             selected: None,
             scroll_to_selected: false,
             scroll_offset: 0.0,
             viewport_h: 400.0,
             takes: vec![],
             takes_for: None,
+            tag_edit: None,
             in_flight: HashSet::new(),
             failures: HashMap::new(),
             segmenting: None,
+            directing: None,
             generating: None,
             exporting: false,
             log: vec![],
@@ -227,6 +315,20 @@ impl App {
         }
     }
 
+    fn chapter_title(&self, id: Id) -> String {
+        self.chapters
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| c.title.clone())
+            .unwrap_or_default()
+    }
+
+    fn tags_active(&self) -> bool {
+        self.project
+            .as_ref()
+            .is_some_and(|p| lang::model_supports_tags(&p.tts_model))
+    }
+
     // ---- loading ----------------------------------------------------------
 
     fn reload_projects(&mut self) {
@@ -242,8 +344,9 @@ impl App {
         self.view = ChapterView::default();
         self.selected = None;
         self.reload_project_data();
-        if let Some(first) = self.chapters.first().map(|c| c.id) {
-            self.open_chapter(first);
+        match self.chapters.last().map(|c| c.id) {
+            Some(latest) => self.open_chapter(latest),
+            None => self.new_chapter(),
         }
     }
 
@@ -277,10 +380,37 @@ impl App {
         self.view.chapter_id = Some(chapter_id);
         self.selected = None;
         self.scroll_offset = 0.0;
+        self.tag_edit = None;
         self.reload_view();
+        if let Some(c) = self.chapters.iter().find(|c| c.id == chapter_id) {
+            self.draft = TextDraft {
+                chapter_id: Some(c.id),
+                title: c.title.clone(),
+                text: c.source_text.clone(),
+                saved_title: c.title.clone(),
+                saved_text: c.source_text.clone(),
+            };
+        }
         if !self.view.segments.is_empty() {
             self.selected = Some(0);
+            self.tab = Tab::Review;
+        } else {
+            self.tab = Tab::Text;
         }
+    }
+
+    fn new_chapter(&mut self) {
+        self.view = ChapterView::default();
+        self.selected = None;
+        self.tag_edit = None;
+        let title = format!("Chapter {}", self.chapters.len() + 1);
+        self.draft = TextDraft {
+            chapter_id: None,
+            title: title.clone(),
+            saved_title: title,
+            ..Default::default()
+        };
+        self.tab = Tab::Text;
     }
 
     fn reload_view(&mut self) {
@@ -355,12 +485,7 @@ impl App {
                 } => {
                     self.segmenting = None;
                     self.dirty = true;
-                    let title = self
-                        .chapters
-                        .iter()
-                        .find(|c| c.id == chapter_id)
-                        .map(|c| c.title.clone())
-                        .unwrap_or_default();
+                    let title = self.chapter_title(chapter_id);
                     let tokens = format!("{input_tokens} input / {output_tokens} output tokens");
                     let msg = if fallback_paragraphs > 0 {
                         format!(
@@ -372,6 +497,35 @@ impl App {
                         )
                     };
                     self.note(fallback_paragraphs > 0, msg);
+                }
+                Event::DirectionProgress {
+                    chapter_id,
+                    done,
+                    total,
+                } => {
+                    self.directing = Some((chapter_id, done, total));
+                }
+                Event::DirectionFinished {
+                    chapter_id,
+                    tagged,
+                    rejected,
+                    input_tokens,
+                    output_tokens,
+                } => {
+                    self.directing = None;
+                    self.dirty = true;
+                    let rejected = if rejected > 0 {
+                        format!(", {rejected} suggestions rejected for changing the text")
+                    } else {
+                        String::new()
+                    };
+                    self.note(
+                        false,
+                        format!(
+                            "{}: audio tags added to {tagged} segments{rejected}; {input_tokens} input / {output_tokens} output tokens.",
+                            self.chapter_title(chapter_id)
+                        ),
+                    );
                 }
                 Event::SegmentsChanged { chapter_id } => {
                     if self.view.chapter_id == Some(chapter_id) {
@@ -607,10 +761,21 @@ impl App {
                 plan.unassigned += 1;
                 continue;
             }
-            plan.chars += s.text.chars().count();
+            plan.chars += s.spoken_text(&project.tts_model).chars().count();
             plan.ids.push(s.id);
         }
         self.dialogs.generate = Some(plan);
+    }
+
+    fn segment_chapter(&mut self, chapter_id: Id) {
+        if self.cfg.api_keys().anthropic.is_empty() {
+            self.note(
+                true,
+                "No Anthropic API key: dialogue will be split by the parser only, with speaker 'unknown'.".into(),
+            );
+        }
+        self.worker.send(Command::SegmentChapter { chapter_id });
+        self.tab = Tab::Review;
     }
 
     fn select(&mut self, i: usize) {
@@ -640,7 +805,7 @@ impl App {
     }
 
     fn keyboard(&mut self, ctx: &egui::Context) {
-        if ctx.text_edit_focused() || self.any_dialog_open() {
+        if self.tab != Tab::Review || ctx.text_edit_focused() || self.any_dialog_open() {
             return;
         }
         let (space, a, r, p, up, down, left, right) = ctx.input(|i| {
@@ -685,7 +850,6 @@ impl App {
     fn any_dialog_open(&self) -> bool {
         let d = &self.dialogs;
         d.new_project.is_some()
-            || d.paste.is_some()
             || d.settings.is_some()
             || d.project_settings.is_some()
             || d.voices.is_some()
@@ -693,37 +857,71 @@ impl App {
             || d.generate.is_some()
             || d.delete_chapter.is_some()
             || d.delete_project.is_some()
-            || d.rename_chapter.is_some()
             || d.resegment.is_some()
+            || d.resplit
     }
 
-    fn import_files(&mut self) {
+    /// Save the Text tab. Returns false if nothing could be saved yet.
+    fn save_text(&mut self, confirmed: bool) -> bool {
         let Some(project) = self.project.clone() else {
-            return;
+            return false;
         };
-        let Some(files) = rfd::FileDialog::new()
+        let title = if self.draft.title.trim().is_empty() {
+            format!("Chapter {}", self.chapters.len() + 1)
+        } else {
+            self.draft.title.trim().to_string()
+        };
+        match self.draft.chapter_id {
+            None => {
+                let r = self.db.import_chapter(project.id, &title, &self.draft.text);
+                let Some(id) = self.try_db(r) else {
+                    return false;
+                };
+                self.reload_project_data();
+                self.open_chapter(id);
+                self.tab = Tab::Text;
+                true
+            }
+            Some(id) => {
+                if self.draft.text_dirty() {
+                    if !self.view.segments.is_empty() && !confirmed {
+                        self.dialogs.resplit = true;
+                        return false;
+                    }
+                    let r = self.db.replace_chapter_text(id, &title, &self.draft.text);
+                    if self.try_db(r).is_none() {
+                        return false;
+                    }
+                } else if self.draft.title != self.draft.saved_title {
+                    let r = self.db.rename_chapter(id, &title);
+                    self.try_db(r);
+                }
+                self.reload_project_data();
+                self.open_chapter(id);
+                self.tab = Tab::Text;
+                true
+            }
+        }
+    }
+
+    fn open_text_file(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
             .add_filter("Text", &["txt", "md"])
-            .pick_files()
+            .pick_file()
         else {
             return;
         };
-        let mut last = None;
-        for f in files {
-            let title = f
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-            match std::fs::read_to_string(&f) {
-                Ok(text) => {
-                    let r = self.db.import_chapter(project.id, &title, &text);
-                    last = self.try_db(r).or(last);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                if self.draft.chapter_id.is_some() && self.view.has_audio() {
+                    self.new_chapter();
                 }
-                Err(e) => self.note(true, format!("{}: {e}", f.display())),
+                if let Some(stem) = path.file_stem() {
+                    self.draft.title = stem.to_string_lossy().to_string();
+                }
+                self.draft.text = text;
             }
-        }
-        self.reload_project_data();
-        if let Some(id) = last {
-            self.open_chapter(id);
+            Err(e) => self.note(true, format!("{}: {e}", path.display())),
         }
     }
 
@@ -765,11 +963,20 @@ impl App {
         });
     }
 
-    // ---- panels ---------------------------------------------------------------
+    // ---- top bar --------------------------------------------------------------
 
-    fn sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
+    fn top_bar(&mut self, ui: &mut egui::Ui) {
+        let p = *theme::palette(ui);
+        ui.add_space(6.0);
         ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("◖ Narration Studio")
+                    .strong()
+                    .size(16.0)
+                    .color(p.accent),
+            );
+            ui.add_space(14.0);
+
             let current = self
                 .project
                 .as_ref()
@@ -778,212 +985,357 @@ impl App {
             let mut pick = None;
             egui::ComboBox::from_id_salt("project")
                 .selected_text(current)
-                .width(150.0)
+                .width(170.0)
                 .show_ui(ui, |ui| {
                     for p in &self.projects {
-                        if ui
-                            .selectable_label(
-                                self.project.as_ref().is_some_and(|c| c.id == p.id),
-                                &p.name,
-                            )
-                            .clicked()
-                        {
+                        let sel = self.project.as_ref().is_some_and(|c| c.id == p.id);
+                        if ui.selectable_label(sel, &p.name).clicked() {
                             pick = Some(p.id);
                         }
+                    }
+                    ui.separator();
+                    if ui.button("＋ New project…").clicked() {
+                        self.dialogs.new_project = Some((String::new(), "en".into()));
                     }
                 });
             if let Some(id) = pick {
                 self.select_project(id);
             }
-            if ui.button("＋").on_hover_text("New project").clicked() {
-                self.dialogs.new_project = Some((String::new(), "en".into()));
-            }
-        });
-        let has_project = self.project.is_some();
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .add_enabled(has_project, egui::Button::new("Voices…"))
-                .clicked()
-            {
-                self.open_voice_editor();
-            }
-            if ui
-                .add_enabled(has_project, egui::Button::new("Project…"))
-                .clicked()
-            {
-                self.dialogs.project_settings = self.project.clone();
-            }
-            if ui.button("Settings…").clicked() {
-                self.dialogs.settings = Some(self.cfg.clone());
-            }
-        });
-        ui.separator();
-        ui.horizontal(|ui| {
-            ui.strong("Chapters");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_enabled(has_project, egui::Button::new("Paste…"))
-                    .clicked()
-                {
-                    self.dialogs.paste = Some((
-                        format!("Chapter {}", self.chapters.len() + 1),
-                        String::new(),
-                    ));
-                }
-                if ui
-                    .add_enabled(has_project, egui::Button::new("Import…"))
-                    .clicked()
-                {
-                    self.import_files();
-                }
-            });
-        });
-        let mut open = None;
-        let mut action: Option<(Id, &'static str)> = None;
-        egui::ScrollArea::vertical()
-            .id_salt("chapters")
-            .auto_shrink([false, true])
-            .max_height(ui.available_height() - 40.0)
-            .show(ui, |ui| {
-                for c in &self.chapters {
-                    let st = self.stats.get(&c.id).cloned().unwrap_or_default();
-                    let selected = self.view.chapter_id == Some(c.id);
-                    let progress = if st.segments == 0 {
-                        "not segmented".to_string()
-                    } else {
-                        format!("{}/{} approved", st.approved, st.segments)
-                    };
-                    let exported = if c.status == ChapterStatus::Exported {
-                        " · exported"
-                    } else {
-                        ""
-                    };
-                    let label = format!("{:02}  {}\n     {progress}{exported}", c.order, c.title);
-                    let resp = ui.selectable_label(selected, label);
-                    if resp.clicked() {
-                        open = Some(c.id);
-                    }
-                    resp.context_menu(|ui| {
-                        for (name, key) in [
-                            ("Rename…", "rename"),
-                            ("Move up", "up"),
-                            ("Move down", "down"),
-                            ("Delete…", "delete"),
-                        ] {
-                            if ui.button(name).clicked() {
-                                action = Some((c.id, key));
-                                ui.close();
-                            }
-                        }
-                    });
-                }
-            });
-        if let Some(id) = open {
-            self.open_chapter(id);
-        }
-        if let Some((id, a)) = action {
-            match a {
-                "rename" => {
-                    let title = self
+
+            if self.project.is_some() {
+                ui.label(RichText::new("›").color(p.muted));
+                let chapter_label = match self.draft.chapter_id {
+                    Some(id) => self
                         .chapters
                         .iter()
                         .find(|c| c.id == id)
                         .map(|c| c.title.clone())
-                        .unwrap_or_default();
-                    self.dialogs.rename_chapter = Some((id, title));
+                        .unwrap_or_default(),
+                    None => "New chapter".into(),
+                };
+                let mut open = None;
+                let mut new = false;
+                egui::ComboBox::from_id_salt("chapter")
+                    .selected_text(chapter_label)
+                    .width(220.0)
+                    .show_ui(ui, |ui| {
+                        for c in self.chapters.iter().rev() {
+                            let st = self.stats.get(&c.id).cloned().unwrap_or_default();
+                            let progress = if st.segments == 0 {
+                                "text only".to_string()
+                            } else {
+                                format!("{}/{} approved", st.approved, st.segments)
+                            };
+                            let sel = self.draft.chapter_id == Some(c.id);
+                            if ui
+                                .selectable_label(sel, format!("{}  ·  {progress}", c.title))
+                                .clicked()
+                            {
+                                open = Some(c.id);
+                            }
+                        }
+                        ui.separator();
+                        if ui.button("＋ New chapter").clicked() {
+                            new = true;
+                        }
+                    });
+                if let Some(id) = open {
+                    self.open_chapter(id);
                 }
-                "up" | "down" => {
-                    let r = self.db.move_chapter(id, if a == "up" { -1 } else { 1 });
-                    self.try_db(r);
-                    self.reload_project_data();
+                if new {
+                    self.new_chapter();
                 }
-                _ => self.dialogs.delete_chapter = Some(id),
+                ui.menu_button("⋯", |ui| {
+                    let ready = self
+                        .stats
+                        .values()
+                        .any(|s| s.segments > 0 && s.approved == s.segments);
+                    if ui
+                        .add_enabled(
+                            ready && !self.exporting,
+                            egui::Button::new("Export book (M4B)"),
+                        )
+                        .on_hover_text(
+                            "All fully approved chapters as one M4B with chapter markers",
+                        )
+                        .clicked()
+                    {
+                        if let Some(p) = &self.project {
+                            self.exporting = true;
+                            self.worker.send(Command::ExportBook { project_id: p.id });
+                        }
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.draft.chapter_id.is_some(),
+                            egui::Button::new("Delete chapter…"),
+                        )
+                        .clicked()
+                    {
+                        self.dialogs.delete_chapter = self.draft.chapter_id;
+                        ui.close();
+                    }
+                });
+
+                ui.add_space(18.0);
+                let has_segments = !self.view.segments.is_empty();
+                for (tab, label) in [(Tab::Text, "1  Text"), (Tab::Review, "2  Review")] {
+                    let enabled = tab == Tab::Text || has_segments || self.segmenting.is_some();
+                    let selected = self.tab == tab;
+                    let text = if selected {
+                        RichText::new(label).strong().color(p.accent)
+                    } else {
+                        RichText::new(label)
+                    };
+                    if ui
+                        .add_enabled(enabled, egui::Button::selectable(selected, text))
+                        .clicked()
+                    {
+                        self.tab = tab;
+                    }
+                }
             }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Settings").clicked() {
+                    self.dialogs.settings = Some(self.cfg.clone());
+                }
+                let has_project = self.project.is_some();
+                if ui
+                    .add_enabled(has_project, egui::Button::new("Project"))
+                    .clicked()
+                {
+                    self.dialogs.project_settings = self.project.clone();
+                }
+                if ui
+                    .add_enabled(has_project, egui::Button::new("Voices"))
+                    .clicked()
+                {
+                    self.open_voice_editor();
+                }
+            });
+        });
+        ui.add_space(6.0);
+    }
+
+    // ---- Text tab ---------------------------------------------------------------
+
+    fn text_tab(&mut self, ui: &mut egui::Ui) {
+        let p = *theme::palette(ui);
+        if self.project.is_none() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(80.0);
+                ui.heading("Welcome");
+                ui.label("Create a project to start narrating. A project holds the language, voices and settings.");
+                ui.add_space(10.0);
+                if ui.add(primary_button(ui, "Create project")).clicked() {
+                    self.dialogs.new_project = Some((String::new(), "en".into()));
+                }
+            });
+            return;
         }
-        ui.separator();
-        ui.horizontal(|ui| {
-            let ready = self
-                .stats
-                .values()
-                .any(|s| s.segments > 0 && s.approved == s.segments);
-            if ui
-                .add_enabled(
-                    has_project && ready && !self.exporting,
-                    egui::Button::new("Export book (M4B)"),
-                )
-                .on_hover_text("All fully approved chapters as one M4B with chapter markers")
-                .clicked()
-                && let Some(p) = &self.project
+        let locked = self.draft.chapter_id.is_some() && self.view.has_audio();
+        let width = ui.available_width().min(920.0);
+        let full = ui.available_rect_before_wrap();
+        let column = egui::Rect::from_center_size(
+            egui::pos2(full.center().x, full.center().y),
+            Vec2::new(width, full.height()),
+        );
+        ui.scope_builder(UiBuilder::new().max_rect(column), |ui| {
             {
-                self.exporting = true;
-                self.worker.send(Command::ExportBook { project_id: p.id });
-            }
-            if ui.small_button("Log").clicked() {
-                self.dialogs.log = !self.dialogs.log;
+                ui.add_space(14.0);
+                ui.label(RichText::new("CHAPTER TITLE").small().color(p.muted));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.draft.title)
+                        .font(egui::FontId::proportional(20.0))
+                        .desired_width(width)
+                        .margin(egui::Margin::symmetric(10, 6)),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("TEXT").small().color(p.muted));
+                    ui.label(
+                        RichText::new("Paste the chapter as plain prose. Blank lines separate paragraphs; a line of *** marks a scene break.")
+                            .small()
+                            .color(p.muted),
+                    );
+                });
+                if locked {
+                    ui.label(
+                        RichText::new("This chapter has audio, so its text is locked. Start a new chapter from the chapter menu to narrate different text.")
+                            .small()
+                            .color(p.warning),
+                    );
+                }
+                let footer_h = 56.0;
+                let editor_h = (ui.available_height() - footer_h).max(160.0);
+                egui::Frame::new()
+                    .fill(p.card)
+                    .stroke(Stroke::new(1.0, p.border))
+                    .corner_radius(10)
+                    .inner_margin(egui::Margin::same(4))
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_salt("text_editor")
+                            .max_height(editor_h)
+                            .min_scrolled_height(editor_h)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                let rows = (editor_h / 22.0) as usize;
+                                ui.add_enabled(
+                                    !locked,
+                                    egui::TextEdit::multiline(&mut self.draft.text)
+                                        .font(egui::FontId::proportional(16.0))
+                                        .frame(egui::Frame::NONE)
+                                        .margin(egui::Margin::symmetric(14, 12))
+                                        .desired_width(f32::INFINITY)
+                                        .desired_rows(rows)
+                                        .hint_text("Paste or type the chapter text here…"),
+                                );
+                            });
+                    });
+                ui.add_space(8.0);
+                let paragraphs = segment::split_paragraphs(&self.draft.text);
+                let lang = lang::by_code(self.project.as_ref().map_or("en", |p| &p.language));
+                let with_dialogue = paragraphs.iter().filter(|p| segment::has_dialogue(&p.text, lang)).count();
+                let chars: usize = paragraphs.iter().map(|p| p.text.chars().count()).sum();
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} paragraphs · {} with dialogue · {} characters",
+                            paragraphs.len(),
+                            with_dialogue,
+                            chars
+                        ))
+                        .color(p.muted),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let can_segment = !paragraphs.is_empty() && !locked && self.segmenting.is_none();
+                        let label = if self.tags_active()
+                            && self.project.as_ref().is_some_and(|p| p.settings.audio_tags.enabled)
+                        {
+                            "Segment & add audio tags  →"
+                        } else {
+                            "Segment speakers  →"
+                        };
+                        if ui
+                            .add_enabled(can_segment, primary_button(ui, label))
+                            .on_hover_text("Saves the text, splits it into narration and dialogue, and attributes speakers with Claude")
+                            .clicked()
+                            && (!self.draft.dirty() || self.save_text(false))
+                            && let Some(id) = self.draft.chapter_id {
+                                self.segment_chapter(id);
+                            }
+                        if ui
+                            .add_enabled(self.draft.dirty() && !paragraphs.is_empty(), egui::Button::new("Save"))
+                            .clicked()
+                        {
+                            self.save_text(false);
+                        }
+                        if ui.add_enabled(!locked, egui::Button::new("Open text file…")).clicked() {
+                            self.open_text_file();
+                        }
+                    });
+                });
             }
         });
     }
 
-    fn chapter_toolbar(&mut self, ui: &mut egui::Ui) {
+    // ---- Review tab -------------------------------------------------------------
+
+    fn review_toolbar(&mut self, ui: &mut egui::Ui) {
         let Some(cid) = self.view.chapter_id else {
             return;
         };
-        let Some(chapter) = self.chapters.iter().find(|c| c.id == cid).cloned() else {
-            return;
-        };
+        let p = *theme::palette(ui);
         let st = self.stats.get(&cid).cloned().unwrap_or_default();
+        ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.heading(&chapter.title);
-            ui.add_space(12.0);
+            ui.heading(&self.draft.saved_title);
+            ui.add_space(10.0);
             if st.segments > 0 {
-                ui.label(format!("{}/{} approved", st.approved, st.segments));
+                let frac = st.approved as f32 / st.segments as f32;
+                ui.add(
+                    egui::ProgressBar::new(frac)
+                        .desired_width(150.0)
+                        .desired_height(8.0)
+                        .fill(p.approved)
+                        .corner_radius(4),
+                );
+                ui.label(
+                    RichText::new(format!("{} / {} approved", st.approved, st.segments)).strong(),
+                );
                 if st.rejected > 0 {
-                    ui.colored_label(
-                        Color32::from_rgb(220, 80, 80),
-                        format!("{} rejected", st.rejected),
-                    );
+                    chip(ui, format!("{} rejected", st.rejected), p.rejected);
                 }
                 if st.unassigned > 0 {
-                    ui.colored_label(
-                        Color32::from_rgb(230, 160, 40),
+                    chip(
+                        ui,
                         format!("⚠ {} unassigned voice", st.unassigned),
-                    );
+                        p.warning,
+                    )
+                    .on_hover_text("Map these speakers in Voices before generating");
                 }
-                ui.label(
-                    RichText::new(format!(
-                        "{} credits · re-roll rate {:.0}%",
+                chip(
+                    ui,
+                    format!(
+                        "{} credits · re-roll {:.0}%",
                         st.credits_used,
                         st.reroll_rate() * 100.0
-                    ))
-                    .weak(),
+                    ),
+                    p.muted,
                 );
+                if !self.tags_active() {
+                    chip(ui, "model ignores audio tags", p.muted).on_hover_text(
+                        "Choose Eleven v4 or v3 in Project settings to perform [tags]",
+                    );
+                }
             }
         });
+        ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
-            let segmenting_this = self.segmenting.is_some_and(|(c, _, _)| c == cid);
-            if segmenting_this {
-                let (_, d, t) = self.segmenting.unwrap();
-                ui.add(egui::Spinner::new());
-                ui.label(format!("Segmenting {d}/{t} dialogue paragraphs"));
-            } else {
-                let label = if st.segments == 0 { "Segment with Claude" } else { "Re-segment drafts" };
-                if ui
-                    .button(label)
-                    .on_hover_text("Attribute speakers in paragraphs that have no audio yet (free to fix before generating)")
-                    .clicked()
-                {
-                    if st.segments == 0 {
-                        self.worker.send(Command::SegmentChapter { chapter_id: cid });
-                    } else {
+            match self.segmenting.filter(|(c, _, _)| *c == cid) {
+                Some((_, d, t)) => {
+                    ui.add(egui::Spinner::new());
+                    ui.label(format!("Segmenting {d}/{t} dialogue paragraphs…"));
+                }
+                None => {
+                    if ui
+                        .button("Re-segment drafts")
+                        .on_hover_text("Re-run speaker attribution for paragraphs that have no audio yet")
+                        .clicked()
+                    {
                         self.dialogs.resegment = Some(cid);
                     }
                 }
             }
+            match self.directing.filter(|(c, _, _)| *c == cid) {
+                Some((_, d, t)) => {
+                    ui.add(egui::Spinner::new());
+                    ui.label(format!("Adding audio tags {d}/{t}…"));
+                }
+                None => {
+                    if ui
+                        .add_enabled(st.draft > 0 && self.segmenting.is_none(), egui::Button::new("✦ Audio tags"))
+                        .on_hover_text("Let Claude (re)write [whispers], [long pause]… into draft segments, narration included")
+                        .clicked()
+                    {
+                        self.worker.send(Command::DirectChapter { chapter_id: cid });
+                    }
+                }
+            }
             ui.separator();
-            if ui.add_enabled(st.draft > 0, egui::Button::new(format!("Generate {} drafts", st.draft))).clicked() {
+            if ui
+                .add_enabled(st.draft > 0, primary_button(ui, &format!("Generate {} drafts", st.draft)))
+                .clicked()
+            {
                 self.plan_generation(false);
             }
-            if ui.add_enabled(st.rejected > 0, egui::Button::new(format!("Re-roll {} rejected", st.rejected))).clicked() {
+            if ui
+                .add_enabled(st.rejected > 0, egui::Button::new(format!("Re-roll {} rejected", st.rejected)))
+                .clicked()
+            {
                 self.plan_generation(true);
             }
             if let Some((d, t)) = self.generating {
@@ -1015,22 +1367,30 @@ impl App {
                 ui.add(egui::Spinner::new());
             }
         });
+        ui.add_space(6.0);
     }
 
     fn segment_list(&mut self, ui: &mut egui::Ui) {
+        let p = *theme::palette(ui);
         let n = self.view.segments.len();
         if n == 0 {
-            ui.add_space(20.0);
-            if self.view.chapter_id.is_some() {
-                ui.label(format!(
-                    "{} paragraphs imported. Run \"Segment with Claude\" to split them into segments and attribute speakers.",
-                    self.view.paragraphs.len()
-                ));
-            } else if self.project.is_none() {
-                ui.label("Create a project to begin.");
-            } else {
-                ui.label("Import a chapter (plain text) to begin.");
-            }
+            ui.vertical_centered(|ui| {
+                ui.add_space(60.0);
+                if self.segmenting.is_some() {
+                    ui.add(egui::Spinner::new().size(28.0));
+                    ui.label("Splitting the text into segments and attributing speakers…");
+                } else {
+                    ui.label(format!(
+                        "{} paragraphs, not segmented yet.",
+                        self.view.paragraphs.len()
+                    ));
+                    if let Some(cid) = self.view.chapter_id
+                        && ui.add(primary_button(ui, "Segment speakers")).clicked()
+                    {
+                        self.segment_chapter(cid);
+                    }
+                }
+            });
             return;
         }
         let spacing = ui.spacing().item_spacing.y;
@@ -1053,6 +1413,8 @@ impl App {
         }
         let playing = self.player.current();
         let project = self.project.clone();
+        let tags_active = self.tags_active();
+        let dark = ui.visuals().dark_mode;
         let mut clicked: Option<usize> = None;
         let mut act: Option<(usize, &'static str)> = None;
         let out = area.show_rows(ui, ROW_H, n, |ui, range| {
@@ -1065,53 +1427,56 @@ impl App {
                     // Keep Space/A/R for the review shortcuts, not the row widget.
                     resp.surrender_focus();
                 }
-                let visuals = ui.visuals();
-                let fill = if Some(seg.id) == playing {
-                    Some(visuals.selection.bg_fill.gamma_multiply(0.6))
-                } else if self.selected == Some(i) {
-                    Some(visuals.selection.bg_fill.gamma_multiply(0.35))
-                } else if resp.hovered() {
-                    Some(visuals.widgets.hovered.bg_fill.gamma_multiply(0.4))
-                } else {
-                    None
-                };
-                if let Some(fill) = fill {
-                    ui.painter().rect_filled(rect, 4.0, fill);
-                }
                 let first = self.view.is_first_in_paragraph(i);
+                let selected = self.selected == Some(i);
+                let fill = if Some(seg.id) == playing {
+                    p.playing
+                } else if selected {
+                    p.accent_soft
+                } else if resp.hovered() {
+                    ui.visuals().faint_bg_color
+                } else {
+                    p.card
+                };
+                ui.painter().rect_filled(rect, 6.0, fill);
+                if selected {
+                    let bar = egui::Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height()));
+                    ui.painter().rect_filled(bar, 2.0, p.accent);
+                }
                 if first && i > 0 {
                     let y = rect.top() - spacing / 2.0;
-                    ui.painter().hline(
-                        rect.x_range(),
-                        y,
-                        ui.visuals().widgets.noninteractive.bg_stroke,
-                    );
+                    ui.painter()
+                        .hline(rect.x_range(), y, Stroke::new(1.0, p.border));
                 }
                 ui.scope_builder(
                     UiBuilder::new()
                         .max_rect(rect)
                         .layout(egui::Layout::left_to_right(egui::Align::Center)),
                     |ui| {
-                        ui.add_space(4.0);
+                        ui.add_space(8.0);
                         let para = self.view.paragraph_of(i);
                         let ptext = match (first, para) {
-                            (true, Some(p)) if p.scene_break_before => format!("✱{}", p.order + 1),
-                            (true, Some(p)) => format!("¶{}", p.order + 1),
+                            (true, Some(p)) if p.scene_break_before => format!("✱ {}", p.order + 1),
+                            (true, Some(p)) => format!("¶ {}", p.order + 1),
                             _ => String::new(),
                         };
-                        ui.add_sized(
-                            [40.0, ROW_H],
-                            egui::Label::new(RichText::new(ptext).weak().small()).selectable(false),
-                        );
+                        left_aligned(ui, 40.0, |ui| {
+                            ui.add(
+                                egui::Label::new(RichText::new(ptext).small().color(p.muted))
+                                    .selectable(false),
+                            )
+                        });
                         let (icon, color) = if self.in_flight.contains(&seg.id) {
-                            ("◌", Color32::from_rgb(230, 190, 60))
+                            ("◌", p.working)
                         } else {
-                            status_icon(seg.status)
+                            status_icon(seg.status, &p)
                         };
-                        let status_label = ui.add_sized(
-                            [18.0, ROW_H],
-                            egui::Label::new(RichText::new(icon).color(color)).selectable(false),
-                        );
+                        let status_label = left_aligned(ui, 18.0, |ui| {
+                            ui.add(
+                                egui::Label::new(RichText::new(icon).color(color))
+                                    .selectable(false),
+                            )
+                        });
                         if let Some(err) = self.failures.get(&seg.id) {
                             status_label.on_hover_text(format!("Last generation failed: {err}"));
                         }
@@ -1119,12 +1484,11 @@ impl App {
                             .as_ref()
                             .is_none_or(|p| p.voice_for(&seg.speaker).is_none());
                         let badge = if unassigned {
-                            RichText::new(format!("⚠ {}", seg.speaker))
-                                .color(Color32::from_rgb(230, 160, 40))
+                            RichText::new(format!("⚠ {}", seg.speaker)).color(p.warning)
                         } else {
-                            RichText::new(&seg.speaker).color(speaker_color(&seg.speaker))
+                            RichText::new(&seg.speaker).color(speaker_color(&seg.speaker, dark))
                         };
-                        let badge_resp = left_aligned(ui, 110.0, |ui| {
+                        let badge_resp = left_aligned(ui, 112.0, |ui| {
                             ui.add(
                                 egui::Label::new(badge.strong())
                                     .truncate()
@@ -1133,33 +1497,35 @@ impl App {
                         });
                         if unassigned {
                             badge_resp.on_hover_text(
-                                "Unassigned voice: map this speaker in Voices… before generating",
+                                "Unassigned voice: map this speaker in Voices before generating",
                             );
                         }
                         let buttons_w = 150.0;
                         let text_w = (ui.available_width() - buttons_w).max(80.0);
-                        let mut job = egui::text::LayoutJob::single_section(
-                            seg.text.clone(),
-                            egui::TextFormat {
-                                font_id: egui::FontId::proportional(14.0),
-                                color: if seg.kind == SegmentKind::Dialogue {
-                                    ui.visuals().strong_text_color()
-                                } else {
-                                    ui.visuals().text_color()
-                                },
-                                italics: seg.kind == SegmentKind::Narration
-                                    && seg.speaker == NARRATOR
-                                    && seg.text.chars().count() < 40,
-                                ..Default::default()
-                            },
+                        let shown = seg.performance.as_deref().unwrap_or(&seg.text);
+                        let mut job = tagged_job(
+                            ui,
+                            shown,
+                            14.5,
+                            seg.kind == SegmentKind::Dialogue,
+                            seg.kind == SegmentKind::Narration && seg.text.chars().count() < 40,
                         );
+                        if !tags_active && seg.performance.is_some() {
+                            // Tags exist but the model will not perform them: dim them.
+                            for s in &mut job.sections {
+                                if s.format.color == p.tag {
+                                    s.format.color = p.muted;
+                                }
+                            }
+                        }
                         job.wrap.max_width = text_w;
                         job.wrap.max_rows = 2;
                         job.wrap.overflow_character = Some('…');
                         left_aligned(ui, text_w, |ui| {
-                            ui.add(egui::Label::new(job).selectable(false))
+                            ui.add(egui::Label::new(job).wrap().selectable(false))
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(6.0);
                             let takes = self.view.take_counts.get(&seg.id).copied().unwrap_or(0);
                             let locked = seg.status == SegmentStatus::Approved;
                             if ui
@@ -1190,7 +1556,7 @@ impl App {
                                 act = Some((i, "play"));
                             }
                             if takes > 0 {
-                                ui.label(RichText::new(format!("{takes}×")).weak().small());
+                                ui.label(RichText::new(format!("{takes}×")).small().color(p.muted));
                             }
                         });
                     },
@@ -1214,8 +1580,12 @@ impl App {
 
     fn detail_panel(&mut self, ui: &mut egui::Ui) {
         self.ensure_takes();
+        let p = *theme::palette(ui);
         let Some(i) = self.selected else {
-            ui.label(RichText::new("Select a segment. Keys: Space play · P play paragraph · A approve · R reject/re-roll · ↑↓ segments · ←→ paragraphs").weak());
+            ui.label(
+                RichText::new("Select a segment. Keys: Space play · P paragraph · A approve · R reject/re-roll · ↑↓ segments · ←→ paragraphs")
+                    .color(p.muted),
+            );
             return;
         };
         let Some(seg) = self.view.segments.get(i).cloned() else {
@@ -1227,34 +1597,43 @@ impl App {
         let locked = seg.status == SegmentStatus::Approved;
         let range = self.view.paragraph_range(i);
         let last_in_para = i + 1 == range.end;
+        let dark = ui.visuals().dark_mode;
+        if self
+            .tag_edit
+            .as_ref()
+            .is_none_or(|t| t.segment_id != seg.id)
+        {
+            self.tag_edit = Some(TagEdit {
+                segment_id: seg.id,
+                text: seg.performance.clone().unwrap_or_else(|| seg.text.clone()),
+                error: None,
+            });
+        }
 
         egui::ScrollArea::vertical()
             .id_salt("detail")
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    let (icon, color) = status_icon(seg.status);
-                    ui.colored_label(color, format!("{icon} {}", seg.status.as_str()));
+                    let (icon, color) = status_icon(seg.status, &p);
+                    chip(ui, format!("{icon} {}", seg.status.as_str()), color);
+                    ui.label(RichText::new(&seg.speaker).strong().color(speaker_color(&seg.speaker, dark)));
                     ui.label(
-                        RichText::new(format!(
-                            "{} · {} chars",
-                            seg.kind.as_str(),
-                            seg.text.chars().count()
-                        ))
-                        .weak(),
+                        RichText::new(format!("{} · {} characters", seg.kind.as_str(), seg.spoken_text(&project.tts_model).chars().count()))
+                            .color(p.muted),
                     );
                     if let Some(e) = self.failures.get(&seg.id) {
-                        ui.colored_label(
-                            Color32::from_rgb(220, 80, 80),
-                            format!("Last attempt failed: {e}"),
-                        );
+                        ui.colored_label(p.rejected, format!("Last attempt failed: {e}"));
                     }
                 });
-                ui.add(egui::Label::new(RichText::new(&seg.text).size(16.0)).wrap());
-                ui.add_space(6.0);
+                ui.add_space(4.0);
+                let shown = seg.performance.as_deref().unwrap_or(&seg.text);
+                ui.add(egui::Label::new(tagged_job(ui, shown, 17.0, false, false)).wrap());
+                ui.add_space(8.0);
 
                 ui.horizontal_wrapped(|ui| {
-                    ui.label("Speaker:");
+                    ui.label(RichText::new("Speaker").color(p.muted));
                     let mut speaker = seg.speaker.clone();
                     ui.add_enabled_ui(!locked, |ui| {
                         egui::ComboBox::from_id_salt(("speaker", seg.id))
@@ -1262,17 +1641,9 @@ impl App {
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(&mut speaker, NARRATOR.to_string(), NARRATOR);
                                 for c in &self.characters {
-                                    ui.selectable_value(
-                                        &mut speaker,
-                                        c.key.clone(),
-                                        format!("{} ({})", c.key, c.display_name),
-                                    );
+                                    ui.selectable_value(&mut speaker, c.key.clone(), format!("{} ({})", c.key, c.display_name));
                                 }
-                                ui.selectable_value(
-                                    &mut speaker,
-                                    UNKNOWN_SPEAKER.to_string(),
-                                    UNKNOWN_SPEAKER,
-                                );
+                                ui.selectable_value(&mut speaker, UNKNOWN_SPEAKER.to_string(), UNKNOWN_SPEAKER);
                             });
                     });
                     if speaker != seg.speaker {
@@ -1297,20 +1668,13 @@ impl App {
                         }
                     } else {
                         if ui
-                            .add_enabled(
-                                seg.current_take_id.is_some(),
-                                egui::Button::new("✔ Approve"),
-                            )
+                            .add_enabled(seg.current_take_id.is_some(), egui::Button::new("✔ Approve"))
                             .clicked()
                         {
                             self.approve(i);
                         }
                         if ui
-                            .button(if seg.current_take_id.is_some() {
-                                "↻ Re-roll"
-                            } else {
-                                "Generate"
-                            })
+                            .button(if seg.current_take_id.is_some() { "↻ Re-roll" } else { "Generate" })
                             .clicked()
                         {
                             self.reject(i);
@@ -1320,22 +1684,13 @@ impl App {
                         self.play_paragraph(i);
                     }
                     ui.separator();
-                    if ui
-                        .add_enabled(
-                            !locked && !last_in_para,
-                            egui::Button::new("Merge with next"),
-                        )
-                        .clicked()
-                    {
+                    if ui.add_enabled(!locked && !last_in_para, egui::Button::new("Merge with next")).clicked() {
                         let r = self.db.merge_with_next(seg.id);
                         self.try_db(r);
                         self.dirty = true;
                     }
                     if ui
-                        .add_enabled(
-                            !locked && i > range.start,
-                            egui::Button::new("Merge with previous"),
-                        )
+                        .add_enabled(!locked && i > range.start, egui::Button::new("Merge with previous"))
                         .clicked()
                     {
                         let prev = self.view.segments[i - 1].id;
@@ -1345,15 +1700,73 @@ impl App {
                         }
                         self.dirty = true;
                     }
-                    if ui
-                        .add_enabled(!locked, egui::Button::new("Split…"))
-                        .clicked()
-                    {
+                    if ui.add_enabled(!locked, egui::Button::new("Split…")).clicked() {
                         self.dialogs.split = Some((seg.id, seg.text.clone(), None));
                     }
                 });
 
-                ui.add_space(4.0);
+                ui.add_space(6.0);
+                egui::CollapsingHeader::new(RichText::new("✦ Audio tags").strong())
+                    .id_salt("tags_header")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        if !lang::model_supports_tags(&project.tts_model) {
+                            ui.label(
+                                RichText::new(format!("{} reads tags aloud instead of performing them; tags are left out of its requests.", project.tts_model))
+                                    .small()
+                                    .color(p.warning),
+                            );
+                        }
+                        ui.label(
+                            RichText::new("Insert cues in square brackets, e.g. [whispers], [thoughtful], [short pause], [long pause], [sighs]. The words themselves cannot change.")
+                                .small()
+                                .color(p.muted),
+                        );
+                        let mut apply = false;
+                        let mut clear = false;
+                        if let Some(edit) = &mut self.tag_edit {
+                            ui.add_enabled(
+                                !locked,
+                                egui::TextEdit::multiline(&mut edit.text)
+                                    .desired_rows(2)
+                                    .desired_width(f32::INFINITY)
+                                    .font(egui::FontId::proportional(15.0)),
+                            );
+                            if let Some(e) = &edit.error {
+                                ui.colored_label(p.rejected, e);
+                            }
+                            ui.horizontal(|ui| {
+                                let current = seg.performance.clone().unwrap_or_else(|| seg.text.clone());
+                                apply = ui
+                                    .add_enabled(!locked && edit.text != current, egui::Button::new("Apply tags"))
+                                    .clicked();
+                                clear = ui
+                                    .add_enabled(!locked && seg.performance.is_some(), egui::Button::new("Remove tags"))
+                                    .clicked();
+                                if seg.current_take_id.is_some() && !locked {
+                                    ui.label(RichText::new("Changing tags needs a new take.").small().color(p.muted));
+                                }
+                            });
+                        }
+                        if apply && let Some(edit) = &mut self.tag_edit {
+                            match tags::validate(&seg.text, &edit.text) {
+                                Ok(perf) => {
+                                    let r = self.db.set_segment_performance(seg.id, perf.as_deref());
+                                    self.try_db(r);
+                                    self.tag_edit = None;
+                                    self.dirty = true;
+                                }
+                                Err(e) => edit.error = Some(format!("Not applied: {e}.")),
+                            }
+                        }
+                        if clear {
+                            let r = self.db.set_segment_performance(seg.id, None);
+                            self.try_db(r);
+                            self.tag_edit = None;
+                            self.dirty = true;
+                        }
+                    });
+
                 ui.add_enabled_ui(!locked, |ui| {
                     let mut use_override = seg.settings_override.is_some();
                     let mut vs = seg
@@ -1368,16 +1781,14 @@ impl App {
                         }
                     });
                     if (use_override, vs.clone()) != before {
-                        let r = self
-                            .db
-                            .set_segment_override(seg.id, use_override.then_some(&vs));
+                        let r = self.db.set_segment_override(seg.id, use_override.then_some(&vs));
                         self.try_db(r);
                         self.dirty = true;
                     }
                 });
 
-                ui.add_space(4.0);
-                ui.strong(format!("Takes ({})", self.takes.len()));
+                ui.add_space(6.0);
+                ui.label(RichText::new(format!("TAKES ({})", self.takes.len())).small().color(p.muted));
                 let mut play: Option<Id> = None;
                 let mut use_take: Option<Id> = None;
                 for (n, t) in self.takes.iter().enumerate() {
@@ -1391,21 +1802,11 @@ impl App {
                         } else {
                             format!("{} credits", t.credits_used)
                         };
-                        let text =
-                            format!("#{} · seed {} · {cost} · {}", n + 1, t.seed, t.created_at);
-                        ui.label(if current {
-                            RichText::new(text).strong()
-                        } else {
-                            RichText::new(text)
-                        });
+                        let text = format!("#{} · seed {} · {cost} · {}", n + 1, t.seed, t.created_at);
+                        ui.label(if current { RichText::new(text).strong() } else { RichText::new(text) });
                         if current {
-                            ui.label(
-                                RichText::new("current").color(Color32::from_rgb(80, 190, 100)),
-                            );
-                        } else if ui
-                            .add_enabled(!locked, egui::Button::new("Use").small())
-                            .clicked()
-                        {
+                            chip(ui, "current", p.approved);
+                        } else if ui.add_enabled(!locked, egui::Button::new("Use").small()).clicked() {
                             use_take = Some(t.id);
                         }
                     });
@@ -1425,7 +1826,6 @@ impl App {
 
     fn dialogs(&mut self, ctx: &egui::Context) {
         self.dialog_new_project(ctx);
-        self.dialog_paste(ctx);
         self.dialog_settings(ctx);
         self.dialog_project_settings(ctx);
         self.dialog_voices(ctx);
@@ -1436,14 +1836,15 @@ impl App {
             let mut open = true;
             egui::Window::new("Log")
                 .open(&mut open)
-                .default_size([600.0, 300.0])
+                .default_size([640.0, 320.0])
                 .show(ctx, |ui| {
+                    let p = *theme::palette(ui);
                     egui::ScrollArea::vertical()
                         .stick_to_bottom(true)
                         .show(ui, |ui| {
                             for (err, m) in &self.log {
                                 if *err {
-                                    ui.colored_label(Color32::from_rgb(220, 100, 100), m);
+                                    ui.colored_label(p.rejected, m);
                                 } else {
                                     ui.label(m);
                                 }
@@ -1460,21 +1861,32 @@ impl App {
         };
         let mut create = false;
         let mut cancel = false;
-        egui::Window::new("New project").collapsible(false).resizable(false).show(ctx, |ui| {
-            egui::Grid::new("np").num_columns(2).show(ui, |ui| {
-                ui.label("Name");
-                ui.text_edit_singleline(name);
-                ui.end_row();
-                ui.label("Language");
-                language_combo(ui, "np_lang", language);
-                ui.end_row();
+        egui::Window::new("New project")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_TOP, [0.0, 90.0])
+            .show(ctx, |ui| {
+                egui::Grid::new("np").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
+                    ui.label("Name");
+                    ui.text_edit_singleline(name);
+                    ui.end_row();
+                    ui.label("Language");
+                    language_combo(ui, "np_lang", language);
+                    ui.end_row();
+                });
+                ui.label(
+                    RichText::new("One language per project; it decides quote styles and the default TTS model.")
+                        .small()
+                        .color(theme::palette(ui).muted),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    create = ui
+                        .add_enabled(!name.trim().is_empty(), primary_button(ui, "Create"))
+                        .clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
             });
-            ui.label(RichText::new("One language per project; it decides quote styles and the default TTS model.").weak());
-            ui.horizontal(|ui| {
-                create = ui.add_enabled(!name.trim().is_empty(), egui::Button::new("Create")).clicked();
-                cancel = ui.button("Cancel").clicked();
-            });
-        });
         if create {
             let (name, language) = self.dialogs.new_project.take().unwrap();
             let r = self.db.create_project(name.trim(), &language);
@@ -1487,50 +1899,6 @@ impl App {
         }
     }
 
-    fn dialog_paste(&mut self, ctx: &egui::Context) {
-        let Some((title, text)) = &mut self.dialogs.paste else {
-            return;
-        };
-        let mut ok = false;
-        let mut cancel = false;
-        egui::Window::new("Paste chapter")
-            .default_size([640.0, 480.0])
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Title");
-                    ui.text_edit_singleline(title);
-                });
-                egui::ScrollArea::vertical()
-                    .max_height(400.0)
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(text)
-                                .desired_rows(18)
-                                .desired_width(f32::INFINITY),
-                        );
-                    });
-                let n = segment::split_paragraphs(text).len();
-                ui.horizontal(|ui| {
-                    ok = ui
-                        .add_enabled(n > 0, egui::Button::new(format!("Import {n} paragraphs")))
-                        .clicked();
-                    cancel = ui.button("Cancel").clicked();
-                });
-            });
-        if ok {
-            let (title, text) = self.dialogs.paste.take().unwrap();
-            if let Some(p) = self.project.clone() {
-                let r = self.db.import_chapter(p.id, title.trim(), &text);
-                if let Some(id) = self.try_db(r) {
-                    self.reload_project_data();
-                    self.open_chapter(id);
-                }
-            }
-        } else if cancel {
-            self.dialogs.paste = None;
-        }
-    }
-
     fn dialog_settings(&mut self, ctx: &egui::Context) {
         let Some(cfg) = &mut self.dialogs.settings else {
             return;
@@ -1538,30 +1906,51 @@ impl App {
         let mut save = false;
         let mut cancel = false;
         egui::Window::new("Settings").collapsible(false).show(ctx, |ui| {
-            egui::Grid::new("settings").num_columns(2).show(ui, |ui| {
+            egui::Grid::new("settings").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
                 ui.label("Anthropic API key");
-                ui.add(egui::TextEdit::singleline(&mut cfg.anthropic_api_key).password(true).hint_text("or ANTHROPIC_API_KEY"));
+                ui.add(
+                    egui::TextEdit::singleline(&mut cfg.anthropic_api_key)
+                        .password(true)
+                        .hint_text("or ANTHROPIC_API_KEY"),
+                );
                 ui.end_row();
                 ui.label("ElevenLabs API key");
-                ui.add(egui::TextEdit::singleline(&mut cfg.elevenlabs_api_key).password(true).hint_text("or ELEVENLABS_API_KEY"));
+                ui.add(
+                    egui::TextEdit::singleline(&mut cfg.elevenlabs_api_key)
+                        .password(true)
+                        .hint_text("or ELEVENLABS_API_KEY"),
+                );
+                ui.end_row();
+                ui.label("Appearance");
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut cfg.dark_mode, false, "Light");
+                    ui.selectable_value(&mut cfg.dark_mode, true, "Dark");
+                });
                 ui.end_row();
                 ui.label("Library");
                 ui.label(cfg.library_dir().display().to_string());
                 ui.end_row();
             });
             if ui.button("Choose library folder…").clicked()
-                && let Some(dir) = rfd::FileDialog::new().pick_folder() {
-                    cfg.library_dir = Some(dir);
-                }
-            ui.label(RichText::new("Keys are stored in the config file with owner-only permissions. A library change takes effect after restart.").weak());
+                && let Some(dir) = rfd::FileDialog::new().pick_folder()
+            {
+                cfg.library_dir = Some(dir);
+            }
+            ui.label(
+                RichText::new("Keys are stored in the config file with owner-only permissions. A library change takes effect after restart.")
+                    .small()
+                    .color(theme::palette(ui).muted),
+            );
+            ui.add_space(6.0);
             ui.horizontal(|ui| {
-                save = ui.button("Save").clicked();
+                save = ui.add(primary_button(ui, "Save")).clicked();
                 cancel = ui.button("Cancel").clicked();
             });
         });
         if save {
             let cfg = self.dialogs.settings.take().unwrap();
             self.worker.send(Command::SetKeys(cfg.api_keys()));
+            theme::apply(ctx, cfg.dark_mode);
             self.cfg = cfg;
             if let Err(e) = self.cfg.save() {
                 self.note(true, format!("Saving settings: {e:#}"));
@@ -1579,124 +1968,120 @@ impl App {
         let mut cancel = false;
         let mut delete = false;
         egui::Window::new("Project settings")
-            .default_width(460.0)
+            .default_width(500.0)
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical()
-                    .max_height(560.0)
-                    .show(ui, |ui| {
-                        egui::Grid::new("ps")
-                            .num_columns(2)
-                            .spacing([12.0, 6.0])
-                            .show(ui, |ui| {
-                                ui.label("Name");
-                                ui.text_edit_singleline(&mut p.name);
-                                ui.end_row();
-                                ui.label("Language");
-                                language_combo(ui, "ps_lang", &mut p.language);
-                                ui.end_row();
-                                ui.label("TTS model");
-                                egui::ComboBox::from_id_salt("model")
-                                    .selected_text(&p.tts_model)
-                                    .show_ui(ui, |ui| {
-                                        for (id, desc) in lang::TTS_MODELS {
-                                            ui.selectable_value(
-                                                &mut p.tts_model,
-                                                id.to_string(),
-                                                format!("{id} — {desc}"),
-                                            );
-                                        }
-                                    });
-                                ui.end_row();
-                                ui.label("Output format");
-                                egui::ComboBox::from_id_salt("fmt")
-                                    .selected_text(&p.settings.output_format)
-                                    .show_ui(ui, |ui| {
-                                        for (id, desc) in lang::OUTPUT_FORMATS {
-                                            ui.selectable_value(
-                                                &mut p.settings.output_format,
-                                                id.to_string(),
-                                                format!("{id} — {desc}"),
-                                            );
-                                        }
-                                    });
-                                ui.end_row();
-                                ui.label("Concurrent requests");
-                                ui.add(
-                                    egui::DragValue::new(&mut p.settings.concurrency).range(1..=15),
-                                )
-                                .on_hover_text("Your ElevenLabs plan's concurrency limit");
-                                ui.end_row();
-                                ui.label("Request stitching");
-                                ui.checkbox(
-                                    &mut p.settings.request_stitching,
-                                    "send previous request ids",
-                                );
-                                ui.end_row();
-                                ui.label("Reject key");
-                                ui.checkbox(
-                                    &mut p.settings.reroll_on_reject,
-                                    "R re-rolls immediately",
-                                );
-                                ui.end_row();
+                let muted = theme::palette(ui).muted;
+                let section = |ui: &mut egui::Ui, title: &str| {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(title).small().strong().color(muted));
+                };
+                egui::ScrollArea::vertical().max_height(600.0).show(ui, |ui| {
+                    egui::Grid::new("ps").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                        ui.label("Name");
+                        ui.text_edit_singleline(&mut p.name);
+                        ui.end_row();
+                        ui.label("Language");
+                        language_combo(ui, "ps_lang", &mut p.language);
+                        ui.end_row();
+                        ui.label("TTS model");
+                        egui::ComboBox::from_id_salt("model")
+                            .selected_text(&p.tts_model)
+                            .show_ui(ui, |ui| {
+                                for (id, desc) in lang::TTS_MODELS {
+                                    ui.selectable_value(&mut p.tts_model, id.to_string(), format!("{id} — {desc}"));
+                                }
                             });
-                        ui.separator();
-                        ui.strong("Default voice settings");
-                        ui.horizontal_wrapped(|ui| {
-                            voice_settings_ui(ui, &mut p.default_voice_settings)
-                        });
-                        ui.separator();
-                        ui.strong("Silence (ms)");
-                        let s = &mut p.settings.silence;
-                        egui::Grid::new("silence").num_columns(2).show(ui, |ui| {
-                            for (label, v) in [
-                                ("Within paragraph", &mut s.within_paragraph_ms),
-                                ("Between paragraphs", &mut s.between_paragraphs_ms),
-                                ("Scene break", &mut s.scene_break_ms),
-                                ("Chapter lead-in", &mut s.chapter_lead_in_ms),
-                                ("Chapter tail", &mut s.chapter_tail_ms),
-                            ] {
-                                ui.label(label);
-                                ui.add(egui::DragValue::new(v).range(0..=10000).speed(10));
-                                ui.end_row();
-                            }
-                        });
-                        ui.separator();
-                        ui.strong("Segmentation (Claude)");
-                        let g = &mut p.settings.segmentation;
-                        egui::Grid::new("seg").num_columns(2).show(ui, |ui| {
-                            ui.label("Model");
-                            ui.text_edit_singleline(&mut g.model);
-                            ui.end_row();
-                            ui.label("Effort");
-                            egui::ComboBox::from_id_salt("effort")
-                                .selected_text(&g.effort)
-                                .show_ui(ui, |ui| {
-                                    for e in ["low", "medium", "high", "xhigh", "max"] {
-                                        ui.selectable_value(&mut g.effort, e.to_string(), e);
-                                    }
-                                });
-                            ui.end_row();
-                            ui.label("Chunk (paragraphs)");
-                            ui.add(egui::DragValue::new(&mut g.chunk_paragraphs).range(1..=200));
-                            ui.end_row();
-                            ui.label("Context overlap");
-                            ui.add(egui::DragValue::new(&mut g.overlap_paragraphs).range(0..=50));
-                            ui.end_row();
-                            ui.label("Retries");
-                            ui.add(egui::DragValue::new(&mut g.max_retries).range(0..=5));
-                            ui.end_row();
-                        });
+                        ui.end_row();
+                        ui.label("Output format");
+                        egui::ComboBox::from_id_salt("fmt")
+                            .selected_text(&p.settings.output_format)
+                            .show_ui(ui, |ui| {
+                                for (id, desc) in lang::OUTPUT_FORMATS {
+                                    ui.selectable_value(&mut p.settings.output_format, id.to_string(), format!("{id} — {desc}"));
+                                }
+                            });
+                        ui.end_row();
+                        ui.label("Concurrent requests");
+                        ui.add(egui::DragValue::new(&mut p.settings.concurrency).range(1..=15))
+                            .on_hover_text("Your ElevenLabs plan's concurrency limit");
+                        ui.end_row();
+                        ui.label("Request stitching");
+                        ui.checkbox(&mut p.settings.request_stitching, "send previous request ids");
+                        ui.end_row();
+                        ui.label("Reject key");
+                        ui.checkbox(&mut p.settings.reroll_on_reject, "R re-rolls immediately");
+                        ui.end_row();
                     });
+
+                    section(ui, "AUDIO TAGS");
+                    let t = &mut p.settings.audio_tags;
+                    ui.checkbox(&mut t.enabled, "Add tags automatically after segmentation (Eleven v3/v4 only)");
+                    ui.horizontal(|ui| {
+                        ui.label("Density");
+                        for d in ["light", "moderate", "rich"] {
+                            ui.selectable_value(&mut t.density, d.to_string(), d);
+                        }
+                    });
+                    ui.label("Director's notes");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut t.direction)
+                            .desired_rows(2)
+                            .desired_width(f32::INFINITY)
+                            .hint_text("e.g. Military sci-fi. Keep the narrator calm and clipped; save whispers for real tension."),
+                    );
+
+                    section(ui, "DEFAULT VOICE SETTINGS");
+                    ui.horizontal_wrapped(|ui| voice_settings_ui(ui, &mut p.default_voice_settings));
+
+                    section(ui, "SILENCE (MS)");
+                    let s = &mut p.settings.silence;
+                    egui::Grid::new("silence").num_columns(2).show(ui, |ui| {
+                        for (label, v) in [
+                            ("Within paragraph", &mut s.within_paragraph_ms),
+                            ("Between paragraphs", &mut s.between_paragraphs_ms),
+                            ("Scene break", &mut s.scene_break_ms),
+                            ("Chapter lead-in", &mut s.chapter_lead_in_ms),
+                            ("Chapter tail", &mut s.chapter_tail_ms),
+                        ] {
+                            ui.label(label);
+                            ui.add(egui::DragValue::new(v).range(0..=10000).speed(10));
+                            ui.end_row();
+                        }
+                    });
+
+                    section(ui, "CLAUDE");
+                    let g = &mut p.settings.segmentation;
+                    egui::Grid::new("seg").num_columns(2).show(ui, |ui| {
+                        ui.label("Model");
+                        ui.text_edit_singleline(&mut g.model);
+                        ui.end_row();
+                        ui.label("Effort");
+                        egui::ComboBox::from_id_salt("effort")
+                            .selected_text(&g.effort)
+                            .show_ui(ui, |ui| {
+                                for e in ["low", "medium", "high", "xhigh", "max"] {
+                                    ui.selectable_value(&mut g.effort, e.to_string(), e);
+                                }
+                            });
+                        ui.end_row();
+                        ui.label("Chunk (paragraphs)");
+                        ui.add(egui::DragValue::new(&mut g.chunk_paragraphs).range(1..=200));
+                        ui.end_row();
+                        ui.label("Context overlap");
+                        ui.add(egui::DragValue::new(&mut g.overlap_paragraphs).range(0..=50));
+                        ui.end_row();
+                        ui.label("Retries");
+                        ui.add(egui::DragValue::new(&mut g.max_retries).range(0..=5));
+                        ui.end_row();
+                    });
+                });
                 ui.separator();
                 ui.horizontal(|ui| {
-                    save = ui.button("Save").clicked();
+                    save = ui.add(primary_button(ui, "Save")).clicked();
                     cancel = ui.button("Cancel").clicked();
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         delete = ui
-                            .button(
-                                RichText::new("Delete project…")
-                                    .color(Color32::from_rgb(220, 80, 80)),
-                            )
+                            .button(RichText::new("Delete project…").color(theme::palette(ui).rejected))
                             .clicked();
                     });
                 });
@@ -1723,93 +2108,97 @@ impl App {
         let mut fetch = false;
         let mut rename: Option<(String, String)> = None;
         let voices = &self.voices;
-        egui::Window::new("Voices and characters").default_size([760.0, 480.0]).show(ctx, |ui| {
-            ui.label(RichText::new("Every speaker needs an ElevenLabs voice id, including the narrator. Segments with an unassigned voice are skipped.").weak());
-            ui.horizontal(|ui| {
-                fetch = ui.button("Load my ElevenLabs voices").clicked();
-                ui.label(RichText::new(format!("{} loaded", voices.len())).weak());
-            });
-            egui::ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
-                egui::Grid::new("voices").num_columns(6).striped(true).show(ui, |ui| {
-                    ui.strong("Key");
-                    ui.strong("Display name");
-                    ui.strong("Aliases (comma separated)");
-                    ui.strong("Voice id");
-                    ui.strong("");
-                    ui.strong("");
-                    ui.end_row();
-                    for (n, row) in ed.rows.iter_mut().enumerate() {
-                        let key_text = RichText::new(&row.key).color(speaker_color(&row.key));
-                        ui.label(if row.remove { key_text.strikethrough() } else { key_text });
-                        if row.key == NARRATOR {
-                            ui.label("Narrator");
-                            ui.label("");
-                        } else {
-                            ui.text_edit_singleline(&mut row.display_name);
-                            ui.text_edit_singleline(&mut row.aliases);
-                        }
-                        ui.add_sized(
-                            [190.0, 20.0],
-                            egui::TextEdit::singleline(&mut row.voice_id).hint_text("voice id"),
-                        );
-                        if voices.is_empty() {
-                            ui.label("");
-                        } else {
-                            let current = voices
-                                .iter()
-                                .find(|v| v.voice_id == row.voice_id)
-                                .map(|v| v.name.clone())
-                                .unwrap_or_else(|| "pick…".into());
-                            egui::ComboBox::from_id_salt(("pick", n))
-                                .selected_text(current)
-                                .width(140.0)
-                                .show_ui(ui, |ui| {
-                                    for v in voices {
-                                        ui.selectable_value(&mut row.voice_id, v.voice_id.clone(), &v.name);
-                                    }
-                                });
-                        }
-                        if row.key != NARRATOR {
-                            ui.checkbox(&mut row.remove, "remove");
-                        } else {
-                            ui.label("");
+        egui::Window::new("Voices and characters")
+            .default_size([800.0, 480.0])
+            .show(ctx, |ui| {
+                let dark = ui.visuals().dark_mode;
+                let muted = theme::palette(ui).muted;
+                ui.label(
+                    RichText::new("Every speaker needs an ElevenLabs voice id, including the narrator. Segments with an unassigned voice are skipped.")
+                        .small()
+                        .color(muted),
+                );
+                ui.horizontal(|ui| {
+                    fetch = ui.button("Load my ElevenLabs voices").clicked();
+                    ui.label(RichText::new(format!("{} loaded", voices.len())).small().color(muted));
+                });
+                egui::ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
+                    egui::Grid::new("voices").num_columns(6).striped(true).spacing([10.0, 6.0]).show(ui, |ui| {
+                        for h in ["Key", "Display name", "Aliases (comma separated)", "Voice id", "", ""] {
+                            ui.label(RichText::new(h).small().strong().color(muted));
                         }
                         ui.end_row();
+                        for (n, row) in ed.rows.iter_mut().enumerate() {
+                            let key_text = RichText::new(&row.key).strong().color(speaker_color(&row.key, dark));
+                            ui.label(if row.remove { key_text.strikethrough() } else { key_text });
+                            if row.key == NARRATOR {
+                                ui.label("Narrator");
+                                ui.label("");
+                            } else {
+                                ui.text_edit_singleline(&mut row.display_name);
+                                ui.text_edit_singleline(&mut row.aliases);
+                            }
+                            ui.add_sized([190.0, 22.0], egui::TextEdit::singleline(&mut row.voice_id).hint_text("voice id"));
+                            if voices.is_empty() {
+                                ui.label("");
+                            } else {
+                                let current = voices
+                                    .iter()
+                                    .find(|v| v.voice_id == row.voice_id)
+                                    .map(|v| v.name.clone())
+                                    .unwrap_or_else(|| "pick…".into());
+                                egui::ComboBox::from_id_salt(("pick", n))
+                                    .selected_text(current)
+                                    .width(140.0)
+                                    .show_ui(ui, |ui| {
+                                        for v in voices {
+                                            ui.selectable_value(&mut row.voice_id, v.voice_id.clone(), &v.name);
+                                        }
+                                    });
+                            }
+                            if row.key != NARRATOR {
+                                ui.checkbox(&mut row.remove, "remove");
+                            } else {
+                                ui.label("");
+                            }
+                            ui.end_row();
+                        }
+                    });
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Add character");
+                    ui.add(egui::TextEdit::singleline(&mut ed.new_key).hint_text("name"));
+                    if ui.button("Add").clicked() {
+                        let key = crate::llm::normalize_key(&ed.new_key);
+                        if !key.is_empty() && !ed.rows.iter().any(|r| r.key == key) {
+                            ed.rows.push(VoiceRow {
+                                key: key.clone(),
+                                display_name: ed.new_key.trim().to_string(),
+                                aliases: String::new(),
+                                voice_id: String::new(),
+                                character_id: None,
+                                remove: false,
+                            });
+                        }
+                        ed.new_key.clear();
                     }
                 });
-            });
-            ui.horizontal(|ui| {
-                ui.label("Add character key:");
-                ui.text_edit_singleline(&mut ed.new_key);
-                if ui.button("Add").clicked() {
-                    let key = crate::llm::normalize_key(&ed.new_key);
-                    if !key.is_empty() && !ed.rows.iter().any(|r| r.key == key) {
-                        ed.rows.push(VoiceRow {
-                            key: key.clone(),
-                            display_name: ed.new_key.trim().to_string(),
-                            aliases: String::new(),
-                            voice_id: String::new(),
-                            character_id: None,
-                            remove: false,
-                        });
+                ui.horizontal(|ui| {
+                    ui.label("Reassign speaker");
+                    ui.add(egui::TextEdit::singleline(&mut ed.rename_from).desired_width(110.0).hint_text("from key"));
+                    ui.label("→");
+                    ui.add(egui::TextEdit::singleline(&mut ed.rename_to).desired_width(110.0).hint_text("to key"));
+                    if ui.button("Apply to all unapproved segments").clicked() {
+                        rename = Some((ed.rename_from.trim().to_string(), crate::llm::normalize_key(&ed.rename_to)));
                     }
-                    ed.new_key.clear();
-                }
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    save = ui.add(primary_button(ui, "Save")).clicked();
+                    cancel = ui.button("Close").clicked();
+                });
             });
-            ui.horizontal(|ui| {
-                ui.label("Reassign speaker");
-                ui.add(egui::TextEdit::singleline(&mut ed.rename_from).desired_width(110.0).hint_text("from key"));
-                ui.label("→");
-                ui.add(egui::TextEdit::singleline(&mut ed.rename_to).desired_width(110.0).hint_text("to key"));
-                if ui.button("Apply to all unapproved segments").clicked() {
-                    rename = Some((ed.rename_from.trim().to_string(), crate::llm::normalize_key(&ed.rename_to)));
-                }
-            });
-            ui.horizontal(|ui| {
-                save = ui.button("Save").clicked();
-                cancel = ui.button("Close").clicked();
-            });
-        });
         if fetch {
             self.worker.send(Command::FetchVoices);
         }
@@ -1893,7 +2282,7 @@ impl App {
         let mut ok = false;
         let mut cancel = false;
         egui::Window::new("Split segment")
-            .default_width(520.0)
+            .default_width(540.0)
             .collapsible(false)
             .show(ctx, |ui| {
                 ui.label(
@@ -1905,10 +2294,10 @@ impl App {
                         .desired_width(f32::INFINITY),
                 );
                 if let Some(e) = error {
-                    ui.colored_label(Color32::from_rgb(220, 80, 80), e.as_str());
+                    ui.colored_label(theme::palette(ui).rejected, e.as_str());
                 }
                 ui.horizontal(|ui| {
-                    ok = ui.button("Split").clicked();
+                    ok = ui.add(primary_button(ui, "Split")).clicked();
                     cancel = ui.button("Cancel").clicked();
                 });
             });
@@ -1934,23 +2323,29 @@ impl App {
         };
         let mut go = false;
         let mut cancel = false;
-        egui::Window::new(&plan.title).collapsible(false).resizable(false).show(ctx, |ui| {
-            ui.label(format!(
-                "{} segments, {} characters. Each generation costs its full character count in credits (cached takes are free).",
-                plan.ids.len(),
-                plan.chars
-            ));
-            if plan.unassigned > 0 {
-                ui.colored_label(
-                    Color32::from_rgb(230, 160, 40),
-                    format!("{} segments skipped: unassigned voice.", plan.unassigned),
-                );
-            }
-            ui.horizontal(|ui| {
-                go = ui.add_enabled(!plan.ids.is_empty(), egui::Button::new("Generate")).clicked();
-                cancel = ui.button("Cancel").clicked();
+        egui::Window::new(&plan.title)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "{} segments, {} characters. Each generation costs its full character count in credits (cached takes are free).",
+                    plan.ids.len(),
+                    plan.chars
+                ));
+                if plan.unassigned > 0 {
+                    ui.colored_label(
+                        theme::palette(ui).warning,
+                        format!("{} segments skipped: unassigned voice.", plan.unassigned),
+                    );
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    go = ui
+                        .add_enabled(!plan.ids.is_empty(), primary_button(ui, "Generate"))
+                        .clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
             });
-        });
         if go {
             let plan = self.dialogs.generate.take().unwrap();
             self.queue_generate(plan.ids, plan.reroll);
@@ -1960,27 +2355,6 @@ impl App {
     }
 
     fn dialog_confirmations(&mut self, ctx: &egui::Context) {
-        if let Some((id, title)) = &mut self.dialogs.rename_chapter {
-            let mut ok = false;
-            let mut cancel = false;
-            egui::Window::new("Rename chapter")
-                .collapsible(false)
-                .show(ctx, |ui| {
-                    ui.text_edit_singleline(title);
-                    ui.horizontal(|ui| {
-                        ok = ui.button("Rename").clicked();
-                        cancel = ui.button("Cancel").clicked();
-                    });
-                });
-            if ok {
-                let r = self.db.rename_chapter(*id, title.trim());
-                self.try_db(r);
-                self.dialogs.rename_chapter = None;
-                self.dirty = true;
-            } else if cancel {
-                self.dialogs.rename_chapter = None;
-            }
-        }
         if let Some(id) = self.dialogs.delete_chapter {
             let title = self
                 .chapters
@@ -1998,11 +2372,11 @@ impl App {
                 if yes {
                     let r = self.db.delete_chapter(id);
                     self.try_db(r);
-                    if self.view.chapter_id == Some(id) {
-                        self.view = ChapterView::default();
-                        self.selected = None;
+                    self.reload_project_data();
+                    match self.chapters.last().map(|c| c.id) {
+                        Some(latest) => self.open_chapter(latest),
+                        None => self.new_chapter(),
                     }
-                    self.dirty = true;
                 }
                 self.dialogs.delete_chapter = None;
             }
@@ -2020,6 +2394,7 @@ impl App {
                 self.project = None;
                 self.chapters.clear();
                 self.view = ChapterView::default();
+                self.draft = TextDraft::default();
                 self.selected = None;
                 self.reload_projects();
                 if let Some(first) = self.projects.first().map(|p| p.id) {
@@ -2032,14 +2407,25 @@ impl App {
             && let Some(yes) = confirm(
                 ctx,
                 "Re-segment",
-                "Re-run attribution for paragraphs whose segments are all untouched drafts? Paragraphs with any audio are kept as they are. Manual edits in draft paragraphs are replaced.",
+                "Re-run attribution (and audio tags) for paragraphs whose segments are all untouched drafts? Paragraphs with any audio are kept as they are. Manual edits in draft paragraphs are replaced.",
             )
         {
             if yes {
-                self.worker
-                    .send(Command::SegmentChapter { chapter_id: cid });
+                self.segment_chapter(cid);
             }
             self.dialogs.resegment = None;
+        }
+        if self.dialogs.resplit
+            && let Some(yes) = confirm(
+                ctx,
+                "Save changed text",
+                "Saving re-splits the chapter into paragraphs. Its segments, speakers and tags are discarded and must be generated again (no audio exists yet, so no credits are lost).",
+            )
+        {
+            self.dialogs.resplit = false;
+            if yes {
+                self.save_text(true);
+            }
         }
     }
 }
@@ -2062,10 +2448,13 @@ fn confirm(ctx: &egui::Context, title: &str, text: &str) -> Option<bool> {
     egui::Window::new(title)
         .collapsible(false)
         .resizable(false)
+        .anchor(egui::Align2::CENTER_TOP, [0.0, 120.0])
         .show(ctx, |ui| {
+            ui.set_max_width(420.0);
             ui.label(text);
+            ui.add_space(6.0);
             ui.horizontal(|ui| {
-                if ui.button("Yes").clicked() {
+                if ui.add(primary_button(ui, "Yes")).clicked() {
                     answer = Some(true);
                 }
                 if ui.button("Cancel").clicked() {
@@ -2103,34 +2492,82 @@ impl eframe::App for App {
         self.handle_events();
         let ctx = ui.ctx().clone();
         self.keyboard(&ctx);
+        let p = *theme::palette(ui);
 
-        egui::Panel::left("sidebar")
-            .default_size(250.0)
-            .show(ui, |ui| self.sidebar(ui));
-        egui::Panel::bottom("status").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let err = self.log.last().is_some_and(|(e, _)| *e);
-                if err {
-                    ui.colored_label(Color32::from_rgb(220, 100, 100), &self.status);
-                } else {
-                    ui.label(RichText::new(&self.status).weak());
+        egui::Panel::top("top")
+            .frame(
+                egui::Frame::new()
+                    .fill(p.card)
+                    .stroke(Stroke::new(1.0, p.border))
+                    .inner_margin(egui::Margin::symmetric(14, 2)),
+            )
+            .show(ui, |ui| self.top_bar(ui));
+        egui::Panel::bottom("status")
+            .frame(
+                egui::Frame::new()
+                    .fill(ui.visuals().panel_fill)
+                    .inner_margin(egui::Margin::symmetric(14, 4)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let err = self.log.last().is_some_and(|(e, _)| *e);
+                    let color = if err { p.rejected } else { p.muted };
+                    ui.label(RichText::new(&self.status).small().color(color));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("Log").clicked() {
+                            self.dialogs.log = !self.dialogs.log;
+                        }
+                        if self.tab == Tab::Review {
+                            ui.label(
+                                RichText::new(
+                                    "Space play · P paragraph · A approve · R re-roll · ↑↓ ←→ move",
+                                )
+                                .small()
+                                .color(p.muted),
+                            );
+                        }
+                    });
+                });
+            });
+
+        let tab = if self.tab == Tab::Review && self.view.chapter_id.is_none() {
+            Tab::Text
+        } else {
+            self.tab
+        };
+        match tab {
+            Tab::Text => {
+                egui::CentralPanel::default().show(ui, |ui| self.text_tab(ui));
+            }
+            Tab::Review => {
+                egui::Panel::top("review_toolbar")
+                    .frame(
+                        egui::Frame::new()
+                            .fill(ui.visuals().panel_fill)
+                            .inner_margin(egui::Margin::symmetric(16, 2)),
+                    )
+                    .show(ui, |ui| self.review_toolbar(ui));
+                if !self.view.segments.is_empty() {
+                    egui::Panel::bottom("detail")
+                        .resizable(true)
+                        .default_size(270.0)
+                        .frame(
+                            egui::Frame::new()
+                                .fill(p.card)
+                                .stroke(Stroke::new(1.0, p.border))
+                                .inner_margin(egui::Margin::symmetric(18, 8)),
+                        )
+                        .show(ui, |ui| self.detail_panel(ui));
                 }
-            });
-        });
-        if self.view.chapter_id.is_some() {
-            egui::Panel::top("toolbar").show(ui, |ui| {
-                ui.add_space(4.0);
-                self.chapter_toolbar(ui);
-                ui.add_space(4.0);
-            });
-            if !self.view.segments.is_empty() {
-                egui::Panel::bottom("detail")
-                    .resizable(true)
-                    .default_size(240.0)
-                    .show(ui, |ui| self.detail_panel(ui));
+                egui::CentralPanel::default()
+                    .frame(
+                        egui::Frame::new()
+                            .fill(ui.visuals().panel_fill)
+                            .inner_margin(egui::Margin::symmetric(16, 6)),
+                    )
+                    .show(ui, |ui| self.segment_list(ui));
             }
         }
-        egui::CentralPanel::default().show(ui, |ui| self.segment_list(ui));
         self.dialogs(&ctx);
 
         if self.player.is_playing() {

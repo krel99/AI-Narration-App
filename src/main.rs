@@ -11,6 +11,8 @@ mod llm;
 mod model;
 mod player;
 mod segment;
+mod tags;
+mod theme;
 mod tts;
 mod worker;
 

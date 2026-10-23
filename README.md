@@ -1,10 +1,18 @@
 # Narration Studio
 
 A native Linux desktop app that turns long prose into multi-voice audiobook
-narration through the ElevenLabs API. Claude attributes speakers, and every
-segment is reviewed individually: approve it, or re-roll it with a new seed.
-Approved chapters are then assembled and exported as MP3 (ACX spec), FLAC and
-M4B with chapter markers.
+narration through the ElevenLabs API. Claude attributes speakers and directs
+the performance with ElevenLabs audio tags (`[whispers]`, `[thoughtful]`,
+`[long pause]`), in narration as well as dialogue. Every segment is reviewed
+individually: approve it, or re-roll it with a new seed. Approved chapters are
+then assembled and exported as MP3 (ACX spec), FLAC and M4B with chapter
+markers.
+
+You work on one chapter at a time, in two tabs:
+
+| 1 Text: paste the chapter as plain prose | 2 Review: speakers, audio tags, takes |
+|---|---|
+| ![Text tab](docs/screenshots/text.png) | ![Review tab](docs/screenshots/review.png) |
 
 The design and the reasoning behind it are in [docs/design.md](docs/design.md),
 including how this first build settles the open decisions.
@@ -30,29 +38,38 @@ Claude and ElevenLabs servers, so they need no API keys.
 
 ## Setup
 
-1. **Settings…**: enter your Anthropic and ElevenLabs API keys. They are stored
+1. **Settings**: enter your Anthropic and ElevenLabs API keys. They are stored
    in `~/.config/narration-studio/config.json` (mode 0600). The environment
    variables `ANTHROPIC_API_KEY` and `ELEVENLABS_API_KEY` are used when the
-   fields are empty.
-2. **＋** creates a project. Choose its language, which sets the quote styles
-   and the default TTS model.
-3. **Project…**: pick the TTS model and output format (`pcm_44100` needs the
-   Pro plan or higher; `mp3_44100_192` is the fallback). Set the concurrency to
-   your plan's limit, and adjust silence durations and segmentation chunking.
-4. **Voices…**: give every speaker an ElevenLabs voice id, including the
+   fields are empty. Appearance is light by default; a dark theme is available.
+2. The project menu's **＋ New project…** creates a project. Choose its
+   language, which sets the quote styles.
+3. **Project**: pick the TTS model (default `eleven_v4`; v4, v4 Turbo and v3
+   perform audio tags) and the output format (`pcm_44100` needs the Pro plan or
+   higher; `mp3_44100_192` is the fallback). Set the concurrency to your plan's
+   limit. Under *Audio tags*, choose the density (light, moderate, rich) and
+   add director's notes for the whole book
+   ([screenshot](docs/screenshots/project-settings.png)).
+4. **Voices**: give every speaker an ElevenLabs voice id, including the
    narrator. *Load my ElevenLabs voices* fills a picker from your account.
 
 ## Workflow
 
-1. **Import** a chapter from a text file, or **Paste** one. Paragraphs are
-   separated by blank lines; a line like `***` or `#` marks a scene break.
-2. **Segment with Claude** splits paragraphs into narration and dialogue and
-   attributes speakers. Every result is checked against the source text, and a
-   paragraph that keeps failing falls back to a quote parser with speaker
-   `unknown`. Paragraphs without dialogue never go to the API.
-3. Fix attribution while it is free: change speakers, merge or split segments
-   (*Split…* takes `|` markers). Segments whose speaker has no voice show
-   ⚠ and are skipped.
+1. **Text tab**: paste the chapter as plain prose, or *Open text file…*.
+   Paragraphs are separated by blank lines; a line like `***` or `#` marks a
+   scene break. The text stays editable until the chapter has audio. The
+   chapter menu at the top switches chapters or starts a new one.
+2. **Segment & add audio tags** saves the text, splits paragraphs into
+   narration and dialogue, and attributes speakers. Every result is checked
+   against the source text, and a paragraph that keeps failing falls back to a
+   quote parser with speaker `unknown`. Claude then inserts audio tags into
+   narration and dialogue. Tags may only be added: if stripping them doesn't
+   give back the exact source words, the suggestion is rejected.
+3. **Review tab**: fix attribution and tags while it is free. Change speakers,
+   merge or split segments (*Split…* takes `|` markers), and edit a segment's
+   tags in the detail panel. **✦ Audio tags** re-runs the tagging for all
+   draft segments. Segments whose speaker has no voice show ⚠ and are
+   skipped.
 4. **Generate N drafts**. A confirmation shows the character count first.
    Identical inputs reuse cached takes at no cost.
 5. Review with the keyboard and approve or re-roll. Earlier takes stay
@@ -89,7 +106,8 @@ Every pipeline stage resumes from this state after a restart.
 | File | Role |
 |------|------|
 | `src/segment.rs` | Paragraph splitting, language-aware quote parser, exact-text validator, split/merge helpers |
-| `src/llm.rs` | Claude attribution request (structured JSON output) and response parsing |
+| `src/tags.rs` | Audio-tag parsing and the check that tags never change the words |
+| `src/llm.rs` | Claude attribution and audio-tag direction requests (structured JSON output) |
 | `src/tts.rs` | ElevenLabs text-to-speech and voice list |
 | `src/worker.rs` | Command/event channels, segmentation pass, TTS worker pool, export jobs |
 | `src/db.rs` | SQLite schema and queries |
@@ -97,4 +115,5 @@ Every pipeline stage resumes from this state after a restart.
 | `src/export.rs` | Streaming assembly with silences; ffmpeg loudnorm and encode |
 | `src/hash.rs` | Take hash |
 | `src/player.rs` | rodio playback queue |
-| `src/app.rs` | egui UI |
+| `src/app.rs` | egui UI (Text and Review tabs, dialogs) |
+| `src/theme.rs` | Light (default) and dark themes, semantic colours |

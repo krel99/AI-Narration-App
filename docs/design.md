@@ -147,7 +147,7 @@ goes beyond the plan. Everything below is a default that can be changed.
 | Decision | Status in code |
 |----------|----------------|
 | Final stack | Built with **Rust + egui** (eframe 0.37, rodio 0.23, rusqlite, tokio + reqwest, hound). Go + Fyne was not pursued. |
-| Language / TTS model | Per project. New projects start on `eleven_multilingual_v2` (stable, supports request stitching); `eleven_v3`, `eleven_turbo_v2_5` and `eleven_flash_v2_5` are selectable in Project settings. `language_code` is sent only to models that accept it (v2.5, v3). |
+| Language / TTS model | Per project. New projects start on `eleven_v4` (performs audio tags); `eleven_v4_turbo`, `eleven_v3`, `eleven_multilingual_v2`, `eleven_turbo_v2_5` and `eleven_flash_v2_5` are selectable in Project settings. `language_code` is sent only to models that accept it (v2.5, v3, v4). |
 | pcm_44100 | Default. Project settings offer `pcm_24000`, `pcm_22050` and the `mp3_44100_192` fallback (decoded to PCM once on arrival). Still needs confirming against the actual plan. |
 | Silence defaults | 0 ms within a paragraph, 700 ms between paragraphs, 2000 ms at scene breaks, 750 ms chapter lead-in, 2000 ms tail (inside ACX's room-tone ranges). All editable per project. |
 | Dialogue tags | Stay narrator-voiced. No automatic merge option yet; the editor's *Merge with next/previous* covers individual cases. Still open. |
@@ -213,6 +213,44 @@ goes beyond the plan. Everything below is a default that can be changed.
 - One library database holds all projects (default
   `~/.local/share/narration-studio/`), with audio shared across projects so the
   hash cache works library-wide.
+
+### Audio tags (added after the first build)
+
+Requested on top of the original plan: ElevenLabs audio tags such as
+`[whispers]`, `[thoughtful]`, `[short pause]` and `[long pause]`, in narration
+as well as dialogue. For example:
+
+```
+said Lieutenant Vale. [thoughtful] Commander Voss looked at the countdown above the forward display. Three minutes. … [long pause] It would not. [short pause] The first enemy vessel slid out of the planet’s shadow.
+```
+
+- ElevenLabs performs tags on Eleven v4, v4 Turbo and v3, but has no API that
+  inserts them, so Claude does it in a separate "direction" pass. It runs
+  automatically after segmentation (project setting, on by default) and on
+  demand with *✦ Audio tags*.
+- The segment keeps its exact source `text`; the tagged version is stored
+  separately as `performance`. Validation strips the tags, collapses
+  whitespace (dropping the gap a tag leaves next to a quote mark), and requires
+  the result to equal the source exactly. Bracketed text already in the source
+  (`[sic]`) must survive, and a segment may not end in a tag, because a tag
+  shapes the text after it. Invalid suggestions are discarded and counted.
+- The direction pass only touches draft segments without audio. The automatic
+  run skips segments that already have tags; the manual run replaces them.
+- What is spoken: `performance` for tag-capable models, plain `text`
+  otherwise. The take hash uses the spoken text, so changing tags never reuses
+  an old take. Neighbouring `previous_text`/`next_text` stay plain.
+- Settings: density (light, moderate, rich) and free-form director's notes per
+  project. Tags can also be edited per segment in the review detail panel.
+- New projects default to `eleven_v4`.
+
+### UI (revised)
+
+- One chapter at a time: the sidebar is gone. The top bar holds the project
+  and chapter pickers, the chapter menu (new chapter, delete, export book) and
+  two tabs. **Text** shows the chapter as plain prose, editable until it has
+  audio. **Review** is the segment list.
+- A light "paper" theme is the default (`src/theme.rs`); a dark theme is
+  available in Settings.
 
 ### To verify against a real account
 

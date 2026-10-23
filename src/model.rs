@@ -169,6 +169,28 @@ impl Default for SegmentationSettings {
     }
 }
 
+/// How Claude inserts ElevenLabs audio tags (`[whispers]`, `[long pause]`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AudioTagSettings {
+    /// Add tags automatically after segmentation (tag-capable models only).
+    pub enabled: bool,
+    /// light | moderate | rich
+    pub density: String,
+    /// Free-form direction for the whole project ("keep the narrator calm").
+    pub direction: String,
+}
+
+impl Default for AudioTagSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            density: "moderate".into(),
+            direction: String::new(),
+        }
+    }
+}
+
 /// Project-level settings that are not first-class columns.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -183,6 +205,7 @@ pub struct ProjectSettings {
     pub reroll_on_reject: bool,
     pub silence: SilenceSettings,
     pub segmentation: SegmentationSettings,
+    pub audio_tags: AudioTagSettings,
 }
 
 impl Default for ProjectSettings {
@@ -194,6 +217,7 @@ impl Default for ProjectSettings {
             reroll_on_reject: true,
             silence: SilenceSettings::default(),
             segmentation: SegmentationSettings::default(),
+            audio_tags: AudioTagSettings::default(),
         }
     }
 }
@@ -261,8 +285,22 @@ pub struct Segment {
     pub speaker: String,
     pub text: String,
     pub settings_override: Option<VoiceSettings>,
+    /// The text with audio tags inserted (`[whispers] Get down.`), sent to
+    /// tag-capable models instead of `text`. Without its tags it equals `text`.
+    pub performance: Option<String>,
     pub status: SegmentStatus,
     pub current_take_id: Option<Id>,
+}
+
+impl Segment {
+    /// What the TTS model receives: the tagged performance when the model can
+    /// perform tags, the plain text otherwise.
+    pub fn spoken_text(&self, tts_model: &str) -> &str {
+        match &self.performance {
+            Some(p) if crate::lang::model_supports_tags(tts_model) => p,
+            _ => &self.text,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

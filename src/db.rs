@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS segment (
     speaker           TEXT NOT NULL,
     text              TEXT NOT NULL,
     settings_override TEXT,
+    performance       TEXT,
     status            TEXT NOT NULL,
     current_take_id   INTEGER
 );
@@ -193,7 +194,7 @@ fn row_paragraph(r: &Row) -> rusqlite::Result<Paragraph> {
     })
 }
 
-const SEGMENT_COLS: &str = "s.id, s.paragraph_id, s.ord, s.kind, s.speaker, s.text, s.settings_override, s.status, s.current_take_id";
+const SEGMENT_COLS: &str = "s.id, s.paragraph_id, s.ord, s.kind, s.speaker, s.text, s.settings_override, s.status, s.current_take_id, s.performance";
 
 fn row_segment(r: &Row) -> rusqlite::Result<Segment> {
     let kind: String = r.get(3)?;
@@ -209,6 +210,7 @@ fn row_segment(r: &Row) -> rusqlite::Result<Segment> {
         settings_override: ovr.and_then(|s| serde_json::from_str(&s).ok()),
         status: SegmentStatus::parse(&status).unwrap_or(SegmentStatus::Draft),
         current_take_id: r.get(8)?,
+        performance: r.get(9)?,
     })
 }
 
@@ -254,6 +256,13 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
+        // Libraries created before audio tags lack the performance column.
+        let has_performance: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('segment') WHERE name = 'performance'")?
+            .exists([])?;
+        if !has_performance {
+            conn.execute_batch("ALTER TABLE segment ADD COLUMN performance TEXT")?;
+        }
         Ok(Self { conn })
     }
 
@@ -459,34 +468,36 @@ impl Db {
         Ok(chapter_id)
     }
 
+    /// Replace a chapter's text and re-split it into paragraphs. Only allowed
+    /// while no segment of the chapter has audio, so no paid take is lost.
+    pub fn replace_chapter_text(&mut self, id: Id, title: &str, source_text: &str) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        let takes: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM take t JOIN segment s ON s.id = t.segment_id
+             JOIN paragraph p ON p.id = s.paragraph_id WHERE p.chapter_id = ?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        if takes > 0 {
+            return Err(anyhow!(
+                "this chapter already has audio; start a new chapter instead"
+            ));
+        }
+        tx.execute(
+            "UPDATE chapter SET title = ?2, source_text = ?3, status = ?4 WHERE id = ?1",
+            params![id, title, source_text, ChapterStatus::Imported.as_str()],
+        )?;
+        tx.execute("DELETE FROM paragraph WHERE chapter_id = ?1", [id])?;
+        insert_paragraphs(&tx, id, &segment::split_paragraphs(source_text))?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn rename_chapter(&self, id: Id, title: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE chapter SET title = ?2 WHERE id = ?1",
             params![id, title],
         )?;
-        Ok(())
-    }
-
-    pub fn move_chapter(&mut self, id: Id, delta: i64) -> Result<()> {
-        let ch = self.chapter(id)?;
-        let chapters = self.chapters(ch.project_id)?;
-        let Some(pos) = chapters.iter().position(|c| c.id == id) else {
-            return Ok(());
-        };
-        let target = pos as i64 + delta;
-        if target < 0 || target >= chapters.len() as i64 {
-            return Ok(());
-        }
-        let mut ids: Vec<Id> = chapters.iter().map(|c| c.id).collect();
-        ids.swap(pos, target as usize);
-        let tx = self.conn.transaction()?;
-        for (i, cid) in ids.iter().enumerate() {
-            tx.execute(
-                "UPDATE chapter SET ord = ?2 WHERE id = ?1",
-                params![cid, i as i64 + 1],
-            )?;
-        }
-        tx.commit()?;
         Ok(())
     }
 
@@ -606,6 +617,19 @@ impl Db {
         Ok(())
     }
 
+    /// Set (or clear) the tagged performance. Changing what is spoken drops
+    /// the segment back to draft; earlier takes stay in the take list.
+    pub fn set_segment_performance(&self, id: Id, performance: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE segment SET performance = ?2,
+                    status = CASE WHEN performance IS ?2 THEN status ELSE 'draft' END,
+                    current_take_id = CASE WHEN performance IS ?2 THEN current_take_id ELSE NULL END
+             WHERE id = ?1 AND status != 'approved'",
+            params![id, performance],
+        )?;
+        Ok(())
+    }
+
     pub fn set_segment_kind(&self, id: Id, kind: SegmentKind) -> Result<()> {
         self.conn.execute(
             "UPDATE segment SET kind = ?2 WHERE id = ?1 AND status != 'approved'",
@@ -660,10 +684,21 @@ impl Db {
         }
         let texts: Vec<&str> = segs.iter().map(|s| s.text.as_str()).collect();
         let merged = segment::merged_text(&para.text, &texts, i, i + 1);
+        // Keep the audio tags of both halves when either had some.
+        let performance = (seg.performance.is_some() || next.performance.is_some())
+            .then(|| {
+                let a = seg.performance.as_deref().unwrap_or(&seg.text);
+                let b = next.performance.as_deref().unwrap_or(&next.text);
+                crate::tags::validate(&merged, &format!("{a} {b}"))
+                    .ok()
+                    .flatten()
+            })
+            .flatten();
         let tx = self.conn.transaction()?;
         tx.execute(
-            "UPDATE segment SET text = ?2, status = 'draft', current_take_id = NULL WHERE id = ?1",
-            params![id, merged],
+            "UPDATE segment SET text = ?2, performance = ?3, status = 'draft', current_take_id = NULL
+             WHERE id = ?1",
+            params![id, merged, performance],
         )?;
         tx.execute("DELETE FROM segment WHERE id = ?1", [next.id])?;
         tx.commit()?;
@@ -683,7 +718,8 @@ impl Db {
             params![seg.paragraph_id, seg.order, n],
         )?;
         tx.execute(
-            "UPDATE segment SET text = ?2, status = 'draft', current_take_id = NULL WHERE id = ?1",
+            "UPDATE segment SET text = ?2, performance = NULL, status = 'draft', current_take_id = NULL
+             WHERE id = ?1",
             params![id, parts[0]],
         )?;
         for (i, part) in parts.iter().enumerate().skip(1) {
@@ -834,7 +870,7 @@ mod tests {
     #[test]
     fn project_defaults_roundtrip() {
         let (db, mut project, _) = setup();
-        assert_eq!(project.tts_model, "eleven_multilingual_v2");
+        assert_eq!(project.tts_model, "eleven_v4");
         assert!(project.voice_map.contains_key(NARRATOR));
         assert_eq!(
             project.voice_for(NARRATOR),
@@ -951,6 +987,109 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn performance_tags_follow_edits() {
+        let (mut db, project, cid) = setup();
+        segment_paragraph(&mut db, &project, cid);
+        let segs = db.chapter_segments(cid).unwrap();
+        let (tag, quote) = (segs[1].id, segs[2].id);
+
+        // Setting tags on a generated segment drops it back to draft.
+        let t = db
+            .insert_take(&NewTake {
+                segment_id: tag,
+                seed: 1,
+                request_id: None,
+                audio_path: "a.wav",
+                hash: "h",
+                credits_used: 1,
+            })
+            .unwrap();
+        db.set_current_take(tag, t).unwrap();
+        db.set_segment_performance(tag, Some("[thoughtful] started Vortram,"))
+            .unwrap();
+        let s = db.segment(tag).unwrap();
+        assert_eq!(
+            s.performance.as_deref(),
+            Some("[thoughtful] started Vortram,")
+        );
+        assert_eq!((s.status, s.current_take_id), (SegmentStatus::Draft, None));
+        assert_eq!(s.spoken_text("eleven_v4"), "[thoughtful] started Vortram,");
+        assert_eq!(s.spoken_text("eleven_multilingual_v2"), "started Vortram,");
+
+        // Merging keeps both halves' tags.
+        db.set_segment_performance(quote, Some("\"[excited] truly magnificent!\""))
+            .unwrap();
+        db.merge_with_next(tag).unwrap();
+        let merged = db.segment(tag).unwrap();
+        assert_eq!(
+            merged.performance.as_deref(),
+            Some("[thoughtful] started Vortram, \"[excited] truly magnificent!\"")
+        );
+        // Splitting clears them (the user re-tags each half).
+        db.split_segment(
+            tag,
+            &["started Vortram,".into(), "\"truly magnificent!\"".into()],
+        )
+        .unwrap();
+        assert_eq!(db.segment(tag).unwrap().performance, None);
+    }
+
+    #[test]
+    fn chapter_text_can_change_until_audio_exists() {
+        let (mut db, project, cid) = setup();
+        segment_paragraph(&mut db, &project, cid);
+        db.replace_chapter_text(cid, "One (rev)", "New first.\n\nNew second.\n\nThird.")
+            .unwrap();
+        let ch = db.chapter(cid).unwrap();
+        assert_eq!(
+            (ch.title.as_str(), ch.status),
+            ("One (rev)", ChapterStatus::Imported)
+        );
+        assert_eq!(db.paragraphs(cid).unwrap().len(), 3);
+        assert!(db.chapter_segments(cid).unwrap().is_empty());
+
+        segment_paragraph(&mut db, &project, cid);
+        let s = db.chapter_segments(cid).unwrap()[0].id;
+        db.insert_take(&NewTake {
+            segment_id: s,
+            seed: 1,
+            request_id: None,
+            audio_path: "a.wav",
+            hash: "h",
+            credits_used: 1,
+        })
+        .unwrap();
+        assert!(db.replace_chapter_text(cid, "x", "y").is_err());
+    }
+
+    #[test]
+    fn old_libraries_gain_the_performance_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&SCHEMA.replace("    performance       TEXT,\n", ""))
+                .unwrap();
+            let cols: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('segment') WHERE name = 'performance'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(cols, 0);
+        }
+        let mut db = Db::open(&path).unwrap();
+        let pid = db.create_project("Old", "en").unwrap();
+        let cid = db.import_chapter(pid, "One", "Text.").unwrap();
+        let project = db.project(pid).unwrap();
+        segment_paragraph(&mut db, &project, cid);
+        assert_eq!(db.chapter_segments(cid).unwrap()[0].performance, None);
+        drop(db);
+        Db::open(&path).unwrap();
     }
 
     #[test]

@@ -16,6 +16,8 @@ pub struct AppConfig {
     /// Overrides the default library directory (takes effect on restart).
     pub library_dir: Option<PathBuf>,
     pub last_project: Option<i64>,
+    /// Dark theme instead of the default light one.
+    pub dark_mode: bool,
 }
 
 fn dirs() -> Option<directories::ProjectDirs> {
