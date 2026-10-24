@@ -489,7 +489,8 @@ impl App {
         while let Ok(ev) = self.worker.events.try_recv() {
             match ev {
                 Event::Info(m) => self.note(false, m),
-                Event::Error(m) => {
+                Event::Error(m) => self.note(true, m),
+                Event::ExportFailed(m) => {
                     self.exporting = false;
                     self.note(true, m)
                 }

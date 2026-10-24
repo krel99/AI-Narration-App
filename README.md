@@ -98,7 +98,7 @@ voices there on the web, then press *⟳ Refresh*
 Claude attributes speakers and adds audio tags. Settings → *Claude* offers two
 ways to run it:
 
-- **Claude Code — your Pro/Max subscription.** The app runs your own
+- **Claude Code — your Pro/Max subscription (the default).** The app runs your own
   [Claude Code](https://code.claude.com) CLI (`claude -p`), so the calls use
   your plan instead of API billing. Setup:
   1. Install Claude Code (2.1.290 or newer; `claude update` upgrades it).
@@ -126,7 +126,8 @@ ways to run it:
   *billed to the API, not your plan*, Claude Code is signed in with an API
   key: run `claude auth login` and choose your subscription.
 - **Anthropic API key — pay per use.** Requests go to the Messages API and are
-  billed per token. This is the default.
+  billed per token. Pick it in Settings if you prefer API billing or have no
+  Claude subscription.
 
 ## Costs
 

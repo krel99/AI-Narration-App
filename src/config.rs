@@ -13,15 +13,16 @@ use crate::worker::ApiKeys;
 #[serde(rename_all = "snake_case")]
 pub enum ClaudeBackend {
     /// The user's own Claude Code CLI, signed in with their Pro/Max plan.
+    /// The default: the user asked for the app to use Claude Code.
+    #[default]
     ClaudeCode,
     /// The Anthropic API with an API key, billed per token.
-    #[default]
     ApiKey,
 }
 
 impl<'de> Deserialize<'de> for ClaudeBackend {
-    /// Unknown values fall back to the default instead of failing the
-    /// whole config file (which would lose the stored keys).
+    /// Unknown values fall back to the default (Claude Code) instead of
+    /// failing the whole config file (which would lose the stored keys).
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let v = serde_json::Value::deserialize(d)?;
         Ok(match v.as_str() {
@@ -123,7 +124,10 @@ mod tests {
     fn old_configs_load_and_backends_roundtrip() {
         let old: AppConfig =
             serde_json::from_str(r#"{"anthropic_api_key":"k","dark_mode":true}"#).unwrap();
-        assert_eq!(old.claude_backend, ClaudeBackend::ApiKey);
+        // A config without the field (or with an unknown value) uses Claude Code.
+        assert_eq!(old.claude_backend, ClaudeBackend::ClaudeCode);
+        let api: AppConfig = serde_json::from_str(r#"{"claude_backend":"api_key"}"#).unwrap();
+        assert_eq!(api.claude_backend, ClaudeBackend::ApiKey);
         assert_eq!(old.anthropic_api_key, "k");
         assert_eq!(old.price_per_1000_credits, None);
 
@@ -146,7 +150,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             (odd.elevenlabs_api_key.as_str(), odd.claude_backend),
-            ("e", ClaudeBackend::ApiKey)
+            ("e", ClaudeBackend::ClaudeCode)
         );
         let odd: AppConfig =
             serde_json::from_str(r#"{"elevenlabs_api_key":"e","claude_backend":5}"#).unwrap();

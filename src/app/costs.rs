@@ -630,7 +630,7 @@ pub(super) fn claude_settings_section(
     ui.radio_value(
         &mut cfg.claude_backend,
         ClaudeBackend::ClaudeCode,
-        "Claude Code — your Pro/Max subscription",
+        "Claude Code — your Pro/Max subscription (default)",
     );
     if cfg.claude_backend == ClaudeBackend::ClaudeCode {
         if before != ClaudeBackend::ClaudeCode || (state.detection.is_none() && !state.detecting) {

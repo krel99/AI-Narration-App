@@ -148,6 +148,9 @@ pub enum Event {
         gaps: usize,
         duration_ms: u64,
     },
+    /// An export (chapter, book or retail sample) failed. The only failure
+    /// that ends the UI's export state.
+    ExportFailed(String),
     /// The account's voices, or why they could not be loaded.
     Voices(std::result::Result<Vec<VoiceInfo>, String>),
     VoicesLookedUp {
@@ -341,14 +344,19 @@ async fn run(ctx: &Ctx, cmd: Command) -> Result<()> {
             reroll,
         } => generate(ctx, segment_ids, reroll).await,
         Command::ExportChapter { chapter_id, draft } => {
-            retail::export_chapter(ctx, chapter_id, draft).await
+            export_outcome(ctx, retail::export_chapter(ctx, chapter_id, draft).await)
         }
-        Command::ExportBook { project_id } => retail::export_book(ctx, project_id).await,
+        Command::ExportBook { project_id } => {
+            export_outcome(ctx, retail::export_book(ctx, project_id).await)
+        }
         Command::ExportSample {
             chapter_id,
             start_segment,
             max_ms,
-        } => retail::export_sample(ctx, chapter_id, start_segment, max_ms).await,
+        } => export_outcome(
+            ctx,
+            retail::export_sample(ctx, chapter_id, start_segment, max_ms).await,
+        ),
         Command::FetchVoices => voices::fetch_voices(ctx).await,
         Command::LookupVoices { ids } => voices::lookup_voices(ctx, ids).await,
         Command::PreviewVoice { voice, language } => {
@@ -365,6 +373,16 @@ async fn run(ctx: &Ctx, cmd: Command) -> Result<()> {
         Command::Check(c) => takecheck::run_command(ctx, c).await,
         Command::Cancel | Command::SetKeys(_) => Ok(()),
     }
+}
+
+/// Export failures get their own event, so the UI ends its export state on
+/// them and never on an unrelated job's error.
+fn export_outcome(ctx: &Ctx, result: Result<()>) -> Result<()> {
+    if let Err(e) = result {
+        ctx.out
+            .emit(Event::ExportFailed(format!("Export failed: {e:#}")));
+    }
+    Ok(())
 }
 
 fn backoff(attempt: u32) -> Duration {
@@ -1264,10 +1282,13 @@ mod tests {
             lib: lib.clone(),
             db: Arc::new(Mutex::new(lib.open().unwrap())),
             http: reqwest::Client::builder().no_proxy().build().unwrap(),
+            // The pipeline tests talk to a fake Messages API; the Claude
+            // Code tests switch the backend themselves.
             keys: Arc::new(RwLock::new(ApiKeys {
                 anthropic: "test".into(),
                 elevenlabs: "test".into(),
-                ..Default::default()
+                claude_backend: crate::config::ClaudeBackend::ApiKey,
+                claude_code_path: None,
             })),
             out: Emitter {
                 tx,

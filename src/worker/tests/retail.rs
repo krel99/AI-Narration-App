@@ -145,15 +145,68 @@ fn chapter_export_is_checked_and_reported() {
         .unwrap();
     // Unapproving a segment makes the chapter's report outdated.
     assert!(ctx.db(|db| db.stale_reports(pid)).unwrap().contains(&cid));
-    let err = rt
-        .block_on(run(
-            &ctx,
-            Command::ExportSample {
-                chapter_id: cid,
-                start_segment: Some(segs[2].id),
-                max_ms: 120_000,
-            },
-        ))
-        .unwrap_err();
-    assert!(format!("{err:#}").contains("not approved"), "{err:#}");
+    let _ = events(&rx);
+    rt.block_on(run(
+        &ctx,
+        Command::ExportSample {
+            chapter_id: cid,
+            start_segment: Some(segs[2].id),
+            max_ms: 120_000,
+        },
+    ))
+    .unwrap();
+    // The failure comes as ExportFailed (which ends the UI's export state),
+    // not as a generic Error.
+    let ev = events(&rx);
+    let failed: Vec<&String> = ev
+        .iter()
+        .filter_map(|e| match e {
+            Event::ExportFailed(m) => Some(m),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(failed.len(), 1, "{ev:?}");
+    assert!(failed[0].contains("not approved"), "{}", failed[0]);
+    assert!(!ev.iter().any(|e| matches!(e, Event::Error(_))), "{ev:?}");
+}
+
+/// Only an export's own failure ends the UI's export state: other jobs
+/// report theirs as Error.
+#[test]
+fn export_failures_have_their_own_event() {
+    let book = approved_book(lighthouse());
+    let (ctx, rx) = test_ctx(&book.lib, "http://127.0.0.1:9", "http://127.0.0.1:9");
+    let rt = rt();
+    let cid = book.chapter.id;
+    let segs = ctx.db(|db| db.chapter_segments(cid)).unwrap();
+    ctx.db(|db| db.set_segment_status(segs[0].id, SegmentStatus::Generated))
+        .unwrap();
+    // A final export of a chapter that is not fully approved is refused.
+    rt.block_on(run(
+        &ctx,
+        Command::ExportChapter {
+            chapter_id: cid,
+            draft: false,
+        },
+    ))
+    .unwrap();
+    let ev = events(&rx);
+    assert!(
+        ev.iter()
+            .any(|e| matches!(e, Event::ExportFailed(m) if m.contains("approved"))),
+        "{ev:?}"
+    );
+    assert!(!ev.iter().any(|e| matches!(e, Event::Error(_))), "{ev:?}");
+    // An unrelated failure stays an Err (reported as Event::Error by the
+    // command loop) and never as ExportFailed.
+    let r = rt.block_on(run(&ctx, Command::AutoTrimChapter { chapter_id: 9999 }));
+    let ev = events(&rx);
+    assert!(
+        r.is_err() || ev.iter().any(|e| matches!(e, Event::Error(_))),
+        "{r:?} {ev:?}"
+    );
+    assert!(
+        !ev.iter().any(|e| matches!(e, Event::ExportFailed(_))),
+        "{ev:?}"
+    );
 }

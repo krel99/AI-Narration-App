@@ -261,16 +261,23 @@ said Lieutenant Vale. [thoughtful] Commander Voss looked at the countdown above 
 Requested: use the user's Claude subscription through Claude Code instead of
 paying for the API as well, and show estimated costs.
 
-- **Backends.** `AppConfig.claude_backend` is `api_key` (default) or
-  `claude_code`, plus an optional `claude_code_path`. `llm::ClaudeClient` has a
+- **Backends.** `AppConfig.claude_backend` is `claude_code` (default) or
+  `api_key`, plus an optional `claude_code_path`. `llm::ClaudeClient` has a
   transport: `Api { url, key }` (unchanged Messages API requests) or
   `ClaudeCode(Invocation)`. Prompts, schemas and validation are shared; both
   return the structured JSON to the same parsers.
-- **Default.** The API key stays the default and Claude Code is opt-in in
-  Settings: Anthropic's terms describe subscription logins as meant for
-  ordinary, individual use of Claude Code, so the app should not route its
-  users through a subscription by default (and must not if it is ever
-  distributed).
+- **Default.** Claude Code is the default, because the user asked for the
+  app to use Claude Code; a config file without the field, or with a value
+  this version does not know, means Claude Code. The research recommended
+  the API key as the default (Anthropic's terms describe subscription
+  logins as meant for ordinary, individual use of Claude Code), so
+  Settings and the README say this backend is for the user's own use on
+  their own computer, that its calls share the plan's usage limits with
+  the Claude apps, and that a distributed build must not route other
+  people through a subscription. The API-key backend stays one click away.
+- **Errors name the transport.** `LlmError::Transient` and `Fatal` carry
+  `Via::Api` or `Via::ClaudeCode`, so messages read "Claude API error: …"
+  or "Claude Code error: …".
 - **Invocation** (`claude_code.rs`): `claude -p --output-format json
   --json-schema <schema> --model <full id> --effort <level> --system-prompt
   <prompt> --tools "" --strict-mcp-config --disable-slash-commands --safe-mode
