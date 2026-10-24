@@ -10,6 +10,11 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use crate::model::*;
 use crate::segment::{self, ParsedParagraph};
 
+mod costs;
+pub use costs::PassUsage;
+#[cfg(test)]
+pub use costs::UsageRow;
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS project (
     id                     INTEGER PRIMARY KEY,
@@ -70,6 +75,32 @@ CREATE INDEX IF NOT EXISTS take_hash ON take(hash);
 CREATE INDEX IF NOT EXISTS take_segment ON take(segment_id);
 CREATE INDEX IF NOT EXISTS segment_paragraph ON segment(paragraph_id, ord);
 CREATE INDEX IF NOT EXISTS paragraph_chapter ON paragraph(chapter_id, ord);
+CREATE TABLE IF NOT EXISTS llm_usage (
+    id                 INTEGER PRIMARY KEY,
+    project_id         INTEGER REFERENCES project(id) ON DELETE CASCADE,
+    chapter_id         INTEGER REFERENCES chapter(id) ON DELETE SET NULL,
+    pass               TEXT NOT NULL,
+    backend            TEXT NOT NULL,
+    model              TEXT NOT NULL,
+    input_tokens       INTEGER NOT NULL DEFAULT 0,
+    output_tokens      INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd           REAL,
+    created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+CREATE INDEX IF NOT EXISTS llm_usage_chapter ON llm_usage(chapter_id);
+CREATE TABLE IF NOT EXISTS take_cost (
+    take_id INTEGER PRIMARY KEY REFERENCES take(id) ON DELETE CASCADE,
+    model   TEXT NOT NULL,
+    chars   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS take_cost_model ON take_cost(model, take_id);
+CREATE TABLE IF NOT EXISTS model_rate (
+    model_id   TEXT PRIMARY KEY,
+    multiplier REAL NOT NULL,
+    fetched_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
 "#;
 
 /// Where the library lives on disk.

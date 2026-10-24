@@ -2,7 +2,9 @@
 
 mod app;
 mod audio;
+mod claude_code;
 mod config;
+mod costs;
 mod db;
 mod export;
 mod hash;

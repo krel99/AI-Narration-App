@@ -192,8 +192,10 @@ goes beyond the plan. Everything below is a default that can be changed.
   segments of the same paragraph that use the same voice. If the API rejects
   the request with ids attached, it is retried once without them.
 - 429 responses honour `retry-after`, otherwise exponential backoff with jitter.
-- Credits: read from the `character-cost` / `x-character-count` response
-  header, falling back to the text's character count.
+- Credits: read from the `character-cost` response header (`x-character-count`
+  as a fallback), parsed as a number and rounded. Without either header the
+  take stores an estimate at the learned rate, flagged inexact (see below);
+  never the text length, which overstates paid plans about 2x.
 
 ### Export details
 
@@ -251,6 +253,88 @@ said Lieutenant Vale. [thoughtful] Commander Voss looked at the countdown above 
   audio. **Review** is the segment list.
 - A light "paper" theme is the default (`src/theme.rs`); a dark theme is
   available in Settings.
+
+### Claude Code backend and costs (added after the first build)
+
+Requested: use the user's Claude subscription through Claude Code instead of
+paying for the API as well, and show estimated costs.
+
+- **Backends.** `AppConfig.claude_backend` is `api_key` (default) or
+  `claude_code`, plus an optional `claude_code_path`. `llm::ClaudeClient` has a
+  transport: `Api { url, key }` (unchanged Messages API requests) or
+  `ClaudeCode(Invocation)`. Prompts, schemas and validation are shared; both
+  return the structured JSON to the same parsers.
+- **Default.** The API key stays the default and Claude Code is opt-in in
+  Settings: Anthropic's terms describe subscription logins as meant for
+  ordinary, individual use of Claude Code, so the app should not route its
+  users through a subscription by default (and must not if it is ever
+  distributed).
+- **Invocation** (`claude_code.rs`): `claude -p --output-format json
+  --json-schema <schema> --model <full id> --effort <level> --system-prompt
+  <prompt> --tools "" --strict-mcp-config --disable-slash-commands --safe-mode
+  --setting-sources= --no-session-persistence --max-turns 8`, prompt on stdin,
+  cwd `<library>/claude-cwd/`, 20-minute timeout with kill-on-drop, stdout and
+  stderr read while stdin is written. Never `--bare` (it ignores the
+  subscription login) and no `--max-budget-usd` (a tripped cap discards the
+  finished answer). `--setting-sources=` is required: `--safe-mode` alone still
+  applies a settings file's `env` block, which can swap in an API key.
+- **Environment.** Removed: `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, the
+  Bedrock/Vertex/Foundry switches, `ANTHROPIC_PROFILE` and federation
+  variables, `CLAUDE_CODE_SIMPLE`, `CLAUDECODE`, `CLAUDE_CODE_EFFORT_LEVEL`
+  (it overrides `--effort`), `ANTHROPIC_MODEL`, `ANTHROPIC_BASE_URL` and the
+  `ANTHROPIC_DEFAULT_*_MODEL` aliases. Kept: `CLAUDE_CONFIG_DIR`,
+  `CLAUDE_CODE_OAUTH_TOKEN`, `HOME`, `PATH`, proxies. Set:
+  `CLAUDE_CODE_MAX_OUTPUT_TOKENS=32000` (as the API's `max_tokens`), file
+  mentions, attachments and auto memory off, `MAX_STRUCTURED_OUTPUT_RETRIES=5`.
+- **Detection** (Settings): the binary (configured path, `PATH`,
+  `~/.local/bin/claude`), `claude --version` (2.1.169 is the floor, as
+  `--safe-mode` arrived then; 2.1.290+ recommended), and
+  `claude --setting-sources= auth status` with the same environment (the flag
+  must precede the subcommand). `claude.ai` and `oauth_token` are accepted;
+  `api_key`, `api_key_helper` and `third_party` get "billed to the API, not
+  your plan". When the isolated check says signed out but a plain one says
+  signed in, the token probably sits in a settings `env` block. The real
+  run's result stays authoritative.
+- **Results.** stdout is one object, or an array whose last `type: result`
+  element counts (a Stop hook causes that). Success needs `is_error: false`,
+  `subtype: success` and `structured_output`. Errors are classified in order:
+  usage limit (`api_error: usage_limit_reached` or "You've hit your …"), output
+  cap (`api_error: max_output_tokens`, not `stop_reason`) → split the chunk,
+  auth (not logged in, expired, 401; a leaked "Invalid API key" gets its own
+  message), plan without the model, API credit, prompt too long, refusal,
+  error subtypes, temporary throttling. No result object: stderr if any
+  (an unknown option means the CLI is too old), else "exited without a result
+  (possibly a usage limit)". Usage limit, auth and "unavailable" errors stop
+  the whole pass instead of falling back chunk by chunk: unattributed
+  paragraphs stay unsegmented, as after Cancel, and the automatic tag pass is
+  skipped.
+- **Usage tracking.** Every call's usage goes to `llm_usage` (pass, backend,
+  model, input/output/cache tokens, cost), failed calls included, since a
+  failed call can still spend tokens. Claude Code usage comes from
+  `modelUsage` (never `usage`, which is zero on some errors) and its `costUSD`,
+  a list-price estimate shown as "API-equivalent". API usage is priced from
+  the table in `costs.rs` (Opus 5.5 $4/$20 per MTok, cache reads $0.20;
+  Sonnet 5.5 $2/$10; Haiku 5.5 $0.10/$0.50; cache writes 1.25x input).
+  Rows keep their project when a chapter is deleted.
+- **Credit rate.** Billed credits per character are account- and
+  date-specific (measured values range from 0.12 to 0.59 on paid plans while
+  `/v1/models` says 1.0), so `costs::credit_rate` uses, in order: the rate
+  learned from the last 50 exact paid takes of that model in the library
+  (`take_cost` stores each paid take's model and spoken characters; at least
+  3 takes and 200 characters), the `/v1/models` `character_cost_multiplier` ×
+  `cost_discount_multiplier` (stored in `model_rate`), then the fallback
+  table. The basis is always shown with the number.
+- **Balance.** `GET /v1/user/subscription`: remaining = max(0,
+  `character_limit` − `character_count`), reset from
+  `next_character_count_reset_unix`. 401 `missing_permissions` or 403
+  `insufficient_permissions` means the key lacks `user_read`, shown as
+  "balance unavailable", not as a bad key. Fetched at start, after each
+  generation batch (at most every 20 s; later requests wait) and on refresh.
+- **Claude estimate.** `costs::estimate_claude` mirrors the worker's chunking
+  (attribution windows of dialogue paragraphs with their overlap, then tag
+  windows over all paragraphs) and assumes ~4 characters per token for
+  English, 3 otherwise, plus Claude Code's own framing. It is labelled rough;
+  retries are not included.
 
 ### To verify against a real account
 

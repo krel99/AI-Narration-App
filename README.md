@@ -38,8 +38,9 @@ Claude and ElevenLabs servers, so they need no API keys.
 
 ## Setup
 
-1. **Settings**: enter your Anthropic and ElevenLabs API keys. They are stored
-   in `~/.config/narration-studio/config.json` (mode 0600). The environment
+1. **Settings**: choose how Claude runs (see [Claude](#claude) below) and
+   enter your ElevenLabs API key. Keys are stored in
+   `~/.config/narration-studio/config.json` (mode 0600). The environment
    variables `ANTHROPIC_API_KEY` and `ELEVENLABS_API_KEY` are used when the
    fields are empty. Appearance is light by default; a dark theme is available.
 2. The project menu's **＋ New project…** creates a project. Choose its
@@ -52,6 +53,64 @@ Claude and ElevenLabs servers, so they need no API keys.
    ([screenshot](docs/screenshots/project-settings.png)).
 4. **Voices**: give every speaker an ElevenLabs voice id, including the
    narrator. *Load my ElevenLabs voices* fills a picker from your account.
+
+## Claude
+
+Claude attributes speakers and adds audio tags. Settings → *Claude* offers two
+ways to run it:
+
+- **Claude Code — your Pro/Max subscription.** The app runs your own
+  [Claude Code](https://code.claude.com) CLI (`claude -p`), so the calls use
+  your plan instead of API billing. Setup:
+  1. Install Claude Code (2.1.290 or newer; `claude update` upgrades it).
+  2. In a terminal, run `claude auth login` once and choose your Claude
+     subscription. Narration Studio never asks for or stores a Claude token.
+  3. In Settings, pick *Claude Code*. The section shows the version, whether
+     you are signed in and how; *Check again* re-runs the check. If `claude`
+     is not on the app's `PATH` or in `~/.local/bin`, set its path there.
+
+  The calls count against your plan's usage limits, which are shared with
+  the Claude apps (claude.ai, desktop, mobile). When a limit is reached, the
+  run stops with the reset time and leaves unattributed paragraphs as they
+  are; *Re-segment drafts* continues later. This backend is meant for your
+  own use on your own computer.
+
+  Every run is isolated from your Claude Code setup: no tools, MCP servers,
+  hooks, skills or settings files, no session history, and an empty working
+  directory. `ANTHROPIC_API_KEY` (and `ANTHROPIC_AUTH_TOKEN`,
+  `ANTHROPIC_BASE_URL`) are removed from its environment, because in this
+  mode Claude Code would otherwise bill that key instead of your plan;
+  Settings says so when one of them is set. If Settings reports
+  *billed to the API, not your plan*, Claude Code is signed in with an API
+  key: run `claude auth login` and choose your subscription.
+- **Anthropic API key — pay per use.** Requests go to the Messages API and are
+  billed per token. This is the default.
+
+## Costs
+
+- **ElevenLabs balance.** The top bar shows the credits left and the reset
+  date (hover for plan, usage and voice slots; ⟳ refreshes). It is fetched at
+  start, after each generation batch, and on refresh. A key without the
+  `user_read` permission shows *balance unavailable*; everything else works.
+- **Before generating.** The Generate dialog estimates the credits, says where
+  the rate comes from, and the share of your remaining balance. It warns when
+  the batch exceeds the balance but never stops you. The Review toolbar shows
+  *Drafts ≈ N credits*.
+- **Where the rate comes from.** Credits per character differ by plan and
+  change over time, so the best rate is learned from your own takes: the
+  `character-cost` ElevenLabs reports for your last 50 takes of that model.
+  Before there are enough takes, the model's list rate from ElevenLabs is
+  used, then a built-in table (v4/v3/Multilingual 1.0, Flash/Turbo 0.5 per
+  character). A take that comes back without a `character-cost` is recorded
+  with this estimate and marked `≈`.
+- **Money.** Optionally set your price per 1,000 credits (and a currency) in
+  Settings to see money next to credit estimates.
+- **Claude.** The Text tab gives a rough token estimate for *Segment & add
+  audio tags* before you run it. The Review toolbar shows what the chapter's
+  Claude calls used, per pass on hover: tokens and the API list price
+  (Opus 5.5: $4 / $20 per million input/output tokens). With Claude Code the
+  figure is labelled *API-equivalent (subscription)*: Claude Code reports
+  it, but your plan's usage limits apply instead of a bill.
 
 ## Workflow
 
@@ -70,8 +129,8 @@ Claude and ElevenLabs servers, so they need no API keys.
    tags in the detail panel. **✦ Audio tags** re-runs the tagging for all
    draft segments. Segments whose speaker has no voice show ⚠ and are
    skipped.
-4. **Generate N drafts**. A confirmation shows the character count first.
-   Identical inputs reuse cached takes at no cost.
+4. **Generate N drafts**. A confirmation shows the character count and the
+   estimated credits first. Identical inputs reuse cached takes at no cost.
 5. Review with the keyboard and approve or re-roll. Earlier takes stay
    available in the take picker.
 6. **Export chapter** once every segment is approved, or use **Draft export**
@@ -94,9 +153,11 @@ All state lives in one library directory (default
 `~/.local/share/narration-studio/`, changeable in Settings):
 
 ```
-library.sqlite              projects, characters, chapters, paragraphs, segments, takes
+library.sqlite              projects, characters, chapters, paragraphs, segments, takes,
+                            Claude usage, credit rates
 audio/<take_hash>.wav       every take, 16-bit mono PCM (opens in Audacity)
 exports/<project>/          chapter MP3 + FLAC, book M4B
+claude-cwd/                 empty working directory for Claude Code runs
 ```
 
 Every pipeline stage resumes from this state after a restart.
@@ -107,13 +168,15 @@ Every pipeline stage resumes from this state after a restart.
 |------|------|
 | `src/segment.rs` | Paragraph splitting, language-aware quote parser, exact-text validator, split/merge helpers |
 | `src/tags.rs` | Audio-tag parsing and the check that tags never change the words |
-| `src/llm.rs` | Claude attribution and audio-tag direction requests (structured JSON output) |
-| `src/tts.rs` | ElevenLabs text-to-speech and voice list |
+| `src/llm.rs` | Claude attribution and audio-tag direction requests (structured JSON output), API or Claude Code transport |
+| `src/claude_code.rs` | Claude Code CLI: lookup, version and sign-in check, isolated `claude -p` runs, result and error parsing |
+| `src/costs.rs` | Claude prices, credit-rate learning, token and credit estimates, number formats |
+| `src/tts.rs` | ElevenLabs text-to-speech and voice list (`tts/account.rs`: balance and model rates) |
 | `src/worker.rs` | Command/event channels, segmentation pass, TTS worker pool, export jobs |
-| `src/db.rs` | SQLite schema and queries |
+| `src/db.rs` | SQLite schema and queries (`db/costs.rs`: usage and rate tables) |
 | `src/audio.rs` | PCM/WAV handling, MP3-fallback decode |
 | `src/export.rs` | Streaming assembly with silences; ffmpeg loudnorm and encode |
 | `src/hash.rs` | Take hash |
 | `src/player.rs` | rodio playback queue |
-| `src/app.rs` | egui UI (Text and Review tabs, dialogs) |
+| `src/app.rs` | egui UI (Text and Review tabs, dialogs; `app/costs.rs`: balance, estimates, Claude settings) |
 | `src/theme.rs` | Light (default) and dark themes, semantic colours |

@@ -20,6 +20,8 @@ use crate::theme::{self, Palette, primary_button, speaker_color};
 use crate::tts::VoiceInfo;
 use crate::worker::{self, Command, Event, WorkerHandle};
 
+mod costs;
+
 const ROW_H: f32 = 46.0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -171,6 +173,7 @@ pub struct App {
     voices: Vec<VoiceInfo>,
     dirty: bool,
     dialogs: Dialogs,
+    costs: costs::CostState,
 }
 
 fn status_icon(s: SegmentStatus, p: &Palette) -> (&'static str, Color32) {
@@ -271,6 +274,7 @@ impl App {
             voices: vec![],
             dirty: false,
             dialogs: Dialogs::default(),
+            costs: Default::default(),
         };
         if let Some(e) = app.player.error.clone() {
             app.note(true, e);
@@ -289,6 +293,7 @@ impl App {
         if let Some(id) = last.or_else(|| app.projects.first().map(|p| p.id)) {
             app.select_project(id);
         }
+        app.costs_startup();
         Ok(app)
     }
 
@@ -445,6 +450,7 @@ impl App {
         }
         .filter(|_| !self.view.segments.is_empty());
         self.takes_for = None;
+        self.reload_cost_stats();
     }
 
     fn selected_segment(&self) -> Option<&Segment> {
@@ -570,6 +576,7 @@ impl App {
                             "Generation finished: {generated} takes ({cached} from cache), {failed} failed, {credits} credits used."
                         ),
                     );
+                    self.request_account(false);
                 }
                 Event::ExportFinished {
                     files,
@@ -595,6 +602,8 @@ impl App {
                     self.note(false, format!("Loaded {} voices from ElevenLabs.", v.len()));
                     self.voices = v;
                 }
+                Event::Account(info) => self.on_account(info),
+                Event::ClaudeCode(d) => self.on_claude_detection(*d),
             }
         }
         if self.dirty {
@@ -768,10 +777,12 @@ impl App {
     }
 
     fn segment_chapter(&mut self, chapter_id: Id) {
-        if self.cfg.api_keys().anthropic.is_empty() {
+        if self.cfg.claude_backend == crate::config::ClaudeBackend::ApiKey
+            && self.cfg.api_keys().anthropic.is_empty()
+        {
             self.note(
                 true,
-                "No Anthropic API key: dialogue will be split by the parser only, with speaker 'unknown'.".into(),
+                "No Anthropic API key: dialogue will be split by the parser only, with speaker 'unknown'. Add a key, or choose Claude Code in Settings.".into(),
             );
         }
         self.worker.send(Command::SegmentChapter { chapter_id });
@@ -1114,6 +1125,7 @@ impl App {
                 {
                     self.open_voice_editor();
                 }
+                self.account_chip(ui);
             });
         });
         ui.add_space(6.0);
@@ -1168,7 +1180,7 @@ impl App {
                             .color(p.warning),
                     );
                 }
-                let footer_h = 56.0;
+                let footer_h = 92.0;
                 let editor_h = (ui.available_height() - footer_h).max(160.0);
                 egui::Frame::new()
                     .fill(p.card)
@@ -1238,6 +1250,7 @@ impl App {
                         }
                     });
                 });
+                self.claude_estimate_footer(ui, &paragraphs, lang);
             }
         });
     }
@@ -1292,6 +1305,7 @@ impl App {
                 } else {
                     "Credits as reported by ElevenLabs."
                 });
+                self.cost_chips(ui);
                 if !self.tags_active() {
                     chip(ui, "model ignores audio tags", p.muted).on_hover_text(
                         "Choose Eleven v4 or v3 in Project settings to perform [tags]",
@@ -1913,21 +1927,20 @@ impl App {
         };
         let mut save = false;
         let mut cancel = false;
-        egui::Window::new("Settings").collapsible(false).show(ctx, |ui| {
+        let mut check = false;
+        egui::Window::new("Settings").collapsible(false).default_width(560.0).show(ctx, |ui| {
+            check = costs::claude_settings_section(ui, cfg, &self.costs);
+            ui.separator();
             egui::Grid::new("settings").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                ui.label("Anthropic API key");
-                ui.add(
-                    egui::TextEdit::singleline(&mut cfg.anthropic_api_key)
-                        .password(true)
-                        .hint_text("or ANTHROPIC_API_KEY"),
-                );
-                ui.end_row();
                 ui.label("ElevenLabs API key");
                 ui.add(
                     egui::TextEdit::singleline(&mut cfg.elevenlabs_api_key)
                         .password(true)
                         .hint_text("or ELEVENLABS_API_KEY"),
                 );
+                ui.end_row();
+                ui.label("Credit price");
+                costs::credit_price_row(ui, cfg);
                 ui.end_row();
                 ui.label("Appearance");
                 ui.horizontal(|ui| {
@@ -1955,10 +1968,15 @@ impl App {
                 cancel = ui.button("Cancel").clicked();
             });
         });
+        if check {
+            let path = cfg.claude_code_path.clone();
+            self.request_detection(path);
+        }
         if save {
             let cfg = self.dialogs.settings.take().unwrap();
             self.worker.send(Command::SetKeys(cfg.api_keys()));
             theme::apply(ctx, cfg.dark_mode);
+            self.settings_saved(&cfg);
             self.cfg = cfg;
             if let Err(e) = self.cfg.save() {
                 self.note(true, format!("Saving settings: {e:#}"));
@@ -2336,10 +2354,11 @@ impl App {
             .resizable(false)
             .show(ctx, |ui| {
                 ui.label(format!(
-                    "{} segments, {} characters. Each generation costs its full character count in credits (cached takes are free).",
+                    "{} segments, {} characters.",
                     plan.ids.len(),
                     plan.chars
                 ));
+                self.generate_estimate_ui(ui, plan.chars);
                 if plan.unassigned > 0 {
                     ui.colored_label(
                         theme::palette(ui).warning,
@@ -2499,6 +2518,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.handle_events();
         let ctx = ui.ctx().clone();
+        self.costs_tick(&ctx);
         self.keyboard(&ctx);
         let p = *theme::palette(ui);
 

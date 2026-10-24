@@ -24,6 +24,9 @@ use crate::segment::{self, DraftSegment, UNKNOWN_SPEAKER};
 use crate::tags;
 use crate::tts::{ElevenLabsClient, TtsError, TtsRequest, VoiceInfo};
 
+mod account;
+mod claude;
+
 /// Seed of a segment's first take. Fixed, so identical lines with the same
 /// voice and settings ("he said,") share one cached take.
 pub const FIRST_TAKE_SEED: u32 = 1;
@@ -32,6 +35,10 @@ pub const FIRST_TAKE_SEED: u32 = 1;
 pub struct ApiKeys {
     pub anthropic: String,
     pub elevenlabs: String,
+    /// Where the Claude passes run.
+    pub claude_backend: crate::config::ClaudeBackend,
+    /// The configured `claude` binary (Claude Code backend).
+    pub claude_code_path: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -59,6 +66,12 @@ pub enum Command {
         project_id: Id,
     },
     FetchVoices,
+    /// The ElevenLabs balance and model rates (answered by `Event::Account`).
+    FetchAccount,
+    /// Check the Claude Code CLI (answered by `Event::ClaudeCode`).
+    DetectClaudeCode {
+        path: Option<PathBuf>,
+    },
     SetKeys(ApiKeys),
     /// Stop queued work (requests already in flight finish).
     Cancel,
@@ -118,6 +131,8 @@ pub enum Event {
         input_tokens: u64,
         output_tokens: u64,
     },
+    Account(crate::tts::account::AccountInfo),
+    ClaudeCode(Box<crate::claude_code::Detection>),
 }
 
 pub struct WorkerHandle {
@@ -307,6 +322,11 @@ async fn run(ctx: &Ctx, cmd: Command) -> Result<()> {
             ctx.out.emit(Event::Voices(voices));
             Ok(())
         }
+        Command::FetchAccount => account::fetch_account(ctx).await,
+        Command::DetectClaudeCode { path } => {
+            claude::detect_claude_code(ctx, path).await;
+            Ok(())
+        }
         Command::Cancel | Command::SetKeys(_) => Ok(()),
     }
 }
@@ -402,17 +422,23 @@ async fn segment_chapter(ctx: &Ctx, chapter_id: Id) -> Result<()> {
         total,
     });
 
-    let key = ctx
-        .keys
-        .read()
-        .map(|k| k.anthropic.clone())
-        .unwrap_or_default();
-    if key.is_empty() && total > 0 {
-        ctx.out.emit(Event::Error(
-            "No Anthropic API key set: dialogue was split by the parser only, speakers are 'unknown'.".into(),
-        ));
-    }
-    let claude = ClaudeClient::new(ctx.http.clone(), key.clone(), &ctx.endpoints.anthropic);
+    // Without a usable backend, dialogue falls back to the parser.
+    let claude = if total > 0 {
+        match claude::claude_client(ctx).await {
+            Ok(c) => Some(c),
+            Err(why) => {
+                ctx.out.emit(Event::Error(format!(
+                    "{why} Dialogue was split by the parser only; speakers are 'unknown'."
+                )));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // Set when Claude cannot answer at all (usage limit, signed out): the
+    // rest of the chapter is left as it is instead of falling back.
+    let mut stopped: Option<String> = None;
 
     // Windows of `chunk_paragraphs` consecutive paragraphs.
     let chunk = settings.chunk_paragraphs.max(1);
@@ -433,7 +459,10 @@ async fn segment_chapter(ctx: &Ctx, chapter_id: Id) -> Result<()> {
         let mut tries: HashMap<usize, u32> = HashMap::new();
         // After a too-long response, send one target paragraph at a time.
         let mut single = false;
-        while !key.is_empty() && !pending.is_empty() && !ctx.cancelled(started) {
+        while !pending.is_empty() && !ctx.cancelled(started) {
+            let Some(claude) = claude.as_ref() else {
+                break;
+            };
             let batch: Vec<usize> = if single {
                 pending.iter().take(1).copied().collect()
             } else {
@@ -466,8 +495,24 @@ async fn segment_chapter(ctx: &Ctx, chapter_id: Id) -> Result<()> {
                 })
                 .collect();
 
-            match claude.attribute(&settings, lang, &registry, &prompt).await {
+            let res = claude.attribute(&settings, lang, &registry, &prompt).await;
+            claude::record_usage(
+                ctx,
+                claude,
+                project.id,
+                chapter_id,
+                claude::PASS_ATTRIBUTION,
+            );
+            match res {
                 Ok(result) => {
+                    log::info!(
+                        "attribution P{}–P{}: {} input / {} output tokens, cost {:?} USD",
+                        first + 1,
+                        last + 1,
+                        result.input_tokens,
+                        result.output_tokens,
+                        result.cost_usd
+                    );
                     input_tokens += result.input_tokens;
                     output_tokens += result.output_tokens;
                     let registry = ctx.db(|db| {
@@ -530,6 +575,10 @@ async fn segment_chapter(ctx: &Ctx, chapter_id: Id) -> Result<()> {
                     log::warn!("Claude: {e}");
                     tokio::time::sleep(backoff(tries.get(&first).copied().unwrap_or(0))).await;
                 }
+                Err(e) if e.stops_pass() => {
+                    stopped = Some(e.to_string());
+                    break;
+                }
                 Err(e) => {
                     ctx.out.emit(Event::Error(format!(
                         "Segmentation of P{}–P{}: {e}",
@@ -552,7 +601,7 @@ async fn segment_chapter(ctx: &Ctx, chapter_id: Id) -> Result<()> {
             }
         }
         pending.extend(gave_up);
-        if ctx.cancelled(started) {
+        if ctx.cancelled(started) || stopped.is_some() {
             // Leave the rest unsegmented; running Segment again resumes.
             break;
         }
@@ -581,6 +630,11 @@ async fn segment_chapter(ctx: &Ctx, chapter_id: Id) -> Result<()> {
         input_tokens,
         output_tokens,
     });
+    if let Some(why) = stopped {
+        return Err(anyhow!(
+            "{why} Paragraphs not attributed yet are left as they are; run Re-segment drafts to continue."
+        ));
+    }
     Ok(())
 }
 
@@ -591,16 +645,9 @@ async fn segment_chapter(ctx: &Ctx, chapter_id: Id) -> Result<()> {
 /// are left alone; otherwise their tags are replaced.
 async fn direct_chapter(ctx: &Ctx, chapter_id: Id, untagged_only: bool) -> Result<()> {
     let started = ctx.epoch.load(Ordering::SeqCst);
-    let key = ctx
-        .keys
-        .read()
-        .map(|k| k.anthropic.clone())
-        .unwrap_or_default();
-    if key.is_empty() {
-        return Err(anyhow!(
-            "set the Anthropic API key in Settings to add audio tags"
-        ));
-    }
+    let claude = claude::claude_client(ctx)
+        .await
+        .map_err(|why| anyhow!("{why} No audio tags were added."))?;
     let (project, paragraphs, segments) = ctx.db(|db| {
         let chapter = db.chapter(chapter_id)?;
         Ok((
@@ -623,7 +670,6 @@ async fn direct_chapter(ctx: &Ctx, chapter_id: Id, untagged_only: bool) -> Resul
         .filter(|s| !(untagged_only && s.performance.is_some()))
         .collect();
     let total = targets.len();
-    let claude = ClaudeClient::new(ctx.http.clone(), key, &ctx.endpoints.anthropic);
     let chunk = settings.chunk_paragraphs.max(1);
 
     // Work queue of paragraph windows; a too-long answer splits its window.
@@ -671,7 +717,7 @@ async fn direct_chapter(ctx: &Ctx, chapter_id: Id, untagged_only: bool) -> Resul
             .collect();
         let mut attempt = 0;
         let result = loop {
-            match claude
+            let r = claude
                 .direct(
                     &settings,
                     &project.settings.audio_tags,
@@ -679,8 +725,9 @@ async fn direct_chapter(ctx: &Ctx, chapter_id: Id, untagged_only: bool) -> Resul
                     &context,
                     &offered,
                 )
-                .await
-            {
+                .await;
+            claude::record_usage(ctx, &claude, project.id, chapter_id, claude::PASS_TAGS);
+            match r {
                 Err(LlmError::Transient(e)) if attempt < settings.max_retries => {
                     log::warn!("Claude: {e}");
                     tokio::time::sleep(backoff(attempt)).await;
@@ -691,6 +738,14 @@ async fn direct_chapter(ctx: &Ctx, chapter_id: Id, untagged_only: bool) -> Resul
         };
         match result {
             Ok(direction) => {
+                log::info!(
+                    "audio tags P{}–P{}: {} input / {} output tokens, cost {:?} USD",
+                    lo + 1,
+                    hi,
+                    direction.input_tokens,
+                    direction.output_tokens,
+                    direction.cost_usd
+                );
                 input_tokens += direction.input_tokens;
                 output_tokens += direction.output_tokens;
                 ctx.db(|db| {
@@ -1028,10 +1083,14 @@ async fn generate_one(
     let path = abs_path.clone();
     tokio::task::spawn_blocking(move || audio::write_wav(&path, &pcm)).await??;
     // Billed rates differ per plan, so a missing header means "estimated", not
-    // "text length": estimate from the characters and flag it as inexact.
+    // "text length": estimate with the learned rate and flag it as inexact.
+    let chars = spoken.chars().count();
     let (credits, credits_exact) = match resp.character_cost {
         Some(c) => (c, true),
-        None => (spoken.chars().count() as i64, false),
+        None => (
+            ctx.db(|db| Ok(db.credit_rate(&project.tts_model).credits(chars)))?,
+            false,
+        ),
     };
     ctx.db(|db| {
         let take_id = db.insert_take(&NewTake {
@@ -1043,6 +1102,8 @@ async fn generate_one(
             credits_used: credits,
             credits_exact,
         })?;
+        // What this take cost per character teaches the credit estimates.
+        db.record_take_cost(take_id, &project.tts_model, chars as i64)?;
         db.set_current_take(seg.id, take_id)
     })?;
     Ok((false, credits))
@@ -1052,6 +1113,8 @@ async fn generate_one(
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Read, Write};
+
+    mod costs;
 
     #[test]
     fn speakers_resolve_through_aliases() {
@@ -1134,6 +1197,7 @@ mod tests {
             keys: Arc::new(RwLock::new(ApiKeys {
                 anthropic: "test".into(),
                 elevenlabs: "test".into(),
+                ..Default::default()
             })),
             out: Emitter {
                 tx,

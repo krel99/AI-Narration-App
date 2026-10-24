@@ -1,5 +1,7 @@
 //! ElevenLabs text-to-speech client.
 
+pub mod account;
+
 use std::time::Duration;
 
 use serde::Serialize;
@@ -152,7 +154,9 @@ impl ElevenLabsClient {
         let request_id = header("request-id");
         let character_cost = header("character-cost")
             .or_else(|| header("x-character-count"))
-            .and_then(|s| s.parse().ok());
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|c| c.is_finite() && *c >= 0.0)
+            .map(|c| c.round() as i64);
         let audio = resp
             .bytes()
             .await
