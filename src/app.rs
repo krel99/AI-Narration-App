@@ -954,6 +954,21 @@ impl App {
             || self.retail_dialog_open()
     }
 
+    /// The open chapter is being generated, segmented or tagged right now.
+    /// Its text must not be re-split meanwhile (the worker re-checks
+    /// generations itself when saving).
+    fn chapter_busy(&self) -> bool {
+        let Some(cid) = self.view.chapter_id else {
+            return false;
+        };
+        self.view
+            .segments
+            .iter()
+            .any(|s| self.in_flight.contains(&s.id))
+            || self.segmenting.is_some_and(|(c, _, _)| c == cid)
+            || self.directing.is_some_and(|(c, _, _)| c == cid)
+    }
+
     /// Save the Text tab. Returns false if nothing could be saved yet.
     fn save_text(&mut self, confirmed: bool) -> bool {
         let Some(project) = self.project.clone() else {
@@ -981,7 +996,16 @@ impl App {
                         self.dialogs.resplit = true;
                         return false;
                     }
-                    let r = self.db.replace_chapter_text(id, &title, &self.draft.text);
+                    if self.chapter_busy() {
+                        self.note(
+                            true,
+                            "Audio is being generated for this chapter; wait for it to finish (or Cancel) before changing its text.".into(),
+                        );
+                        return false;
+                    }
+                    let r = self
+                        .worker
+                        .replace_chapter_text(id, &title, &self.draft.text);
                     if self.try_db(r).is_none() {
                         return false;
                     }
@@ -1244,7 +1268,8 @@ impl App {
             });
             return;
         }
-        let locked = self.draft.chapter_id.is_some() && self.view.has_audio();
+        let busy = self.draft.chapter_id.is_some() && self.chapter_busy();
+        let locked = self.draft.chapter_id.is_some() && (self.view.has_audio() || busy);
         let width = ui.available_width().min(920.0);
         let full = ui.available_rect_before_wrap();
         let column = egui::Rect::from_center_size(
@@ -1271,11 +1296,12 @@ impl App {
                     );
                 });
                 if locked {
-                    ui.label(
-                        RichText::new("This chapter has audio, so its text is locked. Start a new chapter from the chapter menu to narrate different text.")
-                            .small()
-                            .color(p.warning),
-                    );
+                    let why = if busy && !self.view.has_audio() {
+                        "This chapter is being segmented or generated right now, so its text is locked until that finishes."
+                    } else {
+                        "This chapter has audio, so its text is locked. Start a new chapter from the chapter menu to narrate different text."
+                    };
+                    ui.label(RichText::new(why).small().color(p.warning));
                 }
                 let footer_h = 92.0;
                 let editor_h = (ui.available_height() - footer_h).max(160.0);

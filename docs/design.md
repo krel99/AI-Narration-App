@@ -873,6 +873,12 @@ test.
   dialogue paragraphs compare the group hash the same way
   (`DialogueGroup::make_current`). The UI disables Merge and Split while a
   take of the segments involved is on its way.
+- **The Text tab cannot re-split a chapter that is being generated.** The
+  text is locked while any of its segments has a take on its way or a
+  segmentation/tag pass runs for it, and saving goes through the worker
+  (`Command::ReplaceChapterText`), which refuses under the database lock
+  when a segment is in the `busy` set — so a take paid for during the
+  first generation always finds its segment.
 - **Merge keeps both halves' takes** (moved to the merged segment, with
   their checks, trims and cost rows), so the chapter's credits and the
   learned rate keep them, and splitting back finds the second half's audio.

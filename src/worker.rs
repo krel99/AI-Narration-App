@@ -47,6 +47,14 @@ pub struct ApiKeys {
 
 #[derive(Debug)]
 pub enum Command {
+    /// Replace a chapter's text (Text tab) unless a running generation is
+    /// about to store takes for one of its segments. Answered on `reply`.
+    ReplaceChapterText {
+        chapter_id: Id,
+        title: String,
+        text: String,
+        reply: Sender<Result<(), String>>,
+    },
     /// Attribute every paragraph of the chapter whose segments are all still
     /// untouched drafts (or that has none yet). With `resume`, only the
     /// paragraphs a stopped pass left (Continue segmenting).
@@ -215,6 +223,46 @@ impl WorkerHandle {
     pub fn send(&self, cmd: Command) {
         let _ = self.tx.send(cmd);
     }
+
+    /// Replace a chapter's text through the worker, so the check against
+    /// running generations and the deletion of the old segments happen under
+    /// the same locks the generation registers its segments with.
+    pub fn replace_chapter_text(&self, chapter_id: Id, title: &str, text: &str) -> Result<()> {
+        let (reply, answer) = channel();
+        self.send(Command::ReplaceChapterText {
+            chapter_id,
+            title: title.to_string(),
+            text: text.to_string(),
+            reply,
+        });
+        match answer.recv_timeout(Duration::from_secs(30)) {
+            Ok(r) => r.map_err(|e| anyhow!(e)),
+            Err(_) => Err(anyhow!("the text was not saved: the worker did not answer")),
+        }
+    }
+}
+
+/// The Text tab's re-split, refused while a generation is about to store a
+/// take for one of the chapter's segments (that take would lose its segment
+/// after the credits were spent). Call with the worker's database lock held,
+/// like every other `busy` check.
+fn replace_chapter_text_unless_busy(
+    db: &mut Db,
+    busy: &HashSet<Id>,
+    chapter_id: Id,
+    title: &str,
+    text: &str,
+) -> Result<()> {
+    if db
+        .chapter_segments(chapter_id)?
+        .iter()
+        .any(|s| busy.contains(&s.id))
+    {
+        return Err(anyhow!(
+            "audio is being generated for this chapter; wait for it to finish (or Cancel) before changing its text"
+        ));
+    }
+    db.replace_chapter_text(chapter_id, title, text)
 }
 
 #[derive(Clone)]
@@ -407,6 +455,18 @@ async fn run(ctx: &Ctx, cmd: Command) -> Result<()> {
             autotrim::auto_trim_chapter(ctx, chapter_id).await
         }
         Command::Check(c) => takecheck::run_command(ctx, c).await,
+        Command::ReplaceChapterText {
+            chapter_id,
+            title,
+            text,
+            reply,
+        } => {
+            let r = ctx.db(|db| {
+                replace_chapter_text_unless_busy(db, &ctx.busy(), chapter_id, &title, &text)
+            });
+            let _ = reply.send(r.map_err(|e| format!("{e:#}")));
+            Ok(())
+        }
         Command::Cancel | Command::SetKeys(_) => Ok(()),
     }
 }
@@ -1523,6 +1583,36 @@ mod tests {
     mod races;
     mod retail;
     mod voices;
+
+    #[test]
+    fn chapter_text_is_not_replaced_while_its_segments_are_being_generated() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = Library::new(dir.path().to_path_buf());
+        let (ctx, _events) = test_ctx(&lib, "http://unused", "http://unused");
+        let (cid, first) = ctx
+            .db(|db| {
+                let pid = db.create_project("Book", "en")?;
+                let cid = import(db, pid);
+                Ok((cid, db.chapter_segments(cid)?[0].id))
+            })
+            .unwrap();
+
+        // A generation has registered the first segment: the re-split is refused
+        // and the segment (and the take it will receive) survives.
+        ctx.busy().insert(first);
+        let refused =
+            ctx.db(|db| replace_chapter_text_unless_busy(db, &ctx.busy(), cid, "One", "New text."));
+        assert!(refused.unwrap_err().to_string().contains("being generated"));
+        assert_eq!(ctx.db(|db| db.segment(first)).unwrap().id, first);
+
+        // Once the generation is done, the text can change again.
+        ctx.busy().remove(&first);
+        ctx.db(|db| replace_chapter_text_unless_busy(db, &ctx.busy(), cid, "One", "New text."))
+            .unwrap();
+        let paragraphs = ctx.db(|db| db.paragraphs(cid)).unwrap();
+        assert_eq!(paragraphs.len(), 1);
+        assert_eq!(paragraphs[0].text, "New text.");
+    }
 
     #[test]
     fn speakers_resolve_through_aliases() {
