@@ -1959,7 +1959,8 @@ impl App {
                         } else {
                             format!("≈{} credits (estimated)", t.credits_used)
                         };
-                        let text = format!("#{} · seed {} · {cost} · {}", n + 1, t.seed, t.created_at);
+                        let when = t.created_at.replace('T', " ");
+                        let text = format!("#{} · seed {} · {cost} · {}", n + 1, t.seed, when.trim_end_matches('Z'));
                         ui.label(if current { RichText::new(text).strong() } else { RichText::new(text) });
                         dialogue::take_chip(ui, t);
                         if current {
@@ -2321,8 +2322,14 @@ impl App {
         let mut rename: Option<(String, String)> = None;
         let voices = &self.voices;
         let voice_ui = &self.voice_ui;
+        // Wide enough for whole character names (again after the window was
+        // narrower); never wider than the window (the minimum is 900 px):
+        // the grid scrolls sideways instead.
+        let room = (ctx.content_rect().width() - 40.0).max(400.0);
         egui::Window::new("Voices and characters")
-            .default_size([900.0, 480.0])
+            .default_size([980.0_f32.min(room), 480.0])
+            .min_width(980.0_f32.min(room))
+            .max_width(room)
             .show(ctx, |ui| {
                 let dark = ui.visuals().dark_mode;
                 let muted = theme::palette(ui).muted;
@@ -2332,7 +2339,7 @@ impl App {
                         .color(muted),
                 );
                 fetch = voice_picker::list_status(ui, voices.len(), voice_ui);
-                egui::ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
+                egui::ScrollArea::both().max_height(340.0).show(ui, |ui| {
                     egui::Grid::new("voices").num_columns(6).striped(true).spacing([10.0, 6.0]).show(ui, |ui| {
                         for h in ["Key", "Display name", "Aliases (comma separated)", "Voice id", "Voice", ""] {
                             ui.label(RichText::new(h).small().strong().color(muted));
@@ -2345,8 +2352,8 @@ impl App {
                                 ui.label("Narrator");
                                 ui.label("");
                             } else {
-                                ui.text_edit_singleline(&mut row.display_name);
-                                ui.text_edit_singleline(&mut row.aliases);
+                                ui.add_sized([140.0, 22.0], egui::TextEdit::singleline(&mut row.display_name));
+                                ui.add_sized([160.0, 22.0], egui::TextEdit::singleline(&mut row.aliases));
                             }
                             ui.add_sized([190.0, 22.0], egui::TextEdit::singleline(&mut row.voice_id).hint_text("voice id"));
                             if let Some(a) = voice_picker::voice_cell(ui, row, voices, voice_ui, &preview) {
