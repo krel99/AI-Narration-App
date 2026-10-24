@@ -50,14 +50,34 @@ impl Default for TrimSettings {
 /// Length of `pcm` in milliseconds, rounded up so that a trim ending at the
 /// duration always keeps the last sample.
 pub fn duration_ms(pcm: &Pcm) -> u32 {
-    if pcm.rate == 0 {
+    len_ms(pcm.samples.len(), pcm.rate)
+}
+
+fn len_ms(len: usize, rate: u32) -> u32 {
+    if rate == 0 {
         return 0;
     }
-    (pcm.samples.len() as u64 * 1000).div_ceil(pcm.rate as u64) as u32
+    (len as u64 * 1000).div_ceil(rate as u64) as u32
 }
 
 fn ms_to_sample(pcm: &Pcm, ms: u32) -> usize {
-    ((ms as u64 * pcm.rate as u64 / 1000) as usize).min(pcm.samples.len())
+    to_sample(pcm.samples.len(), pcm.rate, ms)
+}
+
+fn to_sample(len: usize, rate: u32, ms: u32) -> usize {
+    ((ms as u64 * rate as u64 / 1000) as usize).min(len)
+}
+
+/// The samples [`apply`] keeps of a take `len` samples long, or `None` when
+/// the trim would leave nothing (the whole take is used then).
+fn kept_range(len: usize, rate: u32, start_ms: u32, end_ms: u32) -> Option<(usize, usize)> {
+    let a = to_sample(len, rate, start_ms);
+    let b = if end_ms >= len_ms(len, rate) {
+        len
+    } else {
+        to_sample(len, rate, end_ms)
+    };
+    (b > a).then_some((a, b))
 }
 
 /// The detector's input: the mean square of every 10 ms frame of a take.
@@ -124,16 +144,9 @@ pub fn detect_frames(f: &Frames, s: &TrimSettings) -> Option<(u32, u32)> {
 /// linearly over `fade_ms` (at most half the kept length). A range that
 /// would leave nothing (e.g. a stale trim) returns the audio untouched.
 pub fn apply(pcm: &Pcm, start_ms: u32, end_ms: u32, fade_ms: u32) -> Pcm {
-    let len = pcm.samples.len();
-    let a = ms_to_sample(pcm, start_ms);
-    let b = if end_ms >= duration_ms(pcm) {
-        len
-    } else {
-        ms_to_sample(pcm, end_ms)
-    };
-    if b <= a {
+    let Some((a, b)) = kept_range(pcm.samples.len(), pcm.rate, start_ms, end_ms) else {
         return pcm.clone();
-    }
+    };
     let mut samples = pcm.samples[a..b].to_vec();
     let n = ms_to_sample(pcm, fade_ms).min(samples.len() / 2);
     if n > 0 {
@@ -176,6 +189,25 @@ pub fn load_take(lib: &Library, take: &Take, settings: &TrimSettings) -> Result<
     Ok(match take.trim_ms {
         Some((start, end)) => apply(&pcm, start, end, settings.fade_ms),
         None => pcm,
+    })
+}
+
+/// How long a take plays with its trim, in milliseconds, from the WAV header
+/// only (no samples are read). Matches the length of [`load_take`]'s audio.
+pub fn take_duration_ms(lib: &Library, take: &Take) -> Result<u64> {
+    let path = lib.audio_path(&take.audio_path);
+    let r = hound::WavReader::open(&path)
+        .map_err(|e| anyhow::anyhow!("opening {}: {e}", path.display()))?;
+    let rate = r.spec().sample_rate;
+    let len = r.duration() as usize;
+    let kept = match take.trim_ms {
+        Some((start, end)) => kept_range(len, rate, start, end).map_or(len, |(a, b)| b - a),
+        None => len,
+    };
+    Ok(if rate == 0 {
+        0
+    } else {
+        kept as u64 * 1000 / rate as u64
     })
 }
 
@@ -404,6 +436,39 @@ pub(crate) mod tests {
         let t: TrimSettings = serde_json::from_str(r#"{"enabled": true}"#).unwrap();
         assert!(t.enabled);
         assert_eq!((t.threshold_db, t.keep_head_ms, t.fade_ms), (-50.0, 40, 10));
+    }
+
+    #[test]
+    fn take_duration_from_the_header_matches_the_loaded_audio() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = Library::new(dir.path().to_path_buf());
+        std::fs::create_dir_all(lib.audio_dir()).unwrap();
+        let p = pcm(&[silence(300), tone(500), silence(437)]);
+        audio::write_wav(&lib.audio_path("t.wav"), &p).unwrap();
+        let s = TrimSettings::default();
+        let mut take = Take {
+            id: 1,
+            segment_id: 1,
+            seed: 1,
+            request_id: None,
+            audio_path: "t.wav".into(),
+            hash: "h".into(),
+            credits_used: 0,
+            credits_exact: true,
+            created_at: String::new(),
+            trim_ms: None,
+            dialogue_group: None,
+        };
+        // Untrimmed, a normal trim, a trim to the end, and a stale trim that
+        // would leave nothing (the whole take plays).
+        for trim in [None, Some((260, 880)), Some((100, 5000)), Some((900, 800))] {
+            take.trim_ms = trim;
+            let loaded = load_take(&lib, &take, &s).unwrap();
+            let expect = loaded.samples.len() as u64 * 1000 / RATE as u64;
+            assert_eq!(take_duration_ms(&lib, &take).unwrap(), expect, "{trim:?}");
+        }
+        take.trim_ms = Some((260, 880));
+        assert_eq!(take_duration_ms(&lib, &take).unwrap(), 620);
     }
 
     #[test]

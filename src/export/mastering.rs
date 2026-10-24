@@ -11,7 +11,6 @@ use anyhow::{Context, Result, bail};
 
 use super::{AssemblyWriter, export_dir, run_ffmpeg, slug, work_rate};
 use crate::acx::{self, Levels};
-use crate::audio;
 use crate::db::{Db, Library};
 use crate::model::*;
 use crate::retail::{self, SamplePlan, SampleSource, SampleStop};
@@ -483,11 +482,9 @@ fn sample_source(
     let mut duration_ms = 0;
     if approved {
         let take = db.take(s.current_take_id.unwrap_or_default())?;
-        match hound::WavReader::open(lib.audio_path(&take.audio_path)) {
-            Ok(r) => {
-                let spec = r.spec();
-                duration_ms = r.duration() as u64 * 1000 / spec.sample_rate.max(1) as u64;
-            }
+        // The length as exported: with the take's silence trim.
+        match crate::trim::take_duration_ms(lib, &take) {
+            Ok(ms) => duration_ms = ms,
             Err(e) => {
                 log::warn!("take {}: {e}", take.id);
                 approved = false;
@@ -556,7 +553,7 @@ pub fn export_sample(
                 .find(|s| s.id == src[i].segment_id)
                 .context("segment vanished")?;
             let take = db.take(seg.current_take_id.context("segment has no take")?)?;
-            let mut pcm = audio::read_wav(&lib.audio_path(&take.audio_path))?;
+            let mut pcm = crate::trim::load_take(lib, &take, &project.settings.trim)?;
             if plan.stop == SampleStop::Cut {
                 let keep = (pcm.rate as u64 * plan.speech_ms / 1000) as usize;
                 pcm.samples.truncate(keep);
@@ -614,6 +611,7 @@ pub fn export_sample(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio;
     use crate::retail::fixture::{self, approved_book, has_cover, lighthouse, tag};
 
     /// Chapter MP3 + FLAC, book M4B and retail sample: tags, cover art,
@@ -850,6 +848,41 @@ mod tests {
         assert_eq!(src[2].paragraph, 1);
         let plan = retail::plan_sample(&src, 0, 180_000, &book.project.settings.silence).unwrap();
         assert_eq!((plan.end, plan.stop), (2, SampleStop::Unsegmented(2)));
+    }
+
+    /// The sample plans and plays the takes as trimmed, like the chapters.
+    #[test]
+    fn the_retail_sample_uses_the_silence_trim() {
+        let book = approved_book(lighthouse());
+        let db = book.lib.open().unwrap();
+        let segments = db.chapter_segments(book.chapter.id).unwrap();
+        let first = db.take(segments[0].current_take_id.unwrap()).unwrap();
+        let silence = &book.project.settings.silence;
+        let before = sample_sources(&db, &book.lib, book.chapter.id).unwrap();
+        let plan_before = retail::plan_sample(&before, 0, 180_000, silence).unwrap();
+        db.set_take_trim(first.id, Some((200, 1000))).unwrap();
+        let src = sample_sources(&db, &book.lib, book.chapter.id).unwrap();
+        assert_eq!(src[0].duration_ms, 800);
+        assert_eq!(src[1].duration_ms, before[1].duration_ms);
+        let plan = retail::plan_sample(&src, 0, 180_000, silence).unwrap();
+        assert_eq!(
+            plan.speech_ms,
+            plan_before.speech_ms - (before[0].duration_ms - 800)
+        );
+        if !fixture::have_ffmpeg() {
+            eprintln!("ffmpeg/ffprobe not found; skipping the export half");
+            return;
+        }
+        // The file is as long as the plan: the trimmed audio was used.
+        let out =
+            export_sample(&db, &book.lib, &book.project, &book.chapter, None, 180_000).unwrap();
+        assert_eq!(out.plan, plan);
+        let measured = out.mastered.levels.as_ref().unwrap().duration_ms;
+        assert!(
+            measured.abs_diff(plan.total_ms()) < 100,
+            "{measured} ms measured, {} ms planned",
+            plan.total_ms()
+        );
     }
 
     #[test]
