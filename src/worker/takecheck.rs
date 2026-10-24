@@ -149,6 +149,14 @@ fn enqueue(ctx: &Ctx, ids: impl IntoIterator<Item = Id>, force: bool) -> usize {
 /// After a take row is stored (new or cache hit): queue it when automatic
 /// checking is on. A take that already has a result is skipped by the
 /// checker.
+/// The takes queued for a check, in order, and how many were queued since
+/// the queue was last empty (tests of the paths that create takes).
+#[cfg(test)]
+pub(super) fn queued(ctx: &Ctx) -> (Vec<Id>, usize) {
+    let q = ctx.checker.inner.queue();
+    (q.jobs.iter().map(|j| j.take_id).collect(), q.total)
+}
+
 pub(super) fn new_take(ctx: &Ctx, take_id: Id) {
     if ctx.checker.inner.queue().config.enabled {
         enqueue(ctx, [take_id], false);

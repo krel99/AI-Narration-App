@@ -207,16 +207,31 @@ fn dialogue_request_of(db: &Db, paragraph_id: Id) -> Result<Option<String>> {
     Ok(rid)
 }
 
-/// The cost of a billed dialogue that is discarded: the header, or the
-/// characters as an estimate (as for the takes' credits).
-fn billed(character_cost: Option<i64>, inputs: &[Input]) -> Spent {
+/// Credits for `chars` spoken characters of `model` when ElevenLabs sends
+/// no `character-cost`: the learned rate, exactly as for per-segment takes
+/// (billed rates differ per plan, so the text length is not the cost).
+fn estimate_credits(ctx: &Ctx, model: &str, chars: usize) -> i64 {
+    ctx.db(|db| Ok(db.credit_rate(model).credits(chars)))
+        .unwrap_or_else(|e| {
+            log::warn!("credit rate: {e:#}");
+            chars as i64
+        })
+}
+
+/// The cost of a billed dialogue that is discarded: the header, or an
+/// estimate at the learned rate (as for the takes' credits).
+fn billed(ctx: &Ctx, model: &str, character_cost: Option<i64>, inputs: &[Input]) -> Spent {
     match character_cost {
         Some(credits) => Spent::Billed {
             credits,
             exact: true,
         },
         None => Spent::Billed {
-            credits: inputs.iter().map(|i| i.text.chars().count() as i64).sum(),
+            credits: estimate_credits(
+                ctx,
+                model,
+                inputs.iter().map(|i| i.text.chars().count()).sum(),
+            ),
             exact: false,
         },
     }
@@ -411,7 +426,7 @@ async fn run(ctx: &Ctx, semaphore: &Semaphore, plan: &RunPlan, jobs: &[Job]) -> 
             }) => {
                 return Ok(Outcome::PerSegment {
                     why: format!("unusable dialogue response: {message}"),
-                    spent: billed(character_cost, &inputs),
+                    spent: billed(ctx, &model, character_cost, &inputs),
                 });
             }
         }
@@ -421,8 +436,7 @@ async fn run(ctx: &Ctx, semaphore: &Semaphore, plan: &RunPlan, jobs: &[Job]) -> 
     let chars: Vec<usize> = inputs.iter().map(|i| i.text.chars().count()).collect();
     let (total, credits_exact) = match reply.character_cost {
         Some(c) => (c, true),
-        // Billed rates differ per plan: estimate from the characters.
-        None => (chars.iter().sum::<usize>() as i64, false),
+        None => (estimate_credits(ctx, &model, chars.iter().sum()), false),
     };
     let request_id = reply.request_id.clone();
     let reply_cost = reply.character_cost;
@@ -460,7 +474,7 @@ async fn run(ctx: &Ctx, semaphore: &Semaphore, plan: &RunPlan, jobs: &[Job]) -> 
         Err(why) => {
             return Ok(Outcome::PerSegment {
                 why: format!("the dialogue could not be cut reliably: {why}"),
-                spent: billed(reply_cost, &inputs),
+                spent: billed(ctx, &model, reply_cost, &inputs),
             });
         }
     };
@@ -481,7 +495,7 @@ async fn run(ctx: &Ctx, semaphore: &Semaphore, plan: &RunPlan, jobs: &[Job]) -> 
         })
         .collect();
     let stored = ctx.db(|db| {
-        db.store_dialogue_takes(
+        let stored = db.store_dialogue_takes(
             &DialogueGroup {
                 group: &group,
                 seed,
@@ -489,7 +503,16 @@ async fn run(ctx: &Ctx, semaphore: &Semaphore, plan: &RunPlan, jobs: &[Job]) -> 
                 credits_exact,
             },
             &parts,
-        )
+        )?;
+        // Each take's model and spoken characters teach the credit
+        // estimates, as for per-segment takes. Bookkeeping only: the paid
+        // takes stay current even if this fails.
+        for (&(take_id, new), &c) in stored.iter().zip(&chars) {
+            if new && let Err(e) = db.record_take_cost(take_id, &model, c as i64) {
+                log::warn!("recording the cost of take {take_id}: {e:#}");
+            }
+        }
+        Ok(stored)
     })?;
     for (take_id, _) in stored {
         takecheck::new_take(ctx, take_id);

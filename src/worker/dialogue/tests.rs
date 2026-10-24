@@ -303,6 +303,160 @@ fn a_multi_speaker_paragraph_is_one_dialogue_cut_into_takes() {
     );
 }
 
+/// Without a `character-cost` header, dialogue takes are estimated at the
+/// learned rate like per-segment takes, the split still sums exactly, the
+/// takes are recorded for rate learning (estimates never teach the rate),
+/// and every new take is queued for the take check once.
+#[test]
+fn dialogue_takes_use_the_credit_bookkeeping_and_the_take_check() {
+    let no_cost = |r: Reply| -> Reply {
+        let (status, headers, body) = r;
+        let headers = headers
+            .into_iter()
+            .filter(|(k, _)| k != "character-cost")
+            .collect();
+        (status, headers, body)
+    };
+    let (url, _requests) = fake_eleven(move |n, body| no_cost(dialogue_reply(n, body, &|_| {})));
+    let s = setup(&url, "en", |_| {});
+    let (cid, segs) = import(&s, CHAPTER, &["guard", "vortram"]);
+    // Earlier exact takes of this model billed 0.44 credits per character.
+    s.ctx
+        .db(|db| {
+            for n in 0..5 {
+                let t = db.insert_take(&crate::db::NewTake {
+                    segment_id: segs[0].id,
+                    seed: 100 + n,
+                    request_id: None,
+                    audio_path: "old.wav",
+                    hash: &format!("old{n}"),
+                    credits_used: 44,
+                    credits_exact: true,
+                })?;
+                db.record_take_cost(t, "eleven_v4", 100)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    // Only the dialogue paragraph: the narration's exact takes would teach
+    // the rate while the dialogue is in flight.
+    let para = &segs[1..4];
+    rt().block_on(generate(&s.ctx, ids(para), false)).unwrap();
+
+    let takes: Vec<Take> = para.iter().map(|seg| current(&s.ctx, seg.id)).collect();
+    assert!(takes.iter().all(|t| t.dialogue_group.is_some()));
+    // 43 characters at 0.44 = 19 credits, split 17:16:10 by characters.
+    let total = (43.0f64 * 0.44).round() as i64;
+    assert_eq!(takes.iter().map(|t| t.credits_used).sum::<i64>(), total);
+    assert_eq!(
+        takes.iter().map(|t| t.credits_used).collect::<Vec<_>>(),
+        crate::dialogue::split_credits(total, &[17, 16, 10])
+    );
+    for (t, chars) in takes.iter().zip([17i64, 16, 10]) {
+        assert!(!t.credits_exact, "no header: estimated");
+        let (model, stored) = s.ctx.db(|db| db.take_cost(t.id)).unwrap().unwrap();
+        assert_eq!((model.as_str(), stored), ("eleven_v4", chars));
+    }
+    // Estimated takes never teach the rate.
+    let sample = s
+        .ctx
+        .db(|db| db.learned_rate("eleven_v4"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(sample.takes, 5);
+    let stats = s
+        .ctx
+        .db(|db| db.chapter_stats(cid, &db.project(s.project_id)?))
+        .unwrap();
+    assert!(stats.credits_estimated);
+    assert_eq!(stats.credits_used, 5 * 44 + total);
+
+    // Every new take is queued for the take check exactly once.
+    let (queued, total_queued) = super::super::takecheck::queued(&s.ctx);
+    let mut got = queued.clone();
+    got.sort();
+    assert_eq!(got, takes.iter().map(|t| t.id).collect::<Vec<_>>());
+    assert_eq!(total_queued, 3);
+
+    // With the header the takes are exact and teach the rate; the rest of
+    // the chapter goes per segment and is queued for the check as well.
+    let (url, _requests) = fake_eleven(|n, body| dialogue_reply(n, body, &|_| {}));
+    let s2 = setup(&url, "en", |_| {});
+    let (_, segs2) = import(&s2, CHAPTER, &["guard", "vortram"]);
+    rt().block_on(generate(&s2.ctx, ids(&segs2), false))
+        .unwrap();
+    for (seg, chars) in segs2[1..4].iter().zip([17i64, 16, 10]) {
+        let t = current(&s2.ctx, seg.id);
+        assert!(t.credits_exact && t.dialogue_group.is_some());
+        assert_eq!(t.credits_used, chars);
+        let (_, stored) = s2.ctx.db(|db| db.take_cost(t.id)).unwrap().unwrap();
+        assert_eq!(stored, chars);
+    }
+    let sample = s2
+        .ctx
+        .db(|db| db.learned_rate("eleven_v4"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(sample.takes, 5, "3 dialogue takes and 2 narration takes");
+    let (queued, total_queued) = super::super::takecheck::queued(&s2.ctx);
+    let mut got = queued;
+    got.sort();
+    let mut expect: Vec<Id> = segs2
+        .iter()
+        .map(|seg| current(&s2.ctx, seg.id).id)
+        .collect();
+    expect.sort();
+    assert_eq!(got, expect);
+    assert_eq!(total_queued, 5);
+}
+
+/// A discarded dialogue without a `character-cost` header is reported at
+/// the learned rate, marked as an estimate.
+#[test]
+fn a_discarded_dialogue_without_a_cost_header_is_estimated_at_the_learned_rate() {
+    let (url, _requests) = fake_eleven(|n, body| {
+        let (status, headers, body) = dialogue_reply(n, body, &|s| s.pcm.samples.clear());
+        let headers = headers
+            .into_iter()
+            .filter(|(k, _)| k != "character-cost")
+            .collect();
+        (status, headers, body)
+    });
+    let s = setup(&url, "en", |_| {});
+    let (_, segs) = import(&s, PARAGRAPH, &["guard", "vortram"]);
+    s.ctx
+        .db(|db| {
+            for n in 0..5 {
+                let t = db.insert_take(&crate::db::NewTake {
+                    segment_id: segs[0].id,
+                    seed: 100 + n,
+                    request_id: None,
+                    audio_path: "old.wav",
+                    hash: &format!("old{n}"),
+                    credits_used: 50,
+                    credits_exact: true,
+                })?;
+                db.record_take_cost(t, "eleven_v4", 100)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    rt().block_on(generate(&s.ctx, ids(&segs), false)).unwrap();
+    let events: Vec<Event> = s.events.try_iter().collect();
+    let about = (43.0f64 * 0.5).round() as i64;
+    assert!(
+        events.iter().any(|e| matches!(e, Event::Info(m)
+            if m.contains(&format!("billed (about {about} credits)")))),
+        "{events:?}"
+    );
+    let credits = events.iter().find_map(|e| match e {
+        Event::GenerationFinished { credits, .. } => Some(*credits),
+        _ => None,
+    });
+    // The fallback's per-segment takes have the header (43 credits).
+    assert_eq!(credits, Some(about + 43));
+}
+
 #[test]
 fn bad_voice_segments_fall_back_to_per_segment_requests() {
     type Tweak = fn(&mut Synth);
