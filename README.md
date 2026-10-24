@@ -51,8 +51,37 @@ Claude and ElevenLabs servers, so they need no API keys.
    limit. Under *Audio tags*, choose the density (light, moderate, rich) and
    add director's notes for the whole book
    ([screenshot](docs/screenshots/project-settings.png)).
-4. **Voices**: give every speaker an ElevenLabs voice id, including the
-   narrator. *Load my ElevenLabs voices* fills a picker from your account.
+4. **Voices**: give every speaker a voice, including the narrator.
+   *Choose…* picks one of the voices in your ElevenLabs account; a pasted
+   voice id works too (see [Voices](#voices) below).
+
+## Voices
+
+The app offers the voices in your own ElevenLabs account: the ones you
+created, cloned or designed, and the Voice Library voices you added to
+*My Voices* on elevenlabs.io. It does not browse the public library; add
+voices there on the web, then press *⟳ Refresh*
+([screenshot](docs/screenshots/voice-picker.png)).
+
+- **Voices dialog.** The list loads when the dialog opens (and stays loaded
+  until you refresh it or change the API key). Next to each voice id it shows
+  the voice's name, a ▶ preview and *Choose…*. An id that is not in your
+  account (an ElevenLabs default voice, say) is looked up by id, and one
+  ElevenLabs does not know is marked *⚠ unknown id*; either way the id is
+  kept as you typed it.
+- **Choose a voice for …** lists your voices with their category, labels and
+  description. Search matches the start of any word in the name, labels,
+  description or category (`brit narr`); the Category, Gender, Age, Accent
+  and Language filters offer only the values your voices have. *Used by:
+  vale, narrator* marks voices other speakers already have. *Assign* puts the
+  voice into the dialog; *Save* there keeps it.
+- **Previews** cost no credits. ▶ downloads a voice's preview once (a
+  spinner shows meanwhile) and keeps it in `voice-previews/`; a second click
+  stops it. Voices without a preview file fall back to a preview in a
+  verified language (the project's first), then to the sample you uploaded.
+- The API key needs the *Voices: Read* permission (`voices_read`); without
+  it the dialog says so, and pasted ids still work. On the Free plan,
+  ElevenLabs may refuse Voice Library voices for API use.
 
 ## Claude
 
@@ -161,6 +190,7 @@ library.sqlite              projects, characters, chapters, paragraphs, segments
 audio/<take_hash>.wav       every take, 16-bit mono PCM (opens in Audacity)
 exports/<project>/          chapter MP3 + FLAC, book M4B
 claude-cwd/                 empty working directory for Claude Code runs
+voice-previews/             downloaded voice previews (<voice_id>-<url hash>.mp3)
 ```
 
 Every pipeline stage resumes from this state after a restart.
@@ -174,12 +204,13 @@ Every pipeline stage resumes from this state after a restart.
 | `src/llm.rs` | Claude attribution and audio-tag direction requests (structured JSON output), API or Claude Code transport |
 | `src/claude_code.rs` | Claude Code CLI: lookup, version and sign-in check, isolated `claude -p` runs, result and error parsing |
 | `src/costs.rs` | Claude prices, credit-rate learning, token and credit estimates, number formats |
-| `src/tts.rs` | ElevenLabs text-to-speech and voice list (`tts/account.rs`: balance and model rates) |
+| `src/tts.rs` | ElevenLabs text-to-speech (`tts/account.rs`: balance and model rates; `tts/voices.rs`: your voices, lookups by id, preview downloads) |
+| `src/voices.rs` | Voice picker search and filters, "used by", preview sources and the preview cache |
 | `src/worker.rs` | Command/event channels, segmentation pass, TTS worker pool, export jobs |
 | `src/db.rs` | SQLite schema and queries (`db/costs.rs`: usage and rate tables) |
 | `src/audio.rs` | PCM/WAV handling, MP3-fallback decode |
 | `src/export.rs` | Streaming assembly with silences; ffmpeg loudnorm and encode |
 | `src/hash.rs` | Take hash |
 | `src/player.rs` | rodio playback queue |
-| `src/app.rs` | egui UI (Text and Review tabs, dialogs; `app/costs.rs`: balance, estimates, Claude settings) |
+| `src/app.rs` | egui UI (Text and Review tabs, dialogs; `app/costs.rs`: balance, estimates, Claude settings; `app/voice_picker.rs`: voice picker and previews) |
 | `src/theme.rs` | Light (default) and dark themes, semantic colours |

@@ -1,6 +1,9 @@
 //! ElevenLabs text-to-speech client.
 
 pub mod account;
+pub mod voices;
+
+pub use voices::VoiceInfo;
 
 use std::time::Duration;
 
@@ -78,12 +81,6 @@ fn error_message(body: &str) -> String {
                 .map(str::to_string)
         })
         .unwrap_or_else(|| body.chars().take(300).collect())
-}
-
-#[derive(Debug, Clone)]
-pub struct VoiceInfo {
-    pub voice_id: String,
-    pub name: String,
 }
 
 pub struct ElevenLabsClient {
@@ -170,44 +167,6 @@ impl ElevenLabsClient {
             request_id,
             character_cost,
         })
-    }
-
-    /// The account's voices, for the voice-map picker.
-    pub async fn voices(&self) -> Result<Vec<VoiceInfo>, TtsError> {
-        let resp = self
-            .http
-            .get(format!("{}/voices", self.base))
-            .header("xi-api-key", &self.api_key)
-            .timeout(Duration::from_secs(30))
-            .send()
-            .await
-            .map_err(|e| TtsError::Transient(e.to_string()))?;
-        let status = resp.status();
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| TtsError::Transient(e.to_string()))?;
-        if !status.is_success() {
-            return Err(TtsError::Rejected {
-                status: status.as_u16(),
-                message: error_message(&body),
-            });
-        }
-        let v: Value =
-            serde_json::from_str(&body).map_err(|e| TtsError::Transient(e.to_string()))?;
-        let mut voices: Vec<VoiceInfo> = v["voices"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|x| {
-                Some(VoiceInfo {
-                    voice_id: x["voice_id"].as_str()?.to_string(),
-                    name: x["name"].as_str().unwrap_or("").to_string(),
-                })
-            })
-            .collect();
-        voices.sort_by_key(|a| a.name.to_lowercase());
-        Ok(voices)
     }
 }
 

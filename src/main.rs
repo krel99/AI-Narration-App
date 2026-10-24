@@ -16,6 +16,7 @@ mod segment;
 mod tags;
 mod theme;
 mod tts;
+mod voices;
 mod worker;
 
 fn main() -> eframe::Result<()> {

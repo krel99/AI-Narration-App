@@ -26,6 +26,7 @@ use crate::tts::{ElevenLabsClient, TtsError, TtsRequest, VoiceInfo};
 
 mod account;
 mod claude;
+mod voices;
 
 /// Seed of a segment's first take. Fixed, so identical lines with the same
 /// voice and settings ("he said,") share one cached take.
@@ -65,7 +66,19 @@ pub enum Command {
     ExportBook {
         project_id: Id,
     },
+    /// The voices in the user's account (answered by `Event::Voices`).
     FetchVoices,
+    /// Look up assigned voice ids that are not in the account list
+    /// (answered by `Event::VoicesLookedUp`).
+    LookupVoices {
+        ids: Vec<String>,
+    },
+    /// A voice's preview audio, downloaded once and cached (answered by
+    /// `Event::VoicePreview`).
+    PreviewVoice {
+        voice: Box<VoiceInfo>,
+        language: String,
+    },
     /// The ElevenLabs balance and model rates (answered by `Event::Account`).
     FetchAccount,
     /// Check the Claude Code CLI (answered by `Event::ClaudeCode`).
@@ -118,7 +131,17 @@ pub enum Event {
         gaps: usize,
         duration_ms: u64,
     },
-    Voices(Vec<VoiceInfo>),
+    /// The account's voices, or why they could not be loaded.
+    Voices(std::result::Result<Vec<VoiceInfo>, String>),
+    VoicesLookedUp {
+        found: Vec<VoiceInfo>,
+        /// Ids ElevenLabs has no voice for.
+        missing: Vec<String>,
+    },
+    VoicePreview {
+        voice_id: String,
+        result: std::result::Result<audio::Pcm, String>,
+    },
     DirectionProgress {
         chapter_id: Id,
         done: usize,
@@ -307,20 +330,10 @@ async fn run(ctx: &Ctx, cmd: Command) -> Result<()> {
             });
             Ok(())
         }
-        Command::FetchVoices => {
-            let key = ctx
-                .keys
-                .read()
-                .map(|k| k.elevenlabs.clone())
-                .unwrap_or_default();
-            if key.is_empty() {
-                return Err(anyhow!("set the ElevenLabs API key in Settings first"));
-            }
-            let voices = ElevenLabsClient::new(ctx.http.clone(), key, &ctx.endpoints.elevenlabs)
-                .voices()
-                .await?;
-            ctx.out.emit(Event::Voices(voices));
-            Ok(())
+        Command::FetchVoices => voices::fetch_voices(ctx).await,
+        Command::LookupVoices { ids } => voices::lookup_voices(ctx, ids).await,
+        Command::PreviewVoice { voice, language } => {
+            voices::preview_voice(ctx, *voice, language).await
         }
         Command::FetchAccount => account::fetch_account(ctx).await,
         Command::DetectClaudeCode { path } => {
@@ -1121,6 +1134,7 @@ mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
 
     mod costs;
+    mod voices;
 
     #[test]
     fn speakers_resolve_through_aliases() {

@@ -162,6 +162,14 @@ impl App {
         }
     }
 
+    /// The plan tier of the last balance answer ("free", "creator", …).
+    pub(super) fn account_tier(&self) -> Option<&str> {
+        match &self.costs.account {
+            Some(Ok(sub)) => sub.tier.as_deref(),
+            _ => None,
+        }
+    }
+
     fn remaining_credits(&self) -> Option<i64> {
         match &self.costs.account {
             Some(Ok(sub)) => sub.remaining(),

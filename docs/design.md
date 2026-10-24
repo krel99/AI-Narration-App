@@ -343,9 +343,62 @@ paying for the API as well, and show estimated costs.
   English, 3 otherwise, plus Claude Code's own framing. It is labelled rough;
   retries are not included.
 
+### Voice picker (added after the first build)
+
+Requested: assign voices from the user's own account only ("I will browse
+the library on the web"), so no public-library browsing and no automatic
+casting.
+
+- **List.** `GET /v2/voices?voice_type=non-default&page_size=100&include_total_count=false`,
+  following `next_page_token` while `has_more` (at most 100 pages; a repeated
+  or missing token stops the loop; duplicates across pages are dropped).
+  `non-default` is personal + workspace + community voices, the last being
+  Voice Library voices added to My Voices; ElevenLabs' default voices are
+  left out. Voices are parsed field by field from JSON because real
+  responses carry explicit nulls (`samples`, `settings`, `sharing`,
+  `description`, `preview_url`); a voice without `voice_id` is skipped, not
+  the page. `category` stays a string. Labels are lowercased by key.
+- **Loading.** When the Voices dialog opens with a key set, once per key (and
+  again after an error); *Refresh* reloads. The list lives in memory only.
+  Errors are shown inline: 401 `missing_permissions` / 403
+  `insufficient_permissions` as "the API key lacks the voices_read
+  permission", other 401s as a rejected key, network errors without the URL.
+- **Assigned ids outside the list** (a default voice picked earlier, a pasted
+  id) are looked up with `GET /v1/voices/{id}` once no text field has focus:
+  found ones show their name, a 404 shows "⚠ unknown id", and other failures
+  leave "not in your voices" (retried on Refresh). The id is always kept as
+  typed; generation decides.
+- **Picker** (`app/voice_picker.rs`, logic in `voices.rs`). Search splits the
+  query into words, and every word must begin a word of the name,
+  category, description, label values or language names (so "male" does not
+  match "female"). Facets (category, gender, age, accent, language) list
+  only values present in the loaded voices; languages come from the
+  `language` label and `verified_languages`, normalised to codes. The list is
+  virtualised (`show_rows`). *Assign* only edits the open Voices dialog;
+  *Save* there writes `voice_map` as before. "Used by" counts the dialog's
+  current, unsaved rows.
+- **Previews.** Sources in order: `preview_url`, verified-language previews
+  (the project's language first), then the first uploaded sample via
+  `GET /v1/voices/{id}/samples/{sample_id}/audio`. Preview URLs are public
+  storage objects on another host, so the API key is never sent with them;
+  the content type (served as `text/plain`) is ignored and the bytes are
+  sniffed (WAV by its header, otherwise MP3 via `audio::decode_mp3`). Files
+  are cached as `<library>/voice-previews/<voice_id>-<10 hex of the
+  source>.mp3|wav`, keyed by URL so an edited voice's new preview is fetched
+  again (older files of that voice are removed). Only audio that decodes is
+  cached; a cached file that no longer decodes is deleted. All cached sources
+  are tried before any download. Playback goes through the app's player
+  with the sentinel id `-1`, so no segment row lights up; a second click
+  stops it, and closing the Voices dialog stops a preview.
+- **Free plan.** When the balance says `tier: free`, the picker notes that
+  ElevenLabs may refuse Voice Library voices for API use (reported as 402
+  `payment_required`; not verified here).
+
 ### To verify against a real account
 
 - ElevenLabs response header names for the request id and the character cost.
 - Whether request stitching applies to `eleven_v3` (the setting can be turned
   off per project).
 - Which PCM rates the plan allows.
+- Whether `/v2/voices` sends `total_count` when it is not asked for (it is
+  read as optional and not used).

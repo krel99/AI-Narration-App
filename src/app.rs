@@ -21,6 +21,7 @@ use crate::tts::VoiceInfo;
 use crate::worker::{self, Command, Event, WorkerHandle};
 
 mod costs;
+mod voice_picker;
 
 const ROW_H: f32 = 46.0;
 
@@ -174,6 +175,7 @@ pub struct App {
     dirty: bool,
     dialogs: Dialogs,
     costs: costs::CostState,
+    voice_ui: voice_picker::VoiceUi,
 }
 
 fn status_icon(s: SegmentStatus, p: &Palette) -> (&'static str, Color32) {
@@ -275,6 +277,7 @@ impl App {
             dirty: false,
             dialogs: Dialogs::default(),
             costs: Default::default(),
+            voice_ui: Default::default(),
         };
         if let Some(e) = app.player.error.clone() {
             app.note(true, e);
@@ -598,10 +601,11 @@ impl App {
                     );
                     self.dirty = true;
                 }
-                Event::Voices(v) => {
-                    self.note(false, format!("Loaded {} voices from ElevenLabs.", v.len()));
-                    self.voices = v;
+                Event::Voices(v) => self.on_voices(v),
+                Event::VoicesLookedUp { found, missing } => {
+                    self.on_voices_looked_up(found, missing)
                 }
+                Event::VoicePreview { voice_id, result } => self.on_voice_preview(voice_id, result),
                 Event::Account(info) => self.on_account(info),
                 Event::ClaudeCode(d) => self.on_claude_detection(*d),
             }
@@ -972,6 +976,7 @@ impl App {
             rename_from: String::new(),
             rename_to: String::new(),
         });
+        self.voices_dialog_opened();
     }
 
     // ---- top bar --------------------------------------------------------------
@@ -1851,6 +1856,7 @@ impl App {
         self.dialog_settings(ctx);
         self.dialog_project_settings(ctx);
         self.dialog_voices(ctx);
+        self.dialog_voice_picker(ctx);
         self.dialog_split(ctx);
         self.dialog_generate(ctx);
         self.dialog_confirmations(ctx);
@@ -2126,16 +2132,19 @@ impl App {
     }
 
     fn dialog_voices(&mut self, ctx: &egui::Context) {
+        let preview = self.preview_now();
         let Some(ed) = &mut self.dialogs.voices else {
             return;
         };
         let mut save = false;
         let mut cancel = false;
         let mut fetch = false;
+        let mut cell = None;
         let mut rename: Option<(String, String)> = None;
         let voices = &self.voices;
+        let voice_ui = &self.voice_ui;
         egui::Window::new("Voices and characters")
-            .default_size([800.0, 480.0])
+            .default_size([900.0, 480.0])
             .show(ctx, |ui| {
                 let dark = ui.visuals().dark_mode;
                 let muted = theme::palette(ui).muted;
@@ -2144,17 +2153,14 @@ impl App {
                         .small()
                         .color(muted),
                 );
-                ui.horizontal(|ui| {
-                    fetch = ui.button("Load my ElevenLabs voices").clicked();
-                    ui.label(RichText::new(format!("{} loaded", voices.len())).small().color(muted));
-                });
+                fetch = voice_picker::list_status(ui, voices.len(), voice_ui);
                 egui::ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
                     egui::Grid::new("voices").num_columns(6).striped(true).spacing([10.0, 6.0]).show(ui, |ui| {
-                        for h in ["Key", "Display name", "Aliases (comma separated)", "Voice id", "", ""] {
+                        for h in ["Key", "Display name", "Aliases (comma separated)", "Voice id", "Voice", ""] {
                             ui.label(RichText::new(h).small().strong().color(muted));
                         }
                         ui.end_row();
-                        for (n, row) in ed.rows.iter_mut().enumerate() {
+                        for row in ed.rows.iter_mut() {
                             let key_text = RichText::new(&row.key).strong().color(speaker_color(&row.key, dark));
                             ui.label(if row.remove { key_text.strikethrough() } else { key_text });
                             if row.key == NARRATOR {
@@ -2165,22 +2171,8 @@ impl App {
                                 ui.text_edit_singleline(&mut row.aliases);
                             }
                             ui.add_sized([190.0, 22.0], egui::TextEdit::singleline(&mut row.voice_id).hint_text("voice id"));
-                            if voices.is_empty() {
-                                ui.label("");
-                            } else {
-                                let current = voices
-                                    .iter()
-                                    .find(|v| v.voice_id == row.voice_id)
-                                    .map(|v| v.name.clone())
-                                    .unwrap_or_else(|| "pick…".into());
-                                egui::ComboBox::from_id_salt(("pick", n))
-                                    .selected_text(current)
-                                    .width(140.0)
-                                    .show_ui(ui, |ui| {
-                                        for v in voices {
-                                            ui.selectable_value(&mut row.voice_id, v.voice_id.clone(), &v.name);
-                                        }
-                                    });
+                            if let Some(a) = voice_picker::voice_cell(ui, row, voices, voice_ui, &preview) {
+                                cell = Some(a);
                             }
                             if row.key != NARRATOR {
                                 ui.checkbox(&mut row.remove, "remove");
@@ -2226,7 +2218,10 @@ impl App {
                 });
             });
         if fetch {
-            self.worker.send(Command::FetchVoices);
+            self.refresh_voices();
+        }
+        if let Some(a) = cell {
+            self.voice_cell_action(a);
         }
         if let Some((from, to)) = rename.filter(|(f, t)| !f.is_empty() && !t.is_empty())
             && let Some(pid) = self.project.as_ref().map(|p| p.id)
