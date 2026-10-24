@@ -306,6 +306,100 @@ so "0 ms within a paragraph" did not give even gaps.
   when they are quieter than the threshold. Raising it (e.g. to -40 dBFS) cuts
   more, at the risk of clipping soft word onsets.
 
+### Take checking (added after the first build)
+
+Requested on top of the plan: "This would be done locally. It should flag
+it, not reject it." Every take is transcribed on the user's machine with
+Whisper (whisper.cpp through whisper-rs 0.16) and compared with its text.
+The design follows the verified research
+(`plan/research/local-whisper.verify.md`).
+
+- **Flag only.** A check stores a result per take (`take_check`: status
+  ok / flagged / dismissed / error / skipped, the transcript, WER, findings
+  as JSON, the model, a timestamp). Nothing else changes: segment statuses,
+  approval, takes and credits are untouched, and approving a flagged take is
+  always possible. Deleting a take deletes its check.
+- **What is compared.** The expected words are the segment's `text`; audio
+  tags (as `tags::find` defines them) and `<break …/>` are not spoken.
+  Both sides are normalised: case, diacritics, apostrophes, quotes, dashes
+  and other punctuation; thousands separators; English number words are
+  parsed ("forty thousand" = "$40,000"), and digits against unparsed number
+  words (Czech, other languages, "nineteen ninety-nine") are not counted.
+  Whisper's own annotations (`[laughs]`, `(sighs)`, `*coughs*`, `♪ … ♪`) are
+  dropped, but only when they close within 40 characters, so a stray `<` or
+  `(` no longer swallows the rest of a line. The words are aligned with a
+  token-level edit distance that accepts British/American spelling variants
+  by explicit rules (not an edit distance, which accepted dead/deed and
+  than/then), merges ("every day" / "everyday"), English contractions
+  ("don't" / "do not") and fillers.
+- **Verdict** (heuristic thresholds from the research, in one
+  `Thresholds` struct, to be calibrated on real takes): nothing heard flags;
+  an audio tag heard as extra words flags; lines of at most three words
+  (dialogue tags) flag only when nothing matches or two words differ; three
+  missing/extra/wrong words in a row flag; otherwise a WER above 20 % (with
+  at least three errors, under 15 words) or 12 % (15 words or more) flags,
+  and these limits are 1.6 times higher outside English. Anything less is
+  "minor differences" and does not flag.
+- **Length check.** Free and always on: the sounding part of the take (the
+  silence detector with no margins) against the characters at 15 per second
+  times the voice's speed. Under half the expected length flags (for lines
+  of at least 1.5 s), as does more than twice the expected length plus
+  1.5 s plus 1 s per audio tag, or a silent take. Without a model (or in a
+  build without Whisper) this is the whole check ("skipped": words not
+  checked).
+- **Hallucinations.** whisper.cpp already drops a window it judges silent.
+  On top of that only a segment that is both in a near-silent window
+  (no-speech probability ≥ 0.6) and a known invented phrase ("Thank you.",
+  "Thanks for watching!", and two commonly reported Czech ones) is ignored,
+  and never one the text itself contains. Filtering on the no-speech
+  probability alone would erase real speech.
+- **Whisper settings.** The chapter's language (never auto-detect), greedy
+  decoding, no context, a single segment for takes up to 28 s, suppressed
+  blanks and non-speech tokens, no initial prompt (the expected text would
+  bias Whisper toward it). Input is resampled to 16 kHz with a windowed-sinc
+  polyphase filter (`audio::resample_linear` has no anti-alias filter).
+  Takes under 1.5 s get a 200 ms lead-in and are padded to 1.5 s. Decoding
+  is capped at about 10 tokens per second of audio (some three times natural
+  speech) so a hallucination loop cannot run to the window limit; that cap
+  is an addition to the research.
+- **One background thread.** A dedicated thread at nice 19 and SCHED_IDLE
+  (both per thread on Linux and inherited by ggml's worker threads) checks
+  one take at a time from a de-duplicated queue, with its own database
+  connection. It never holds up generation or the UI. The model is loaded on
+  first use and dropped after five idle minutes. Cancelling uses whisper.cpp's
+  raw abort callback (whisper-rs's `set_abort_callback_safe` is broken in
+  0.13–0.16) and is checked before each transcription; whisper.cpp polls it
+  only between encoder and decoder passes. Threads default to half the cores
+  (1–8).
+- **Triggers.** Every take `generate_one` stores, cache hits included, is
+  queued while automatic checking is on (`AppConfig.check.enabled`, default
+  on). A cache hit reuses the check of the take it shares a file and text
+  with instead of transcribing again (a dismissal included). "Check chapter"
+  queues the current takes without a result for the current model; failed
+  checks are retried, dismissed flags kept, and a length-only result is
+  upgraded once a model is installed. "Re-check" goes to the front of the
+  queue and replaces the result. The check reads the take's WAV untrimmed:
+  it judges the generated audio, which cache hits share, not the editable
+  trim.
+- **Models.** `<library>/models/ggml-<name>.bin`, downloaded from
+  huggingface.co/ggerganov/whisper.cpp to a `.part` file, verified against
+  the SHA-1 published in whisper.cpp's model list (or, for files without
+  one, the SHA-256 from Hugging Face's file listing), then renamed. A model
+  placed by hand is hashed once before its first load. Offered: base, small
+  (default), small-q8_0, large-v3-turbo-q5_0 (recommended for Czech) and
+  large-v3-turbo; all multilingual. An English-only model is refused for
+  other languages.
+- **Build.** Cargo feature `whisper` (default). `--no-default-features`
+  builds without it; the take check then only checks lengths and Settings
+  says so. Debug builds compile whisper.cpp with debug logging, so the log
+  filter defaults to `whisper_rs=warn`.
+
+Not verified here (no network access to Hugging Face, no real weights): the
+recognition quality of the offered models on ElevenLabs takes in English and
+Czech, the size and hash of `small-q8_0`, how Whisper renders performed tags
+such as `[laughs]`, and therefore the thresholds. The pipeline was exercised
+end to end with random-weight models of the real shapes.
+
 ### To verify against a real account
 
 - ElevenLabs response header names for the request id and the character cost.

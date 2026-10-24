@@ -2,6 +2,7 @@
 
 mod app;
 mod audio;
+mod check;
 mod config;
 mod db;
 mod export;
@@ -18,7 +19,10 @@ mod tts;
 mod worker;
 
 fn main() -> eframe::Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info,whisper_rs=warn"),
+    )
+    .init();
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Narration Studio")

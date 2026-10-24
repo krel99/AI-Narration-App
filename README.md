@@ -25,12 +25,21 @@ Requirements:
 - Build dependencies: `pkg-config`, `libasound2-dev` (ALSA headers for audio playback)
 - Runtime: `ffmpeg` with `libmp3lame` on `PATH` (export only), and a desktop
   session (X11 or Wayland)
+- For the local take check (the default `whisper` feature, which compiles
+  whisper.cpp): `cmake`, a C and C++ compiler, and libclang (any
+  `libclang1-NN`, which `clang` pulls in, or `libclang-dev`). The first build
+  takes about a minute longer. `cargo build --no-default-features` builds
+  without Whisper; the take check then only checks lengths.
 
 ```sh
-sudo apt install pkg-config libasound2-dev ffmpeg   # Debian/Ubuntu
+sudo apt install pkg-config libasound2-dev ffmpeg build-essential cmake clang   # Debian/Ubuntu
 cargo build --release
 ./target/release/narration-studio
 ```
+
+whisper.cpp is compiled for the building machine's CPU (`-march=native`). To
+build a binary for other machines, set `GGML_NATIVE=OFF` and run
+`cargo clean -p whisper-rs-sys` first (cargo does not notice the variable).
 
 Run the tests with `cargo test`. The export test also encodes with ffmpeg when
 it is installed. The pipeline tests drive the workers against local fake
@@ -111,6 +120,44 @@ silence, never the middle, with a short fade at each cut
   the database. The WAV file and the take hash stay as they are. Playback,
   paragraph playback and every export use the trimmed audio.
 
+### Take checking
+
+Every new take is transcribed on this computer with Whisper and compared
+with the segment's text. A take whose words differ, or whose length is
+unusual for its text, is **flagged** for a listen. A flag never rejects a
+take, never blocks approving it and never costs credits
+([screenshot](docs/screenshots/take-check.png)).
+
+- **Settings → Take checking**: pick a model and **Download** it (from
+  Hugging Face, into the library's `models/` folder; the checksum is verified
+  before the file is kept). *small* (466 MiB, about 780 MB of memory, about
+  5 s per take with 4 threads) is the default. *base* is faster and less
+  accurate. *Large v3 Turbo, 5-bit* is the better choice for Czech and other
+  non-English projects, at about five times the cost of *small*. The check
+  uses half the CPU cores by default and runs one take at a time at the
+  lowest priority. Set `HF_TOKEN` to send a Hugging Face token.
+- Without a model (or in a build without Whisper) only the free **length
+  check** runs: a take much shorter or longer than its text needs at the
+  voice's speed is flagged.
+- **Review**: a flagged segment shows an amber ⚠ next to its status; hover it
+  for the reason. The toolbar's **⚠ N flagged** chip selects the next flagged
+  segment. **Check chapter** queues the current takes that have no result yet
+  (for example after installing a model) and shows the progress; **Stop**
+  empties the queue.
+- The detail panel's **Take check** shows the text with the differences
+  marked: words that were not heard are struck through in red, words that
+  were heard but are not in the text are highlighted. Below it are what
+  Whisper heard, the reason for a flag and the length. **Re-check** runs the
+  check again, **Dismiss flag** marks the take as fine, and **↻ Re-roll**
+  generates a new take (costs credits, like R).
+- Differences in punctuation, case, quotes, dashes, British/American
+  spelling, numbers written as digits or words, contractions and fillers
+  ("um", laughter) are ignored. An audio tag that was read aloud
+  (`[whispers]` heard as "whispers") is flagged. Short dialogue tags are
+  judged leniently, and non-English text more leniently than English.
+- Checking new takes automatically can be turned off in Settings; **Check
+  chapter** and **Re-check** work either way.
+
 ## Data
 
 All state lives in one library directory (default
@@ -120,6 +167,7 @@ All state lives in one library directory (default
 library.sqlite              projects, characters, chapters, paragraphs, segments, takes
 audio/<take_hash>.wav       every take, 16-bit mono PCM (opens in Audacity)
 exports/<project>/          chapter MP3 + FLAC, book M4B
+models/ggml-<model>.bin     Whisper models for the take check
 ```
 
 Every pipeline stage resumes from this state after a restart.
@@ -138,8 +186,16 @@ Every pipeline stage resumes from this state after a restart.
 | `src/audio.rs` | PCM/WAV handling, MP3-fallback decode |
 | `src/export.rs` | Streaming assembly with silences; ffmpeg loudnorm and encode |
 | `src/trim.rs` | Silence trimming: detection, cut and fade, waveform peaks, loading a take's audio with its trim |
+| `src/check.rs` | Take check: settings, results, length check, hallucination filter, combining the findings |
+| `src/check/text.rs` | Text normalisation, word alignment and the flag thresholds |
+| `src/check/resample.rs` | Anti-aliased resampling to Whisper's 16 kHz input |
+| `src/check/models.rs` | Whisper model catalog, checksum verification, download |
+| `src/check/whisper.rs` | whisper-rs backend (feature `whisper`) |
+| `src/worker/takecheck.rs` | The low-priority checker thread, take-check commands, model downloads |
+| `src/db/takecheck.rs` | `take_check` table queries |
 | `src/hash.rs` | Take hash |
 | `src/player.rs` | rodio playback queue |
 | `src/app.rs` | egui UI (Text and Review tabs, dialogs) |
 | `src/app/waveform.rs` | Take waveform with trim handles, Auto-trim buttons, trim settings |
+| `src/app/check.rs` | Take-check marker, toolbar chip, detail section with the highlighted differences, settings |
 | `src/theme.rs` | Light (default) and dark themes, semantic colours |

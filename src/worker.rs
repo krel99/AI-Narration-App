@@ -25,6 +25,7 @@ use crate::tags;
 use crate::tts::{ElevenLabsClient, TtsError, TtsRequest, VoiceInfo};
 
 mod autotrim;
+mod takecheck;
 
 /// Seed of a segment's first take. Fixed, so identical lines with the same
 /// voice and settings ("he said,") share one cached take.
@@ -66,6 +67,8 @@ pub enum Command {
     AutoTrimChapter {
         chapter_id: Id,
     },
+    /// Local take check (Whisper): queueing, settings and models.
+    Check(crate::check::CheckCommand),
     SetKeys(ApiKeys),
     /// Stop queued work (requests already in flight finish).
     Cancel,
@@ -125,6 +128,25 @@ pub enum Event {
         input_tokens: u64,
         output_tokens: u64,
     },
+    /// A take of this segment got a (new) check result.
+    TakeChecked {
+        segment_id: Id,
+    },
+    /// Take-check queue: `done` of `total` since it was last empty; 0 of 0
+    /// when the checker is idle.
+    CheckProgress {
+        done: usize,
+        total: usize,
+    },
+    ModelDownload {
+        model: String,
+        received: u64,
+        total: Option<u64>,
+    },
+    ModelDownloadFinished {
+        model: String,
+        error: Option<String>,
+    },
 }
 
 pub struct WorkerHandle {
@@ -161,6 +183,7 @@ struct Ctx {
     /// Bumped by Cancel; jobs stop when it no longer matches their start value.
     epoch: Arc<AtomicU64>,
     endpoints: Endpoints,
+    checker: takecheck::Checker,
 }
 
 /// API endpoints; overridden in tests to point at local fakes.
@@ -212,7 +235,9 @@ pub fn spawn(
         },
         epoch: Arc::new(AtomicU64::new(0)),
         endpoints: Endpoints::default(),
+        checker: Default::default(),
     };
+    takecheck::start(&ctx, crate::check::whisper_loader());
     std::thread::Builder::new()
         .name("workers".into())
         .spawn(move || {
@@ -317,6 +342,7 @@ async fn run(ctx: &Ctx, cmd: Command) -> Result<()> {
         Command::AutoTrimChapter { chapter_id } => {
             autotrim::auto_trim_chapter(ctx, chapter_id).await
         }
+        Command::Check(c) => takecheck::run_command(ctx, c).await,
         Command::Cancel | Command::SetKeys(_) => Ok(()),
     }
 }
@@ -984,6 +1010,7 @@ async fn generate_one(
         if take_id != existing.id {
             autotrim::trim_new_take(ctx, &project, take_id).await;
         }
+        takecheck::new_take(ctx, take_id);
         return Ok((true, 0));
     }
 
@@ -1061,6 +1088,7 @@ async fn generate_one(
         Ok(take_id)
     })?;
     autotrim::trim_new_take(ctx, &project, take_id).await;
+    takecheck::new_take(ctx, take_id);
     Ok((false, credits))
 }
 
@@ -1164,6 +1192,7 @@ mod tests {
                 anthropic: anthropic.into(),
                 elevenlabs: elevenlabs.into(),
             },
+            checker: Default::default(),
         };
         (ctx, rx)
     }

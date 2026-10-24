@@ -19,6 +19,7 @@ use crate::theme::{self, Palette, primary_button, speaker_color};
 use crate::tts::VoiceInfo;
 use crate::worker::{self, Command, Event, WorkerHandle};
 
+mod check;
 mod waveform;
 
 const ROW_H: f32 = 46.0;
@@ -161,6 +162,7 @@ pub struct App {
     takes_for: Option<Id>,
     tag_edit: Option<TagEdit>,
     wave: waveform::WaveState,
+    check: check::CheckState,
 
     in_flight: HashSet<Id>,
     failures: HashMap<Id, String>,
@@ -263,6 +265,7 @@ impl App {
             takes_for: None,
             tag_edit: None,
             wave: Default::default(),
+            check: Default::default(),
             in_flight: HashSet::new(),
             failures: HashMap::new(),
             segmenting: None,
@@ -275,6 +278,10 @@ impl App {
             dirty: false,
             dialogs: Dialogs::default(),
         };
+        app.worker
+            .send(Command::Check(crate::check::CheckCommand::Config(
+                app.cfg.check.clone(),
+            )));
         if let Some(e) = app.player.error.clone() {
             app.note(true, e);
         }
@@ -448,6 +455,7 @@ impl App {
         }
         .filter(|_| !self.view.segments.is_empty());
         self.takes_for = None;
+        self.reload_checks();
     }
 
     fn selected_segment(&self) -> Option<&Segment> {
@@ -598,6 +606,10 @@ impl App {
                     self.note(false, format!("Loaded {} voices from ElevenLabs.", v.len()));
                     self.voices = v;
                 }
+                ev @ (Event::TakeChecked { .. }
+                | Event::CheckProgress { .. }
+                | Event::ModelDownload { .. }
+                | Event::ModelDownloadFinished { .. }) => self.on_check_event(ev),
             }
         }
         if self.dirty {
@@ -1267,6 +1279,7 @@ impl App {
                 if st.rejected > 0 {
                     chip(ui, format!("{} rejected", st.rejected), p.rejected);
                 }
+                self.check_chip(ui);
                 if st.unassigned > 0 {
                     chip(
                         ui,
@@ -1350,6 +1363,7 @@ impl App {
                 }
             }
             self.auto_trim_chapter_button(ui, cid);
+            self.check_toolbar(ui, cid);
             ui.separator();
             let complete = st.segments > 0 && st.approved == st.segments;
             if ui
@@ -1485,6 +1499,7 @@ impl App {
                         if let Some(err) = self.failures.get(&seg.id) {
                             status_label.on_hover_text(format!("Last generation failed: {err}"));
                         }
+                        self.check_marker(ui, seg);
                         let unassigned = project
                             .as_ref()
                             .is_none_or(|p| p.voice_for(&seg.speaker).is_none());
@@ -1710,6 +1725,7 @@ impl App {
                     }
                 });
                 self.waveform_section(ui, &seg, locked);
+                self.check_section(ui, &seg, locked, i);
 
                 ui.add_space(6.0);
                 egui::CollapsingHeader::new(RichText::new("✦ Audio tags").strong())
@@ -1913,6 +1929,7 @@ impl App {
         };
         let mut save = false;
         let mut cancel = false;
+        let mut check_cmd = None;
         egui::Window::new("Settings").collapsible(false).show(ctx, |ui| {
             egui::Grid::new("settings").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
                 ui.label("Anthropic API key");
@@ -1949,15 +1966,23 @@ impl App {
                     .small()
                     .color(theme::palette(ui).muted),
             );
+            check_cmd = check::settings_section(ui, &mut cfg.check, &self.check, &self.lib);
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 save = ui.add(primary_button(ui, "Save")).clicked();
                 cancel = ui.button("Cancel").clicked();
             });
         });
+        if let Some(c) = check_cmd {
+            self.worker.send(Command::Check(c));
+        }
         if save {
             let cfg = self.dialogs.settings.take().unwrap();
             self.worker.send(Command::SetKeys(cfg.api_keys()));
+            self.worker
+                .send(Command::Check(crate::check::CheckCommand::Config(
+                    cfg.check.clone(),
+                )));
             theme::apply(ctx, cfg.dark_mode);
             self.cfg = cfg;
             if let Err(e) = self.cfg.save() {

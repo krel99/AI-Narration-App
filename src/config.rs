@@ -18,6 +18,8 @@ pub struct AppConfig {
     pub last_project: Option<i64>,
     /// Dark theme instead of the default light one.
     pub dark_mode: bool,
+    /// Local take check (Whisper): machine-dependent, so app-level.
+    pub check: crate::check::CheckConfig,
 }
 
 fn dirs() -> Option<directories::ProjectDirs> {

@@ -10,6 +10,8 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use crate::model::*;
 use crate::segment::{self, ParsedParagraph};
 
+mod takecheck;
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS project (
     id                     INTEGER PRIMARY KEY,
@@ -67,6 +69,15 @@ CREATE TABLE IF NOT EXISTS take (
     trim_start_ms INTEGER,
     trim_end_ms  INTEGER,
     created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+CREATE TABLE IF NOT EXISTS take_check (
+    take_id    INTEGER PRIMARY KEY REFERENCES take(id) ON DELETE CASCADE,
+    status     TEXT NOT NULL,
+    transcript TEXT,
+    wer        REAL,
+    issues     TEXT NOT NULL DEFAULT '[]',
+    model      TEXT NOT NULL DEFAULT '',
+    checked_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
 CREATE INDEX IF NOT EXISTS take_hash ON take(hash);
 CREATE INDEX IF NOT EXISTS take_segment ON take(segment_id);
