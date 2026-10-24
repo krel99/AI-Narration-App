@@ -231,15 +231,28 @@ fn tagged_job(
 }
 
 /// A small rounded label with a coloured outline.
+/// Height of a settings dialog's scrolling body: the window minus room for
+/// the title bar and the Save row, so Save is reachable at 900x560 too.
+fn dialog_body_height(ctx: &egui::Context) -> f32 {
+    (ctx.content_rect().height() - 250.0).clamp(200.0, 640.0)
+}
+
+/// A small outlined label. One widget that never wraps its text, so in a
+/// wrapping row (the Review toolbar) a chip that does not fit moves to the
+/// next line whole.
 fn chip(ui: &mut egui::Ui, text: impl Into<String>, color: Color32) -> egui::Response {
-    egui::Frame::new()
-        .stroke(Stroke::new(1.0, color.gamma_multiply(0.6)))
-        .corner_radius(10)
-        .inner_margin(egui::Margin::symmetric(8, 2))
-        .show(ui, |ui| {
-            ui.label(RichText::new(text.into()).color(color).small())
-        })
-        .response
+    let padding = ui.spacing().button_padding;
+    ui.spacing_mut().button_padding = Vec2::new(8.0, 2.0);
+    let r = ui.add(
+        egui::Button::new(RichText::new(text.into()).color(color).small())
+            .fill(Color32::TRANSPARENT)
+            .stroke(Stroke::new(1.0, color.gamma_multiply(0.6)))
+            .corner_radius(10)
+            .wrap_mode(egui::TextWrapMode::Extend)
+            .sense(Sense::hover()),
+    );
+    ui.spacing_mut().button_padding = padding;
+    r
 }
 
 impl App {
@@ -1002,14 +1015,22 @@ impl App {
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         let p = *theme::palette(ui);
         ui.add_space(6.0);
+        // Narrow windows (down to the 900 px minimum) get a shorter brand and
+        // narrower pickers, so the right-hand buttons never cover the tabs.
+        let compact = ui.available_width() < 1180.0;
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new("◖ Narration Studio")
-                    .strong()
-                    .size(16.0)
-                    .color(p.accent),
-            );
-            ui.add_space(14.0);
+                RichText::new(if compact {
+                    "◖"
+                } else {
+                    "◖ Narration Studio"
+                })
+                .strong()
+                .size(16.0)
+                .color(p.accent),
+            )
+            .on_hover_text("Narration Studio");
+            ui.add_space(if compact { 8.0 } else { 14.0 });
 
             let current = self
                 .project
@@ -1019,7 +1040,7 @@ impl App {
             let mut pick = None;
             egui::ComboBox::from_id_salt("project")
                 .selected_text(current)
-                .width(170.0)
+                .width(if compact { 120.0 } else { 170.0 })
                 .show_ui(ui, |ui| {
                     for p in &self.projects {
                         let sel = self.project.as_ref().is_some_and(|c| c.id == p.id);
@@ -1051,7 +1072,7 @@ impl App {
                 let mut new = false;
                 egui::ComboBox::from_id_salt("chapter")
                     .selected_text(chapter_label)
-                    .width(220.0)
+                    .width(if compact { 150.0 } else { 220.0 })
                     .show_ui(ui, |ui| {
                         for c in self.chapters.iter().rev() {
                             let st = self.stats.get(&c.id).cloned().unwrap_or_default();
@@ -1113,9 +1134,14 @@ impl App {
                     }
                 });
 
-                ui.add_space(18.0);
+                ui.add_space(if compact { 8.0 } else { 18.0 });
                 let has_segments = !self.view.segments.is_empty();
-                for (tab, label) in [(Tab::Text, "1  Text"), (Tab::Review, "2  Review")] {
+                let tabs = if compact {
+                    [(Tab::Text, "Text"), (Tab::Review, "Review")]
+                } else {
+                    [(Tab::Text, "1  Text"), (Tab::Review, "2  Review")]
+                };
+                for (tab, label) in tabs {
                     let enabled = tab == Tab::Text || has_segments || self.segmenting.is_some();
                     let selected = self.tab == tab;
                     let text = if selected {
@@ -1288,7 +1314,10 @@ impl App {
         let p = *theme::palette(ui);
         let st = self.stats.get(&cid).cloned().unwrap_or_default();
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
+        // Title and progress, then the chips: review state (flags,
+        // rejections, voices), costs (credits, drafts, Claude), delivery
+        // (ACX). They wrap onto a second line in narrow windows.
+        ui.horizontal_wrapped(|ui| {
             ui.heading(&self.draft.saved_title);
             ui.add_space(10.0);
             if st.segments > 0 {
@@ -1303,10 +1332,10 @@ impl App {
                 ui.label(
                     RichText::new(format!("{} / {} approved", st.approved, st.segments)).strong(),
                 );
+                self.check_chip(ui);
                 if st.rejected > 0 {
                     chip(ui, format!("{} rejected", st.rejected), p.rejected);
                 }
-                self.check_chip(ui);
                 if st.unassigned > 0 {
                     chip(
                         ui,
@@ -1330,13 +1359,13 @@ impl App {
                 } else {
                     "Credits as reported by ElevenLabs."
                 });
-                self.cost_chips(ui);
-                self.acx_chip(ui);
                 if !self.tags_active() {
                     chip(ui, "model ignores audio tags", p.muted).on_hover_text(
                         "Choose Eleven v4 or v3 in Project settings to perform [tags]",
                     );
                 }
+                self.cost_chips(ui);
+                self.acx_chip(ui);
             }
         });
         ui.add_space(4.0);
@@ -1963,8 +1992,19 @@ impl App {
         let mut cancel = false;
         let mut check = false;
         let mut check_cmd = None;
-        egui::Window::new("Settings").collapsible(false).default_width(560.0).show(ctx, |ui| {
+        let max_height = dialog_body_height(ctx);
+        egui::Window::new("Settings").collapsible(false).default_width(600.0).show(ctx, |ui| {
+            ui.set_max_width(640.0);
+            // A solid scrollbar shows that there is more below.
+            ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+            // Claude, then ElevenLabs and the app, then the take check;
+            // Save stays visible below the scroll area.
+            egui::ScrollArea::vertical()
+                .max_height(max_height)
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                .show(ui, |ui| {
             check = costs::claude_settings_section(ui, cfg, &self.costs);
+            ui.add_space(4.0);
             ui.separator();
             egui::Grid::new("settings").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
                 ui.label("ElevenLabs API key");
@@ -1984,7 +2024,8 @@ impl App {
                 });
                 ui.end_row();
                 ui.label("Library");
-                ui.label(cfg.library_dir().display().to_string());
+                let dir = cfg.library_dir().display().to_string();
+                ui.add(egui::Label::new(dir.clone()).truncate()).on_hover_text(dir);
                 ui.end_row();
             });
             if ui.button("Choose library folder…").clicked()
@@ -1997,8 +2038,11 @@ impl App {
                     .small()
                     .color(theme::palette(ui).muted),
             );
+            ui.add_space(4.0);
+            ui.separator();
             check_cmd = check::settings_section(ui, &mut cfg.check, &self.check, &self.lib);
-            ui.add_space(6.0);
+                });
+            ui.separator();
             ui.horizontal(|ui| {
                 save = ui.add(primary_button(ui, "Save")).clicked();
                 cancel = ui.button("Cancel").clicked();
@@ -2036,15 +2080,26 @@ impl App {
         let mut save = false;
         let mut cancel = false;
         let mut delete = false;
+        let max_height = dialog_body_height(ctx);
         egui::Window::new("Project settings")
-            .default_width(500.0)
+            .collapsible(false)
+            .default_width(560.0)
             .show(ctx, |ui| {
                 let muted = theme::palette(ui).muted;
                 let section = |ui: &mut egui::Ui, title: &str| {
-                    ui.add_space(8.0);
+                    ui.add_space(10.0);
+                    ui.separator();
                     ui.label(RichText::new(title).small().strong().color(muted));
                 };
-                egui::ScrollArea::vertical().max_height(600.0).show(ui, |ui| {
+                // Generation first (model, voices, tags, dialogue), then
+                // timing (silences, trimming), Claude, and the book's
+                // publication data. Save stays visible below the scroll area,
+                // and a solid scrollbar shows that there is more.
+                ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+                egui::ScrollArea::vertical()
+                    .max_height(max_height)
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                    .show(ui, |ui| {
                     egui::Grid::new("ps").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
                         ui.label("Name");
                         ui.text_edit_singleline(&mut p.name);
@@ -2082,6 +2137,9 @@ impl App {
                         ui.end_row();
                     });
 
+                    section(ui, "DEFAULT VOICE SETTINGS");
+                    ui.horizontal_wrapped(|ui| voice_settings_ui(ui, &mut p.default_voice_settings));
+
                     section(ui, "AUDIO TAGS");
                     let t = &mut p.settings.audio_tags;
                     ui.checkbox(&mut t.enabled, "Add tags automatically after segmentation (Eleven v3/v4 only)");
@@ -2101,9 +2159,6 @@ impl App {
 
                     section(ui, "MULTI-SPEAKER DIALOGUE");
                     dialogue::settings_ui(ui, &mut p.settings.dialogue, &p.tts_model, &p.default_voice_settings);
-
-                    section(ui, "DEFAULT VOICE SETTINGS");
-                    ui.horizontal_wrapped(|ui| voice_settings_ui(ui, &mut p.default_voice_settings));
 
                     section(ui, "SILENCE (MS)");
                     let s = &mut p.settings.silence;
@@ -2149,7 +2204,10 @@ impl App {
                         ui.add(egui::DragValue::new(&mut g.max_retries).range(0..=5));
                         ui.end_row();
                     });
+                    ui.add_space(2.0);
+                    ui.separator();
                     retail::publication_ui(ui, p, &self.lib.root, &mut self.retail);
+                    ui.add_space(4.0);
                 });
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -2393,10 +2451,11 @@ impl App {
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
+                ui.set_max_width(480.0);
                 ui.label(format!(
                     "{} segments, {} characters.",
                     plan.ids.len(),
-                    plan.chars
+                    crate::costs::fmt_int(plan.chars as i64)
                 ));
                 self.generate_estimate_ui(ui, plan.chars);
                 if plan.unassigned > 0 {
@@ -2628,9 +2687,18 @@ impl eframe::App for App {
                     )
                     .show(ui, |ui| self.review_toolbar(ui));
                 if !self.view.segments.is_empty() {
+                    // Tall enough for the text, actions, waveform and the take
+                    // check's summary at 1400x900; at most about half of a
+                    // small window, so the list keeps a few rows.
+                    let room = ui.available_height();
                     egui::Panel::bottom("detail")
                         .resizable(true)
-                        .default_size(270.0)
+                        .default_size(
+                            (room * 0.6)
+                                .clamp(180.0, 440.0)
+                                .min((room - 110.0).max(120.0)),
+                        )
+                        .max_size((room - 110.0).max(180.0))
                         .frame(
                             egui::Frame::new()
                                 .fill(p.card)

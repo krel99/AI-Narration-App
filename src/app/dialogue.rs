@@ -104,19 +104,42 @@ impl App {
         } else {
             format!("{} paragraphs ({segments} segments) go", plan.len())
         };
+        // What a fallback would bill again: the paragraph's characters
+        // (dialogue inputs are the segments' spoken text, as per segment).
+        let chars = |para: &Vec<Id>| -> usize {
+            para.iter()
+                .filter_map(|id| self.view.segments.iter().find(|s| s.id == *id))
+                .map(|s| s.spoken_text(&project.tts_model).chars().count())
+                .sum()
+        };
+        let largest = plan.iter().map(chars).max().unwrap_or(0);
+        let again = self.credits_text(self.credit_rate(&project.tts_model).credits(largest));
         let p = *theme::palette(ui);
-        ui.label(
-            RichText::new(format!(
-                "{what} through multi-speaker dialogue: one request per paragraph, cut back into one take per segment."
-            ))
-            .color(p.accent),
-        );
-        ui.label(
-            RichText::new(
-                "A paragraph whose dialogue cannot be cut cleanly is generated again per segment, which bills its characters a second time.",
+        ui.separator();
+        ui.add(
+            egui::Label::new(
+                RichText::new(format!(
+                    "{what} through multi-speaker dialogue: one request per paragraph, cut back into one take per segment. The estimate above includes them."
+                ))
+                .color(p.accent),
             )
-            .small()
-            .color(p.muted),
+            .wrap(),
+        );
+        let paragraph = if plan.len() == 1 {
+            "this paragraph"
+        } else {
+            "the largest of these paragraphs"
+        };
+        ui.add(
+            egui::Label::new(
+                RichText::new(format!(
+                    "If a dialogue cannot be cut cleanly, its paragraph is generated again per segment and billed a second time ({again} for {paragraph}). After {} such paragraphs, the rest of this generation goes per segment.",
+                    dialogue::MAX_DISCARDED_PER_RUN
+                ))
+                .small()
+                .color(p.muted),
+            )
+            .wrap(),
         );
     }
 }

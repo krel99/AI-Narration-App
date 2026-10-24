@@ -172,7 +172,8 @@ impl App {
         )
         .fill(Color32::TRANSPARENT)
         .stroke(Stroke::new(1.0, p.warning.gamma_multiply(0.6)))
-        .corner_radius(10);
+        .corner_radius(10)
+        .wrap_mode(egui::TextWrapMode::Extend);
         if ui
             .add(chip)
             .on_hover_text("The take check heard something unexpected. Click to select the next flagged segment.")
@@ -662,14 +663,16 @@ pub(super) fn settings_section(
         });
         ui.end_row();
     });
-    ui.label(
-        RichText::new(format!(
-            "Models are stored in {}.",
-            models::models_dir(lib).display()
-        ))
-        .small()
-        .color(p.muted),
-    );
+    let dir = models::models_dir(lib).display().to_string();
+    ui.add(
+        egui::Label::new(
+            RichText::new(format!("Models are stored in {dir}."))
+                .small()
+                .color(p.muted),
+        )
+        .truncate(),
+    )
+    .on_hover_text(dir);
     cmd
 }
 

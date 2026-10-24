@@ -155,7 +155,7 @@ impl App {
     }
 
     /// The cached rate, or a fresh read when the model changed since.
-    fn credit_rate(&self, model: &str) -> CreditRate {
+    pub(super) fn credit_rate(&self, model: &str) -> CreditRate {
         match &self.costs.rate {
             Some((m, r)) if m == model => *r,
             _ => self.db.credit_rate(model),
@@ -187,7 +187,7 @@ impl App {
     }
 
     /// "≈ 12,400 credits (≈ 2.98 USD)".
-    fn credits_text(&self, credits: i64) -> String {
+    pub(super) fn credits_text(&self, credits: i64) -> String {
         match self.money(credits) {
             Some(m) => format!("≈ {} credits (≈ {m})", fmt_int(credits)),
             None => format!("≈ {} credits", fmt_int(credits)),
@@ -230,13 +230,34 @@ impl App {
                 if let Some(reset) = sub.next_character_count_reset_unix {
                     text.push_str(&format!(" · resets {}", costs::fmt_day_month(reset)));
                 }
+                // The top bar's free room decides how much fits; the hover
+                // always has the details.
+                let room = ui.available_width();
+                let fits = |t: &str, style: egui::TextStyle| {
+                    let font = style.resolve(ui.style());
+                    let w = ui
+                        .fonts_mut(|f| f.layout_no_wrap(t.to_string(), font, egui::Color32::WHITE))
+                        .size()
+                        .x;
+                    w + 12.0 <= room
+                };
                 let color = if left == 0 {
                     p.warning
                 } else {
                     ui.visuals().text_color()
                 };
-                ui.label(RichText::new(text).color(color))
-                    .on_hover_text(subscription_details(sub));
+                let short = format!("{} credits", fmt_tokens(left.max(0) as u64));
+                let label = if fits(&text, egui::TextStyle::Body) {
+                    Some(RichText::new(text))
+                } else if fits(&short, egui::TextStyle::Small) {
+                    Some(RichText::new(short).small())
+                } else {
+                    None
+                };
+                if let Some(label) = label {
+                    ui.label(label.color(color))
+                        .on_hover_text(subscription_details(sub));
+                }
             }
             Some(Err(e)) => {
                 ui.label(RichText::new("balance unavailable").small().color(p.muted))

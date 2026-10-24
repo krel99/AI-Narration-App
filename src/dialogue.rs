@@ -24,6 +24,11 @@ use crate::lang;
 use crate::model::*;
 use crate::trim::{self, TrimSettings};
 
+/// After this many billed dialogues are discarded in one Generate run, its
+/// remaining paragraphs go per segment straight away: a systematic problem
+/// (say, a change in the API's answers) must not bill every paragraph twice.
+pub const MAX_DISCARDED_PER_RUN: usize = 2;
+
 /// ElevenLabs' hard limit on distinct voices in one dialogue request.
 pub const MAX_VOICES: usize = 10;
 /// The documented total across all inputs "for reliable generation".

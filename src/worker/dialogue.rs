@@ -18,7 +18,7 @@ use super::{Ctx, Event, FIRST_TAKE_SEED, Job, backoff, takecheck};
 use crate::audio::{self, Pcm};
 use crate::db::{Db, DialogueGroup, DialoguePart};
 use crate::dialogue::client::{self, CallError, Request};
-use crate::dialogue::{self, Input, MAX_PREVIOUS_REQUESTS, Skip, cut};
+use crate::dialogue::{self, Input, MAX_DISCARDED_PER_RUN, MAX_PREVIOUS_REQUESTS, Skip, cut};
 use crate::lang;
 use crate::model::*;
 use crate::trim;
@@ -26,11 +26,6 @@ use crate::tts::TtsError;
 
 /// `generate`'s counters: (generated, cached, failed, credits).
 pub(super) type Stats = Mutex<(usize, usize, usize, i64)>;
-
-/// After this many billed dialogues are discarded in one Generate run, its
-/// remaining paragraphs go per segment straight away: a systematic problem
-/// (say, a change in the API's answers) must not bill every paragraph twice.
-const MAX_DISCARDED_PER_RUN: usize = 2;
 
 /// The paragraphs of one Generate run that go through dialogue.
 #[derive(Default)]
