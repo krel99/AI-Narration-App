@@ -166,7 +166,7 @@ fn write_chapter(
             match seg.current_take_id.filter(|_| usable) {
                 Some(take_id) => {
                     let take = db.take(take_id)?;
-                    let pcm = audio::read_wav(&lib.audio_path(&take.audio_path))?;
+                    let pcm = crate::trim::load_take(lib, &take, &project.settings.trim)?;
                     w.append(&pcm)?;
                 }
                 None if draft => {
@@ -483,6 +483,15 @@ mod tests {
             + s.scene_break_ms
             + s.chapter_tail_ms;
         assert_eq!(report.duration_ms, expected as u64);
+
+        // A trimmed take is assembled at its trimmed length: keep 20..80 ms.
+        let segs = db.chapter_segments(cid).unwrap();
+        db.set_take_trim(segs[0].current_take_id.unwrap(), Some((20, 80)))
+            .unwrap();
+        let mut w = AssemblyWriter::create(&wav, 24000).unwrap();
+        let report = write_chapter(&mut w, &db, &lib, &project, cid, false).unwrap();
+        w.finish().unwrap();
+        assert_eq!(report.duration_ms, expected as u64 - 40);
 
         if !ffmpeg_available() {
             eprintln!("ffmpeg not found; skipping encode");

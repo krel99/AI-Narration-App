@@ -88,6 +88,28 @@ Claude and ElevenLabs servers, so they need no API keys.
 | ↑ / ↓ | Previous / next segment |
 | ← / → | Previous / next paragraph |
 
+### Silence trimming
+
+ElevenLabs takes start and end with uneven silence, so even "0 ms within a
+paragraph" leaves uneven gaps. A trim cuts a take's leading and trailing
+silence, never the middle, with a short fade at each cut
+([screenshot](docs/screenshots/trim-waveform.png)).
+
+- The Review detail panel shows the current take's waveform. The cut-off
+  parts are shaded. Drag the start or end handle to trim by hand.
+  **Auto-trim** detects the silence with the project's settings, and **Reset
+  trim** restores the whole take. Approved segments are locked: their
+  waveform is shown, but the trim can only change after unapproving.
+- Automatic trimming of new takes is **off by default**. Turn it on in
+  **Project → Silence trimming**, which also sets the threshold (-50 dBFS),
+  the silence kept before (40 ms) and after (80 ms) the speech, and the fade
+  (10 ms). While it is on, the Review toolbar has **✂ Auto-trim chapter**. It
+  re-detects the trim of every unapproved segment's current take and replaces
+  earlier trims.
+- Trimming is free and non-destructive. The trim is stored on the take in
+  the database. The WAV file and the take hash stay as they are. Playback,
+  paragraph playback and every export use the trimmed audio.
+
 ## Data
 
 All state lives in one library directory (default
@@ -110,10 +132,13 @@ Every pipeline stage resumes from this state after a restart.
 | `src/llm.rs` | Claude attribution and audio-tag direction requests (structured JSON output) |
 | `src/tts.rs` | ElevenLabs text-to-speech and voice list |
 | `src/worker.rs` | Command/event channels, segmentation pass, TTS worker pool, export jobs |
+| `src/worker/autotrim.rs` | Trim jobs: automatic trimming of new takes, Auto-trim chapter |
 | `src/db.rs` | SQLite schema and queries |
 | `src/audio.rs` | PCM/WAV handling, MP3-fallback decode |
 | `src/export.rs` | Streaming assembly with silences; ffmpeg loudnorm and encode |
+| `src/trim.rs` | Silence trimming: detection, cut and fade, waveform peaks, loading a take's audio with its trim |
 | `src/hash.rs` | Take hash |
 | `src/player.rs` | rodio playback queue |
 | `src/app.rs` | egui UI (Text and Review tabs, dialogs) |
+| `src/app/waveform.rs` | Take waveform with trim handles, Auto-trim buttons, trim settings |
 | `src/theme.rs` | Light (default) and dark themes, semantic colours |

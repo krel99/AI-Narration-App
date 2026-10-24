@@ -13,6 +13,7 @@ mod player;
 mod segment;
 mod tags;
 mod theme;
+mod trim;
 mod tts;
 mod worker;
 

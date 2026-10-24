@@ -24,6 +24,8 @@ use crate::segment::{self, DraftSegment, UNKNOWN_SPEAKER};
 use crate::tags;
 use crate::tts::{ElevenLabsClient, TtsError, TtsRequest, VoiceInfo};
 
+mod autotrim;
+
 /// Seed of a segment's first take. Fixed, so identical lines with the same
 /// voice and settings ("he said,") share one cached take.
 pub const FIRST_TAKE_SEED: u32 = 1;
@@ -59,6 +61,11 @@ pub enum Command {
         project_id: Id,
     },
     FetchVoices,
+    /// Detect and store the silence trim of the current take of every
+    /// unapproved segment (metadata only, no credits).
+    AutoTrimChapter {
+        chapter_id: Id,
+    },
     SetKeys(ApiKeys),
     /// Stop queued work (requests already in flight finish).
     Cancel,
@@ -306,6 +313,9 @@ async fn run(ctx: &Ctx, cmd: Command) -> Result<()> {
                 .await?;
             ctx.out.emit(Event::Voices(voices));
             Ok(())
+        }
+        Command::AutoTrimChapter { chapter_id } => {
+            autotrim::auto_trim_chapter(ctx, chapter_id).await
         }
         Command::Cancel | Command::SetKeys(_) => Ok(()),
     }
@@ -954,7 +964,7 @@ async fn generate_one(
     if let Some(existing) = ctx.db(|db| db.take_by_hash(&hash))?
         && ctx.lib.audio_path(&existing.audio_path).exists()
     {
-        ctx.db(|db| {
+        let take_id = ctx.db(|db| {
             let take_id = if existing.segment_id == seg.id {
                 existing.id
             } else {
@@ -968,8 +978,12 @@ async fn generate_one(
                     credits_exact: true,
                 })?
             };
-            db.set_current_take(seg.id, take_id)
+            db.set_current_take(seg.id, take_id)?;
+            Ok(take_id)
         })?;
+        if take_id != existing.id {
+            autotrim::trim_new_take(ctx, &project, take_id).await;
+        }
         return Ok((true, 0));
     }
 
@@ -1033,7 +1047,7 @@ async fn generate_one(
         Some(c) => (c, true),
         None => (spoken.chars().count() as i64, false),
     };
-    ctx.db(|db| {
+    let take_id = ctx.db(|db| {
         let take_id = db.insert_take(&NewTake {
             segment_id: seg.id,
             seed,
@@ -1043,8 +1057,10 @@ async fn generate_one(
             credits_used: credits,
             credits_exact,
         })?;
-        db.set_current_take(seg.id, take_id)
+        db.set_current_take(seg.id, take_id)?;
+        Ok(take_id)
     })?;
+    autotrim::trim_new_take(ctx, &project, take_id).await;
     Ok((false, credits))
 }
 
@@ -1074,7 +1090,7 @@ mod tests {
     type RequestLog = Arc<Mutex<Vec<(String, String)>>>;
 
     /// Minimal HTTP/1.1 server: records (path, body) and answers with `handler`.
-    fn serve(
+    pub(super) fn serve(
         handler: impl Fn(usize, &str, &str) -> Reply + Send + 'static,
     ) -> (String, RequestLog) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1125,7 +1141,11 @@ mod tests {
         (url, log)
     }
 
-    fn test_ctx(lib: &Library, anthropic: &str, elevenlabs: &str) -> (Ctx, Receiver<Event>) {
+    pub(super) fn test_ctx(
+        lib: &Library,
+        anthropic: &str,
+        elevenlabs: &str,
+    ) -> (Ctx, Receiver<Event>) {
         let (tx, rx) = channel();
         let ctx = Ctx {
             lib: lib.clone(),
@@ -1148,7 +1168,7 @@ mod tests {
         (ctx, rx)
     }
 
-    fn rt() -> tokio::runtime::Runtime {
+    pub(super) fn rt() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -1158,7 +1178,7 @@ mod tests {
     const TEXT: &str = "\"It is,\" started Vortram, \"truly magnificent!\"\n\nThe end.";
 
     /// Import TEXT, split it with the parser and give the quotes to Vortram.
-    fn import(db: &mut Db, project_id: Id) -> Id {
+    pub(super) fn import(db: &mut Db, project_id: Id) -> Id {
         let cid = db.import_chapter(project_id, "One", TEXT).unwrap();
         for p in db.paragraphs(cid).unwrap() {
             let segs = segment::parse_paragraph(&p.text, lang::by_code("en"));

@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use eframe::egui::{self, Color32, Key, RichText, Sense, Stroke, UiBuilder, Vec2};
 
-use crate::audio;
 use crate::config::AppConfig;
 use crate::db::{ChapterStats, Db, Library};
 use crate::export;
@@ -19,6 +18,8 @@ use crate::tags;
 use crate::theme::{self, Palette, primary_button, speaker_color};
 use crate::tts::VoiceInfo;
 use crate::worker::{self, Command, Event, WorkerHandle};
+
+mod waveform;
 
 const ROW_H: f32 = 46.0;
 
@@ -159,6 +160,7 @@ pub struct App {
     takes: Vec<Take>,
     takes_for: Option<Id>,
     tag_edit: Option<TagEdit>,
+    wave: waveform::WaveState,
 
     in_flight: HashSet<Id>,
     failures: HashMap<Id, String>,
@@ -260,6 +262,7 @@ impl App {
             takes: vec![],
             takes_for: None,
             tag_edit: None,
+            wave: Default::default(),
             in_flight: HashSet::new(),
             failures: HashMap::new(),
             segmenting: None,
@@ -618,12 +621,10 @@ impl App {
     }
 
     fn play_take(&mut self, segment_id: Id, take_id: Id) {
-        let pcm = self
-            .db
-            .take(take_id)
-            .and_then(|t| audio::read_wav(&self.lib.audio_path(&t.audio_path)));
+        let pcm = self.db.take(take_id).and_then(|t| self.take_audio(&t));
         if let Some(pcm) = self.try_db(pcm) {
             self.player.play(vec![(segment_id, pcm)], 0);
+            self.wave.playing_take = Some(take_id);
         }
     }
 
@@ -639,11 +640,7 @@ impl App {
         for j in self.view.paragraph_range(i) {
             let seg = &self.view.segments[j];
             if let Some(t) = seg.current_take_id {
-                match self
-                    .db
-                    .take(t)
-                    .and_then(|t| audio::read_wav(&self.lib.audio_path(&t.audio_path)))
-                {
+                match self.db.take(t).and_then(|t| self.take_audio(&t)) {
                     Ok(pcm) => items.push((seg.id, pcm)),
                     Err(e) => log::warn!("{e:#}"),
                 }
@@ -653,6 +650,7 @@ impl App {
             self.note(true, "No audio in this paragraph yet.".into());
         } else {
             self.player.play(items, gap);
+            self.wave.playing_take = None;
         }
     }
 
@@ -1351,6 +1349,7 @@ impl App {
                     self.worker.send(Command::Cancel);
                 }
             }
+            self.auto_trim_chapter_button(ui, cid);
             ui.separator();
             let complete = st.segments > 0 && st.approved == st.segments;
             if ui
@@ -1710,6 +1709,7 @@ impl App {
                         self.dialogs.split = Some((seg.id, seg.text.clone(), None));
                     }
                 });
+                self.waveform_section(ui, &seg, locked);
 
                 ui.add_space(6.0);
                 egui::CollapsingHeader::new(RichText::new("✦ Audio tags").strong())
@@ -2056,6 +2056,9 @@ impl App {
                             ui.end_row();
                         }
                     });
+
+                    section(ui, "SILENCE TRIMMING");
+                    waveform::trim_settings_ui(ui, &mut p.settings.trim);
 
                     section(ui, "CLAUDE");
                     let g = &mut p.settings.segmentation;

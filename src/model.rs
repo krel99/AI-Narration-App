@@ -206,6 +206,8 @@ pub struct ProjectSettings {
     pub silence: SilenceSettings,
     pub segmentation: SegmentationSettings,
     pub audio_tags: AudioTagSettings,
+    /// Silence trimming of takes (automatic trimming is off by default).
+    pub trim: crate::trim::TrimSettings,
 }
 
 impl Default for ProjectSettings {
@@ -218,6 +220,7 @@ impl Default for ProjectSettings {
             silence: SilenceSettings::default(),
             segmentation: SegmentationSettings::default(),
             audio_tags: AudioTagSettings::default(),
+            trim: crate::trim::TrimSettings::default(),
         }
     }
 }
@@ -318,4 +321,7 @@ pub struct Take {
     /// header is missing it is an estimate (billed rates differ per plan).
     pub credits_exact: bool,
     pub created_at: String,
+    /// Kept range `(start_ms, end_ms)` of the WAV; `None` = untrimmed. Metadata
+    /// only: the file is never modified and the take hash does not change.
+    pub trim_ms: Option<(u32, u32)>,
 }

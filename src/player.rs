@@ -74,6 +74,13 @@ impl Player {
         self.output.as_ref().is_some_and(|(_, p)| !p.empty())
     }
 
+    /// Playback position inside the item that is currently audible.
+    pub fn position(&self) -> std::time::Duration {
+        self.output
+            .as_ref()
+            .map_or(std::time::Duration::ZERO, |(_, p)| p.get_pos())
+    }
+
     /// The segment currently audible, if any.
     pub fn current(&self) -> Option<Id> {
         let (_, player) = self.output.as_ref()?;

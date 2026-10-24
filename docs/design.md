@@ -252,6 +252,47 @@ said Lieutenant Vale. [thoughtful] Commander Voss looked at the countdown above 
 - A light "paper" theme is the default (`src/theme.rs`); a dark theme is
   available in Settings.
 
+### Silence trimming (added after the first build)
+
+Requested on top of the plan: trim the silence (and breaths) off every take,
+but disabled by default. ElevenLabs takes start and end with uneven silence,
+so "0 ms within a paragraph" did not give even gaps.
+
+- **Non-destructive.** The take row stores the kept range as `trim_start_ms`
+  and `trim_end_ms` (NULL means untrimmed). An idempotent migration adds the
+  columns to older libraries. The WAV is never rewritten and the take hash
+  does not change, so the cache still reuses the file. The trim belongs to the
+  take row, so a cache hit for another segment has its own trim.
+- **Detection** (`trim::detect`): the RMS of 10 ms frames is compared with a
+  threshold (default -50 dBFS). The kept range runs from the first to the last
+  frame above it, widened by 40 ms before and 80 ms after, because decays fade
+  slowly. It is clamped to the take. An all-silent take is left untrimmed, and
+  the range is never empty or inverted.
+- **Applying** is a cut plus a linear fade-in and fade-out (10 ms, at most half
+  the kept length), done when the audio is loaded. `trim::load_take` is the
+  only loader of a take's audio: single-take playback, paragraph playback and
+  every export go through it. A stale or invalid trim plays the whole take.
+- **Automatic trimming** of new takes is off by default
+  (`ProjectSettings.trim.enabled`). When it is on, the worker trims each newly
+  stored take on the blocking pool. This includes cache-hit takes created for
+  another segment. A take that its own segment reuses keeps its trim. A
+  failure is only logged and the paid take stays untrimmed.
+- **Auto-trim chapter** is a toolbar button shown only while automatic
+  trimming is on. It re-detects the current take of every unapproved segment
+  and replaces earlier trims, manual ones included. Approved segments are
+  skipped, including ones approved while it runs. The detail panel's
+  **Auto-trim** works on one take even when automatic trimming is off. Neither
+  spends credits.
+- **Waveform**: min/max peaks (2048 buckets) are computed once per audio file
+  and cached, then drawn one column per pixel. The cut-off parts are shaded.
+  Dragging moves the nearest handle and saves on release. At least 20 ms is
+  kept, and dragging back to the full range stores "untrimmed". While the take
+  plays, a playhead follows rodio's per-source position. Approved segments
+  show the waveform read-only.
+- **Breaths** inside a take are never touched. At either end they are cut only
+  when they are quieter than the threshold. Raising it (e.g. to -40 dBFS) cuts
+  more, at the risk of clipping soft word onsets.
+
 ### To verify against a real account
 
 - ElevenLabs response header names for the request id and the character cost.
