@@ -965,6 +965,7 @@ async fn generate_one(
                     audio_path: &existing.audio_path,
                     hash: &hash,
                     credits_used: 0,
+                    credits_exact: true,
                 })?
             };
             db.set_current_take(seg.id, take_id)
@@ -1026,7 +1027,12 @@ async fn generate_one(
     };
     let path = abs_path.clone();
     tokio::task::spawn_blocking(move || audio::write_wav(&path, &pcm)).await??;
-    let credits = resp.character_cost.unwrap_or(spoken.chars().count() as i64);
+    // Billed rates differ per plan, so a missing header means "estimated", not
+    // "text length": estimate from the characters and flag it as inexact.
+    let (credits, credits_exact) = match resp.character_cost {
+        Some(c) => (c, true),
+        None => (spoken.chars().count() as i64, false),
+    };
     ctx.db(|db| {
         let take_id = db.insert_take(&NewTake {
             segment_id: seg.id,
@@ -1035,6 +1041,7 @@ async fn generate_one(
             audio_path: &rel_path,
             hash: &hash,
             credits_used: credits,
+            credits_exact,
         })?;
         db.set_current_take(seg.id, take_id)
     })?;
@@ -1220,6 +1227,7 @@ mod tests {
             .unwrap();
         assert_eq!(take0.seed, FIRST_TAKE_SEED);
         assert_eq!(take0.credits_used, "\"It is,\"".chars().count() as i64);
+        assert!(take0.credits_exact, "character-cost header was present");
         assert!(lib.audio_path(&take0.audio_path).exists());
 
         // The second quote stitches onto the first (same voice) and gets its neighbours' text.
@@ -1484,6 +1492,13 @@ mod tests {
             .collect();
         assert!(sent.contains(&"\"[tense] Hold position,\"".to_string()));
         assert!(sent.contains(&"It would not.".to_string()));
+        // That fake server sends no character-cost header: credits are estimates.
+        let takes = ctx.db(|db| db.takes(segs[0].id)).unwrap();
+        assert!(!takes[0].credits_exact);
+        let stats = ctx
+            .db(|db| db.chapter_stats(cid, &db.project(db.chapter(cid)?.project_id)?))
+            .unwrap();
+        assert!(stats.credits_estimated);
         let narr: serde_json::Value = eleven_reqs
             .lock()
             .unwrap()

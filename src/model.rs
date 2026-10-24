@@ -312,7 +312,10 @@ pub struct Take {
     /// Path relative to the library's audio directory.
     pub audio_path: String,
     pub hash: String,
-    /// Characters billed for this take; 0 when it reused a cached take.
+    /// Credits charged for this take; 0 when it reused a cached take.
     pub credits_used: i64,
+    /// `credits_used` came from ElevenLabs' `character-cost` header. When the
+    /// header is missing it is an estimate (billed rates differ per plan).
+    pub credits_exact: bool,
     pub created_at: String,
 }

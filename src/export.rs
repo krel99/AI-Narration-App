@@ -461,6 +461,7 @@ mod tests {
                     audio_path: &rel,
                     hash: &rel,
                     credits_used: 1,
+                    credits_exact: true,
                 })
                 .unwrap();
             db.set_current_take(s.id, t).unwrap();

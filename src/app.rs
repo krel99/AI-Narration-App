@@ -1280,12 +1280,18 @@ impl App {
                 chip(
                     ui,
                     format!(
-                        "{} credits · re-roll {:.0}%",
+                        "{}{} credits · re-roll {:.0}%",
+                        if st.credits_estimated { "≈" } else { "" },
                         st.credits_used,
                         st.reroll_rate() * 100.0
                     ),
                     p.muted,
-                );
+                )
+                .on_hover_text(if st.credits_estimated {
+                    "Some takes came back without a credit count; their cost is estimated."
+                } else {
+                    "Credits as reported by ElevenLabs."
+                });
                 if !self.tags_active() {
                     chip(ui, "model ignores audio tags", p.muted).on_hover_text(
                         "Choose Eleven v4 or v3 in Project settings to perform [tags]",
@@ -1799,8 +1805,10 @@ impl App {
                         }
                         let cost = if t.credits_used == 0 {
                             "cached".to_string()
-                        } else {
+                        } else if t.credits_exact {
                             format!("{} credits", t.credits_used)
+                        } else {
+                            format!("≈{} credits (estimated)", t.credits_used)
                         };
                         let text = format!("#{} · seed {} · {cost} · {}", n + 1, t.seed, t.created_at);
                         ui.label(if current { RichText::new(text).strong() } else { RichText::new(text) });

@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS take (
     audio_path   TEXT NOT NULL,
     hash         TEXT NOT NULL,
     credits_used INTEGER NOT NULL DEFAULT 0,
+    credits_exact INTEGER NOT NULL DEFAULT 1,
     created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
 CREATE INDEX IF NOT EXISTS take_hash ON take(hash);
@@ -114,8 +115,10 @@ pub struct ChapterStats {
     pub rejected: usize,
     /// Segments whose speaker has no voice mapped.
     pub unassigned: usize,
-    /// Characters billed across all takes of this chapter.
+    /// Credits charged across all takes of this chapter.
     pub credits_used: i64,
+    /// Some of `credits_used` is estimated (takes without a `character-cost` header).
+    pub credits_estimated: bool,
     /// Takes that cost credits (not cache hits).
     pub paid_takes: usize,
     /// Segments with at least one paid take.
@@ -215,7 +218,7 @@ fn row_segment(r: &Row) -> rusqlite::Result<Segment> {
 }
 
 const TAKE_COLS: &str =
-    "id, segment_id, seed, request_id, audio_path, hash, credits_used, created_at";
+    "id, segment_id, seed, request_id, audio_path, hash, credits_used, created_at, credits_exact";
 
 fn row_take(r: &Row) -> rusqlite::Result<Take> {
     Ok(Take {
@@ -227,6 +230,7 @@ fn row_take(r: &Row) -> rusqlite::Result<Take> {
         hash: r.get(5)?,
         credits_used: r.get(6)?,
         created_at: r.get(7)?,
+        credits_exact: r.get::<_, i64>(8)? != 0,
     })
 }
 
@@ -238,6 +242,8 @@ pub struct NewTake<'a> {
     pub audio_path: &'a str,
     pub hash: &'a str,
     pub credits_used: i64,
+    /// False when `credits_used` is an estimate (no `character-cost` header).
+    pub credits_exact: bool,
 }
 
 impl Db {
@@ -262,6 +268,14 @@ impl Db {
             .exists([])?;
         if !has_performance {
             conn.execute_batch("ALTER TABLE segment ADD COLUMN performance TEXT")?;
+        }
+        let has_credits_exact: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('take') WHERE name = 'credits_exact'")?
+            .exists([])?;
+        if !has_credits_exact {
+            conn.execute_batch(
+                "ALTER TABLE take ADD COLUMN credits_exact INTEGER NOT NULL DEFAULT 1",
+            )?;
         }
         Ok(Self { conn })
     }
@@ -744,15 +758,16 @@ impl Db {
 
     pub fn insert_take(&self, t: &NewTake) -> Result<Id> {
         self.conn.execute(
-            "INSERT INTO take (segment_id, seed, request_id, audio_path, hash, credits_used)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO take (segment_id, seed, request_id, audio_path, hash, credits_used, credits_exact)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 t.segment_id,
                 t.seed as i64,
                 t.request_id,
                 t.audio_path,
                 t.hash,
-                t.credits_used
+                t.credits_used,
+                t.credits_exact as i64
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -808,16 +823,18 @@ impl Db {
                 s.unassigned += 1;
             }
         }
-        let (credits, paid, segs_paid): (i64, i64, i64) = self.conn.query_row(
+        let (credits, paid, segs_paid, estimated): (i64, i64, i64, i64) = self.conn.query_row(
             "SELECT COALESCE(SUM(t.credits_used), 0),
                     COALESCE(SUM(t.credits_used > 0), 0),
-                    COUNT(DISTINCT CASE WHEN t.credits_used > 0 THEN t.segment_id END)
+                    COUNT(DISTINCT CASE WHEN t.credits_used > 0 THEN t.segment_id END),
+                    COALESCE(SUM(t.credits_used > 0 AND t.credits_exact = 0), 0)
              FROM take t JOIN segment s ON s.id = t.segment_id
              JOIN paragraph p ON p.id = s.paragraph_id WHERE p.chapter_id = ?1",
             [chapter_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
         s.credits_used = credits;
+        s.credits_estimated = estimated > 0;
         s.paid_takes = paid as usize;
         s.segments_with_paid_takes = segs_paid as usize;
         Ok(s)
@@ -931,6 +948,7 @@ mod tests {
                 audio_path: "a.wav",
                 hash: "h1",
                 credits_used: 8,
+                credits_exact: true,
             })
             .unwrap();
         db.set_current_take(s0, t1).unwrap();
@@ -942,6 +960,7 @@ mod tests {
                 audio_path: "b.wav",
                 hash: "h2",
                 credits_used: 8,
+                credits_exact: true,
             })
             .unwrap();
         db.set_current_take(s0, t2).unwrap();
@@ -954,6 +973,7 @@ mod tests {
                 audio_path: "a.wav",
                 hash: "h1",
                 credits_used: 0,
+                credits_exact: true,
             })
             .unwrap();
         db.set_current_take(segs[1].id, t3).unwrap();
@@ -1005,6 +1025,7 @@ mod tests {
                 audio_path: "a.wav",
                 hash: "h",
                 credits_used: 1,
+                credits_exact: true,
             })
             .unwrap();
         db.set_current_take(tag, t).unwrap();
@@ -1060,6 +1081,7 @@ mod tests {
             audio_path: "a.wav",
             hash: "h",
             credits_used: 1,
+            credits_exact: true,
         })
         .unwrap();
         assert!(db.replace_chapter_text(cid, "x", "y").is_err());
@@ -1071,8 +1093,12 @@ mod tests {
         let path = dir.path().join("old.sqlite");
         {
             let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(&SCHEMA.replace("    performance       TEXT,\n", ""))
-                .unwrap();
+            conn.execute_batch(
+                &SCHEMA
+                    .replace("    performance       TEXT,\n", "")
+                    .replace("    credits_exact INTEGER NOT NULL DEFAULT 1,\n", ""),
+            )
+            .unwrap();
             let cols: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM pragma_table_info('segment') WHERE name = 'performance'",
@@ -1083,6 +1109,16 @@ mod tests {
             assert_eq!(cols, 0);
         }
         let mut db = Db::open(&path).unwrap();
+        let has = |table: &str, col: &str| -> bool {
+            db.conn
+                .prepare(&format!(
+                    "SELECT 1 FROM pragma_table_info('{table}') WHERE name = '{col}'"
+                ))
+                .unwrap()
+                .exists([])
+                .unwrap()
+        };
+        assert!(has("segment", "performance") && has("take", "credits_exact"));
         let pid = db.create_project("Old", "en").unwrap();
         let cid = db.import_chapter(pid, "One", "Text.").unwrap();
         let project = db.project(pid).unwrap();
