@@ -25,12 +25,21 @@ Requirements:
 - Build dependencies: `pkg-config`, `libasound2-dev` (ALSA headers for audio playback)
 - Runtime: `ffmpeg` 4.4 or newer with `libmp3lame`, and `ffprobe`, on `PATH`
   (export and its ACX checks only), and a desktop session (X11 or Wayland)
+- For the local take check (the default `whisper` feature, which compiles
+  whisper.cpp): `cmake`, a C and C++ compiler, and libclang (any
+  `libclang1-NN`, which `clang` pulls in, or `libclang-dev`). The first build
+  takes about a minute longer. `cargo build --no-default-features` builds
+  without Whisper; the take check then only checks lengths.
 
 ```sh
-sudo apt install pkg-config libasound2-dev ffmpeg   # Debian/Ubuntu
+sudo apt install pkg-config libasound2-dev ffmpeg build-essential cmake clang   # Debian/Ubuntu
 cargo build --release
 ./target/release/narration-studio
 ```
+
+whisper.cpp is compiled for the building machine's CPU (`-march=native`). To
+build a binary for other machines, set `GGML_NATIVE=OFF` and run
+`cargo clean -p whisper-rs-sys` first (cargo does not notice the variable).
 
 Run the tests with `cargo test`. The export tests also encode with ffmpeg and
 inspect the files with ffprobe when they are installed. The pipeline tests drive the workers against local fake
@@ -162,8 +171,9 @@ ways to run it:
    tags in the detail panel. **✦ Audio tags** re-runs the tagging for all
    draft segments. Segments whose speaker has no voice show ⚠ and are
    skipped.
-4. **Generate N drafts**. A confirmation shows the character count and the
-   estimated credits first. Identical inputs reuse cached takes at no cost.
+4. **Generate N drafts**. A confirmation shows the character count, the
+   estimated credits and how many paragraphs go through multi-speaker
+   dialogue first. Identical inputs reuse cached takes at no cost.
 5. Review with the keyboard and approve or re-roll. Earlier takes stay
    available in the take picker.
 6. **Export chapter** once every segment is approved, or use **Draft export**
@@ -241,6 +251,106 @@ and cover art in every file, an ACX report and a retail sample
 | ↑ / ↓ | Previous / next segment |
 | ← / → | Previous / next paragraph |
 
+### Silence trimming
+
+ElevenLabs takes start and end with uneven silence, so even "0 ms within a
+paragraph" leaves uneven gaps. A trim cuts a take's leading and trailing
+silence, never the middle, with a short fade at each cut
+([screenshot](docs/screenshots/trim-waveform.png)).
+
+- The Review detail panel shows the current take's waveform. The cut-off
+  parts are shaded. Drag the start or end handle to trim by hand.
+  **Auto-trim** detects the silence with the project's settings, and **Reset
+  trim** restores the whole take. Approved segments are locked: their
+  waveform is shown, but the trim can only change after unapproving.
+- Automatic trimming of new takes is **off by default**. Turn it on in
+  **Project → Silence trimming**, which also sets the threshold (-50 dBFS),
+  the silence kept before (40 ms) and after (80 ms) the speech, and the fade
+  (10 ms). While it is on, the Review toolbar has **✂ Auto-trim chapter**. It
+  re-detects the trim of every unapproved segment's current take and replaces
+  earlier trims. The fade applies whenever a trimmed take is played or
+  exported, so changing it also affects approved trimmed takes.
+- Trimming is free and non-destructive. The trim is stored on the take in
+  the database. The WAV file and the take hash stay as they are. Playback,
+  paragraph playback and every export use the trimmed audio.
+
+### Take checking
+
+Every new take is transcribed on this computer with Whisper and compared
+with the segment's text. A take whose words differ, or whose length is
+unusual for its text, is **flagged** for a listen. A flag never rejects a
+take, never blocks approving it and never costs credits
+([screenshot](docs/screenshots/take-check.png)).
+
+- **Settings → Take checking**: pick a model and **Download** it (from
+  Hugging Face, into the library's `models/` folder; the checksum is verified
+  before the file is kept; a download that receives nothing for a minute
+  gives up). *small* (466 MiB, about 780 MB of memory, about
+  5 s per take with 4 threads) is the default. *base* is faster and less
+  accurate. *Large v3 Turbo, 5-bit* is the better choice for Czech and other
+  non-English projects, at about five times the cost of *small*. The check
+  uses half the CPU cores by default and runs one take at a time at the
+  lowest priority. Set `HF_TOKEN` to send a Hugging Face token.
+- Without a model (or in a build without Whisper) only the free **length
+  check** runs: a take much shorter or longer than its text needs at the
+  voice's speed is flagged.
+- **Review**: a flagged segment shows an amber ⚠ next to its status; hover it
+  for the reason. The toolbar's **⚠ N flagged** chip selects the next flagged
+  segment. **Check chapter** queues the current takes that have no result yet
+  (for example after installing a model) and shows the progress; **Stop**
+  empties the queue.
+- The detail panel's **Take check** shows the text with the differences
+  marked: words that were not heard are struck through in red, words that
+  were heard but are not in the text are highlighted. Below it are what
+  Whisper heard, the reason for a flag and the length. **Re-check** runs the
+  check again, **Dismiss flag** marks the take as fine, and **↻ Re-roll**
+  generates a new take (costs credits, like R).
+- Differences in punctuation, case, quotes, dashes, British/American
+  spelling, numbers written as digits or words, contractions and fillers
+  ("um", laughter) are ignored. An audio tag that was read aloud
+  (`[whispers]` heard as "whispers") is flagged. Short dialogue tags are
+  judged leniently, and non-English text more leniently than English.
+- Checking new takes automatically can be turned off in Settings; **Check
+  chapter** and **Re-check** work either way.
+
+### Multi-speaker dialogue
+
+A paragraph that goes back and forth between speakers is generated as one
+ElevenLabs Text-to-Dialogue request instead of one request per segment,
+which gives more natural turn-taking. The result is cut back into one take
+per segment in the pauses between the speakers, so every segment is still
+reviewed, approved and re-rolled on its own
+([screenshot](docs/screenshots/dialogue.png)).
+
+- On by default, for Eleven v4 and v3 (**Project → Multi-speaker
+  dialogue**). Eleven v4 Turbo and the older models generate per segment.
+- A paragraph qualifies on its **first generation** when the request
+  covers all of its segments, all are drafts without audio, they use 2 to
+  10 different voices and their spoken text (tags included) is at most
+  1,800 characters (adjustable up to ElevenLabs' advised 2,000). Re-rolls,
+  single segments, a segment with its own voice settings, a project speed
+  or style other than the default (dialogue takes only stability and
+  similarity) and an `[interrupting]` tag (it is known to break the
+  dialogue's timings) keep per-segment requests.
+- The **Generate** confirmation says how many paragraphs go through
+  dialogue. The neighbouring paragraphs' text is sent as context, audio tags
+  are performed, and identical paragraphs reuse their takes for free.
+- Before cutting, the response is checked: every line has its own stretch of
+  audio, in order, long enough for its text and with sound in it, and the
+  character ranges match the lines exactly. Each cut goes in the middle of
+  the pause between two lines, never inside speech; played back to back,
+  the takes are the dialogue exactly. If any check fails, the dialogue audio
+  is discarded and the paragraph is generated per segment instead, which
+  bills its characters a second time; the status bar says so, and the
+  discarded dialogue counts in the credits used. After two such paragraphs
+  in one generation, the rest of it goes per segment straight away.
+- Takes cut from a dialogue are marked **dialogue** in the take list. Each
+  carries the request id and its share of the request's credits, by
+  characters. Re-rolling a segment later generates it on its own.
+- With automatic silence trimming on, and with **Auto-trim chapter**, only
+  the paragraph's outer edges are trimmed: the pauses between speakers are
+  the dialogue's own timing.
+
 ## Data
 
 All state lives in one library directory (default
@@ -254,6 +364,7 @@ exports/<project>/          chapter MP3 + FLAC, book M4B, retail sample, ACX rep
 covers/                     cover art copied in from Project settings
 claude-cwd/                 empty working directory for Claude Code runs
 voice-previews/             downloaded voice previews (<voice_id>-<url hash>.mp3)
+models/ggml-<model>.bin     Whisper models for the take check
 ```
 
 Every pipeline stage resumes from this state after a restart.
@@ -267,15 +378,44 @@ Every pipeline stage resumes from this state after a restart.
 | `src/llm.rs` | Claude attribution and audio-tag direction requests (structured JSON output), API or Claude Code transport |
 | `src/claude_code.rs` | Claude Code CLI: lookup, version and sign-in check, isolated `claude -p` runs, result and error parsing |
 | `src/costs.rs` | Claude prices, credit-rate learning, token and credit estimates, number formats |
-| `src/tts.rs` | ElevenLabs text-to-speech (`tts/account.rs`: balance and model rates; `tts/voices.rs`: your voices, lookups by id, preview downloads) |
+| `src/tts.rs` | ElevenLabs text-to-speech |
+| `src/tts/account.rs` | ElevenLabs balance and model rates |
+| `src/tts/voices.rs` | Your ElevenLabs voices, lookups by id, preview downloads |
 | `src/voices.rs` | Voice picker search and filters, "used by", preview sources and the preview cache |
-| `src/worker.rs` | Command/event channels, segmentation pass, TTS worker pool, export jobs (`worker/retail.rs`: exports with their ACX checks) |
-| `src/db.rs` | SQLite schema and queries (`db/costs.rs`: usage and rate tables; `db/retail.rs`: export reports) |
+| `src/dialogue.rs` | Multi-speaker dialogue: which paragraphs qualify, inputs and settings, hashes, credit split, context text |
+| `src/dialogue/cut.rs` | Validating a dialogue response and finding the cut points in the pauses |
+| `src/dialogue/client.rs` | ElevenLabs Text-to-Dialogue request and response |
+| `src/worker.rs` | Command/event channels, segmentation pass, TTS worker pool |
+| `src/worker/account.rs` | Fetching the ElevenLabs balance and model rates |
+| `src/worker/claude.rs` | Claude backend selection, usage recording, stopping a pass on usage limits |
+| `src/worker/voices.rs` | Voice list, lookups and cached previews |
+| `src/worker/retail.rs` | Chapter, book and retail-sample exports with their ACX checks |
+| `src/worker/autotrim.rs` | Trim jobs: automatic trimming of new takes, Auto-trim chapter |
+| `src/worker/dialogue.rs` | Generating a paragraph as one dialogue, cutting it into takes, falling back per segment |
+| `src/worker/takecheck.rs` | The low-priority checker thread, take-check commands, model downloads |
+| `src/db.rs` | SQLite schema and queries |
+| `src/db/costs.rs` | Claude usage, take costs and model rates |
+| `src/db/retail.rs` | Export reports and the retail sample |
+| `src/db/takecheck.rs` | `take_check` table queries |
+| `src/db/dialogue.rs` | Storing a dialogue paragraph's takes together |
 | `src/audio.rs` | PCM/WAV handling, MP3-fallback decode |
-| `src/export.rs` | Streaming assembly with silences (`export/mastering.rs`: loudness, tags, cover art, retail sample) |
+| `src/trim.rs` | Silence trimming: detection, cut and fade, waveform peaks, loading a take's audio with its trim |
+| `src/export.rs` | Streaming assembly with silences |
+| `src/export/mastering.rs` | Loudness, tags, cover art, retail sample |
 | `src/acx.rs` | ACX meter (RMS, peak, noise floor, room tone), ffprobe and CBR checks, pass/warning/fail bands, `ACX report.md` |
 | `src/retail.rs` | Publication metadata and tag mapping, cover checks, retail-sample planning, book-level checks |
+| `src/check.rs` | Take check: settings, results, length check, hallucination filter, combining the findings |
+| `src/check/text.rs` | Text normalisation, word alignment and the flag thresholds |
+| `src/check/resample.rs` | Anti-aliased resampling to Whisper's 16 kHz input |
+| `src/check/models.rs` | Whisper model catalog, checksum verification, download |
+| `src/check/whisper.rs` | whisper-rs backend (feature `whisper`) |
 | `src/hash.rs` | Take hash |
 | `src/player.rs` | rodio playback queue |
-| `src/app.rs` | egui UI (Text and Review tabs, dialogs; `app/costs.rs`: balance, estimates, Claude settings; `app/voice_picker.rs`: voice picker and previews; `app/retail.rs`: Publication settings, ACX chip, Retail & ACX window, retail sample) |
+| `src/app.rs` | egui UI (Text and Review tabs, dialogs) |
+| `src/app/costs.rs` | Balance, estimates, Claude settings |
+| `src/app/voice_picker.rs` | Voice picker and previews |
+| `src/app/retail.rs` | Publication settings, ACX chip, Retail & ACX window, retail sample |
+| `src/app/waveform.rs` | Take waveform with trim handles, Auto-trim buttons, trim settings |
+| `src/app/check.rs` | Take-check marker, toolbar chip, detail section with the highlighted differences, settings |
+| `src/app/dialogue.rs` | Dialogue setting, the Generate confirmation's note, the take list's marker |
 | `src/theme.rs` | Light (default) and dark themes, semantic colours |

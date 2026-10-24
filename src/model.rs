@@ -208,6 +208,10 @@ pub struct ProjectSettings {
     pub audio_tags: AudioTagSettings,
     /// Book metadata, cover and delivery options for the retail export.
     pub publication: crate::retail::Publication,
+    /// Silence trimming of takes (automatic trimming is off by default).
+    pub trim: crate::trim::TrimSettings,
+    /// Multi-speaker paragraphs as one Text-to-Dialogue request (on by default).
+    pub dialogue: crate::dialogue::DialogueSettings,
 }
 
 impl Default for ProjectSettings {
@@ -221,6 +225,8 @@ impl Default for ProjectSettings {
             segmentation: SegmentationSettings::default(),
             audio_tags: AudioTagSettings::default(),
             publication: Default::default(),
+            trim: crate::trim::TrimSettings::default(),
+            dialogue: crate::dialogue::DialogueSettings::default(),
         }
     }
 }
@@ -321,4 +327,10 @@ pub struct Take {
     /// header is missing it is an estimate (billed rates differ per plan).
     pub credits_exact: bool,
     pub created_at: String,
+    /// Kept range `(start_ms, end_ms)` of the WAV; `None` = untrimmed. Metadata
+    /// only: the file is never modified and the take hash does not change.
+    pub trim_ms: Option<(u32, u32)>,
+    /// Set when the take was cut from a multi-speaker dialogue request: the
+    /// group hash shared by that paragraph's takes. `None` for single-voice TTS.
+    pub dialogue_group: Option<String>,
 }

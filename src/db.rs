@@ -15,6 +15,9 @@ mod retail;
 pub use costs::PassUsage;
 #[cfg(test)]
 pub use costs::UsageRow;
+mod dialogue;
+pub use dialogue::{DialogueGroup, DialoguePart};
+mod takecheck;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS project (
@@ -70,7 +73,19 @@ CREATE TABLE IF NOT EXISTS take (
     hash         TEXT NOT NULL,
     credits_used INTEGER NOT NULL DEFAULT 0,
     credits_exact INTEGER NOT NULL DEFAULT 1,
+    trim_start_ms INTEGER,
+    trim_end_ms  INTEGER,
+    dialogue_group TEXT,
     created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+);
+CREATE TABLE IF NOT EXISTS take_check (
+    take_id    INTEGER PRIMARY KEY REFERENCES take(id) ON DELETE CASCADE,
+    status     TEXT NOT NULL,
+    transcript TEXT,
+    wer        REAL,
+    issues     TEXT NOT NULL DEFAULT '[]',
+    model      TEXT NOT NULL DEFAULT '',
+    checked_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
 CREATE INDEX IF NOT EXISTS take_hash ON take(hash);
 CREATE INDEX IF NOT EXISTS take_segment ON take(segment_id);
@@ -249,8 +264,7 @@ fn row_segment(r: &Row) -> rusqlite::Result<Segment> {
     })
 }
 
-const TAKE_COLS: &str =
-    "id, segment_id, seed, request_id, audio_path, hash, credits_used, created_at, credits_exact";
+const TAKE_COLS: &str = "id, segment_id, seed, request_id, audio_path, hash, credits_used, created_at, credits_exact, trim_start_ms, trim_end_ms, dialogue_group";
 
 fn row_take(r: &Row) -> rusqlite::Result<Take> {
     Ok(Take {
@@ -263,6 +277,11 @@ fn row_take(r: &Row) -> rusqlite::Result<Take> {
         credits_used: r.get(6)?,
         created_at: r.get(7)?,
         credits_exact: r.get::<_, i64>(8)? != 0,
+        trim_ms: match (r.get::<_, Option<i64>>(9)?, r.get::<_, Option<i64>>(10)?) {
+            (Some(a), Some(b)) => Some((a.max(0) as u32, b.max(0) as u32)),
+            _ => None,
+        },
+        dialogue_group: r.get(11)?,
     })
 }
 
@@ -309,6 +328,23 @@ impl Db {
             conn.execute_batch(
                 "ALTER TABLE take ADD COLUMN credits_exact INTEGER NOT NULL DEFAULT 1",
             )?;
+        }
+        // Libraries created before silence trimming lack the trim columns.
+        // Checked one by one, so an interrupted migration still completes.
+        for col in ["trim_start_ms", "trim_end_ms"] {
+            let has: bool = conn
+                .prepare("SELECT 1 FROM pragma_table_info('take') WHERE name = ?1")?
+                .exists([col])?;
+            if !has {
+                conn.execute_batch(&format!("ALTER TABLE take ADD COLUMN {col} INTEGER"))?;
+            }
+        }
+        // Libraries created before multi-speaker dialogue lack the group column.
+        let has_dialogue_group: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('take') WHERE name = 'dialogue_group'")?
+            .exists([])?;
+        if !has_dialogue_group {
+            conn.execute_batch("ALTER TABLE take ADD COLUMN dialogue_group TEXT")?;
         }
         Ok(Self { conn })
     }
@@ -833,6 +869,16 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Set (or clear, with `None`) the kept range of a take. Only metadata:
+    /// the WAV and the take hash stay as they are.
+    pub fn set_take_trim(&self, take_id: Id, trim: Option<(u32, u32)>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE take SET trim_start_ms = ?2, trim_end_ms = ?3 WHERE id = ?1",
+            params![take_id, trim.map(|t| t.0), trim.map(|t| t.1)],
+        )?;
+        Ok(())
+    }
+
     /// Any existing take with this hash, from any segment.
     pub fn take_by_hash(&self, hash: &str) -> Result<Option<Take>> {
         let sql = format!("SELECT {TAKE_COLS} FROM take WHERE hash = ?1 ORDER BY id LIMIT 1");
@@ -1180,5 +1226,104 @@ mod tests {
             cs[0].aliases,
             vec!["the old man".to_string(), "Vort".to_string()]
         );
+    }
+
+    #[test]
+    fn take_trim_is_metadata_and_old_libraries_gain_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                &SCHEMA
+                    .replace("    trim_start_ms INTEGER,\n", "")
+                    .replace("    trim_end_ms  INTEGER,\n", ""),
+            )
+            .unwrap();
+            let pid: i64 = {
+                conn.execute(
+                    "INSERT INTO project (name, language, tts_model, default_voice_settings) VALUES ('Old', 'en', 'm', '{}')",
+                    [],
+                )
+                .unwrap();
+                conn.last_insert_rowid()
+            };
+            conn.execute_batch(&format!(
+                "INSERT INTO chapter (project_id, ord, title, source_text, status) VALUES ({pid}, 1, 'One', 'Text.', 'segmented');
+                 INSERT INTO paragraph (chapter_id, ord, text) VALUES (1, 0, 'Text.');
+                 INSERT INTO segment (paragraph_id, ord, kind, speaker, text, status) VALUES (1, 0, 'narration', 'narrator', 'Text.', 'generated');
+                 INSERT INTO take (segment_id, seed, audio_path, hash) VALUES (1, 1, 'old.wav', 'h-old');"
+            ))
+            .unwrap();
+            let cols: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('take') WHERE name LIKE 'trim_%'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(cols, 0, "the old schema has no trim columns");
+        }
+        let db = Db::open(&path).unwrap();
+        // The pre-existing take loads untrimmed.
+        let old = db.take_by_hash("h-old").unwrap().unwrap();
+        assert_eq!(old.trim_ms, None);
+
+        db.set_take_trim(old.id, Some((120, 2480))).unwrap();
+        let t = db.take(old.id).unwrap();
+        assert_eq!(t.trim_ms, Some((120, 2480)));
+        assert_eq!(
+            (t.hash.as_str(), t.audio_path.as_str()),
+            ("h-old", "old.wav")
+        );
+        assert_eq!(
+            db.takes(t.segment_id).unwrap()[0].trim_ms,
+            Some((120, 2480))
+        );
+        // The segment is untouched by trimming.
+        assert_eq!(
+            db.segment(t.segment_id).unwrap().status,
+            SegmentStatus::Generated
+        );
+
+        db.set_take_trim(old.id, None).unwrap();
+        assert_eq!(db.take(old.id).unwrap().trim_ms, None);
+        drop(db);
+        // Opening again is a no-op migration.
+        assert_eq!(Db::open(&path).unwrap().take(old.id).unwrap().trim_ms, None);
+    }
+
+    #[test]
+    fn interrupted_trim_migration_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("half.sqlite");
+        // Only the first trim column made it in before the app stopped.
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(&SCHEMA.replace("    trim_end_ms  INTEGER,\n", ""))
+            .unwrap();
+        let mut db = Db::open(&path).unwrap();
+        let pid = db.create_project("Book", "en").unwrap();
+        let cid = db.import_chapter(pid, "One", "Text.").unwrap();
+        let p = db.paragraphs(cid).unwrap()[0].clone();
+        db.replace_paragraph_segments(
+            p.id,
+            &[(SegmentKind::Narration, NARRATOR.into(), "Text.".into())],
+        )
+        .unwrap();
+        let sid = db.chapter_segments(cid).unwrap()[0].id;
+        let take = db
+            .insert_take(&NewTake {
+                segment_id: sid,
+                seed: 1,
+                request_id: None,
+                audio_path: "a.wav",
+                hash: "h",
+                credits_used: 0,
+                credits_exact: true,
+            })
+            .unwrap();
+        db.set_take_trim(take, Some((5, 50))).unwrap();
+        assert_eq!(db.take(take).unwrap().trim_ms, Some((5, 50)));
     }
 }

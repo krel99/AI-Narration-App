@@ -24,8 +24,11 @@ use crate::tags;
 use crate::tts::{ElevenLabsClient, TtsError, TtsRequest, VoiceInfo};
 
 mod account;
+mod autotrim;
 mod claude;
+mod dialogue;
 mod retail;
+mod takecheck;
 mod voices;
 
 /// Seed of a segment's first take. Fixed, so identical lines with the same
@@ -92,6 +95,13 @@ pub enum Command {
     DetectClaudeCode {
         path: Option<PathBuf>,
     },
+    /// Detect and store the silence trim of the current take of every
+    /// unapproved segment (metadata only, no credits).
+    AutoTrimChapter {
+        chapter_id: Id,
+    },
+    /// Local take check (Whisper): queueing, settings and models.
+    Check(crate::check::CheckCommand),
     SetKeys(ApiKeys),
     /// Stop queued work (requests already in flight finish).
     Cancel,
@@ -169,6 +179,25 @@ pub enum Event {
         summary: String,
         verdict: crate::acx::Verdict,
     },
+    /// A take of this segment got a (new) check result.
+    TakeChecked {
+        segment_id: Id,
+    },
+    /// Take-check queue: `done` of `total` since it was last empty; 0 of 0
+    /// when the checker is idle.
+    CheckProgress {
+        done: usize,
+        total: usize,
+    },
+    ModelDownload {
+        model: String,
+        received: u64,
+        total: Option<u64>,
+    },
+    ModelDownloadFinished {
+        model: String,
+        error: Option<String>,
+    },
 }
 
 pub struct WorkerHandle {
@@ -205,6 +234,7 @@ struct Ctx {
     /// Bumped by Cancel; jobs stop when it no longer matches their start value.
     epoch: Arc<AtomicU64>,
     endpoints: Endpoints,
+    checker: takecheck::Checker,
 }
 
 /// API endpoints; overridden in tests to point at local fakes.
@@ -256,7 +286,9 @@ pub fn spawn(
         },
         epoch: Arc::new(AtomicU64::new(0)),
         endpoints: Endpoints::default(),
+        checker: Default::default(),
     };
+    takecheck::start(&ctx, crate::check::whisper_loader());
     std::thread::Builder::new()
         .name("workers".into())
         .spawn(move || {
@@ -327,6 +359,10 @@ async fn run(ctx: &Ctx, cmd: Command) -> Result<()> {
             claude::detect_claude_code(ctx, path).await;
             Ok(())
         }
+        Command::AutoTrimChapter { chapter_id } => {
+            autotrim::auto_trim_chapter(ctx, chapter_id).await
+        }
+        Command::Check(c) => takecheck::run_command(ctx, c).await,
         Command::Cancel | Command::SetKeys(_) => Ok(()),
     }
 }
@@ -866,17 +902,27 @@ async fn generate(ctx: &Ctx, segment_ids: Vec<Id>, reroll: bool) -> Result<()> {
         .flat_map(|(_, j)| j.iter().map(|j| j.segment_id))
         .collect();
     ctx.out.emit(Event::GenerationStarted { segment_ids: ids });
+    // Multi-speaker paragraphs that go through Text-to-Dialogue.
+    let through_dialogue = Arc::new(dialogue::plan_request(ctx, &segment_ids, reroll));
     let semaphore = Arc::new(Semaphore::new(concurrency));
     // (generated, cached, failed, credits)
     let stats = Arc::new(Mutex::new((0usize, 0usize, 0usize, 0i64)));
 
     let mut handles = Vec::new();
-    for (_, jobs) in groups {
+    for (paragraph_id, jobs) in groups {
         let ctx = ctx.clone();
         let tts = tts.clone();
         let semaphore = semaphore.clone();
         let stats = stats.clone();
+        let as_dialogue = through_dialogue.contains(&paragraph_id);
+        let plan = through_dialogue.clone();
         handles.push(tokio::spawn(async move {
+            // What dialogue does not (or cannot) generate goes per segment.
+            let jobs = if as_dialogue {
+                dialogue::generate_paragraph(&ctx, &semaphore, started, &stats, &plan, jobs).await
+            } else {
+                jobs
+            };
             for job in jobs {
                 if ctx.cancelled(started) {
                     ctx.out.emit(Event::GenerationFailed {
@@ -961,10 +1007,15 @@ async fn generate_one(
             if project.voice_for(&s.speaker) != Some(voice.as_str()) {
                 continue;
             }
-            if let Some(t) = s.current_take_id
-                && let Some(rid) = db.take(t)?.request_id
-            {
-                prev_ids.push(rid);
+            if let Some(t) = s.current_take_id {
+                let take = db.take(t)?;
+                // A dialogue take carries the dialogue request's id, which is
+                // not a text-to-speech generation to stitch onto.
+                if take.dialogue_group.is_none()
+                    && let Some(rid) = take.request_id
+                {
+                    prev_ids.push(rid);
+                }
             }
         }
         prev_ids.reverse();
@@ -1011,7 +1062,7 @@ async fn generate_one(
     if let Some(existing) = ctx.db(|db| db.take_by_hash(&hash))?
         && ctx.lib.audio_path(&existing.audio_path).exists()
     {
-        ctx.db(|db| {
+        let take_id = ctx.db(|db| {
             let take_id = if existing.segment_id == seg.id {
                 existing.id
             } else {
@@ -1025,8 +1076,13 @@ async fn generate_one(
                     credits_exact: true,
                 })?
             };
-            db.set_current_take(seg.id, take_id)
+            db.set_current_take(seg.id, take_id)?;
+            Ok(take_id)
         })?;
+        if take_id != existing.id {
+            autotrim::trim_new_take(ctx, &project, take_id).await;
+        }
+        takecheck::new_take(ctx, take_id);
         return Ok((true, 0));
     }
 
@@ -1094,7 +1150,7 @@ async fn generate_one(
             false,
         ),
     };
-    ctx.db(|db| {
+    let take_id = ctx.db(|db| {
         let take_id = db.insert_take(&NewTake {
             segment_id: seg.id,
             seed,
@@ -1110,8 +1166,10 @@ async fn generate_one(
         if let Err(e) = db.record_take_cost(take_id, &project.tts_model, chars as i64) {
             log::warn!("recording the cost of take {take_id}: {e:#}");
         }
-        Ok(())
+        Ok(take_id)
     })?;
+    autotrim::trim_new_take(ctx, &project, take_id).await;
+    takecheck::new_take(ctx, take_id);
     Ok((false, credits))
 }
 
@@ -1145,7 +1203,7 @@ mod tests {
     type RequestLog = Arc<Mutex<Vec<(String, String)>>>;
 
     /// Minimal HTTP/1.1 server: records (path, body) and answers with `handler`.
-    fn serve(
+    pub(super) fn serve(
         handler: impl Fn(usize, &str, &str) -> Reply + Send + 'static,
     ) -> (String, RequestLog) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1196,7 +1254,11 @@ mod tests {
         (url, log)
     }
 
-    fn test_ctx(lib: &Library, anthropic: &str, elevenlabs: &str) -> (Ctx, Receiver<Event>) {
+    pub(super) fn test_ctx(
+        lib: &Library,
+        anthropic: &str,
+        elevenlabs: &str,
+    ) -> (Ctx, Receiver<Event>) {
         let (tx, rx) = channel();
         let ctx = Ctx {
             lib: lib.clone(),
@@ -1216,11 +1278,12 @@ mod tests {
                 anthropic: anthropic.into(),
                 elevenlabs: elevenlabs.into(),
             },
+            checker: Default::default(),
         };
         (ctx, rx)
     }
 
-    fn rt() -> tokio::runtime::Runtime {
+    pub(super) fn rt() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -1230,7 +1293,15 @@ mod tests {
     const TEXT: &str = "\"It is,\" started Vortram, \"truly magnificent!\"\n\nThe end.";
 
     /// Import TEXT, split it with the parser and give the quotes to Vortram.
-    fn import(db: &mut Db, project_id: Id) -> Id {
+    /// These tests exercise per-segment generation, so the project's
+    /// multi-speaker dialogue (on by default) is turned off; it has its own
+    /// tests in worker/dialogue/tests.rs.
+    pub(super) fn import(db: &mut Db, project_id: Id) -> Id {
+        let mut p = db.project(project_id).unwrap();
+        if p.settings.dialogue.enabled {
+            p.settings.dialogue.enabled = false;
+            db.update_project(&p).unwrap();
+        }
         let cid = db.import_chapter(project_id, "One", TEXT).unwrap();
         for p in db.paragraphs(cid).unwrap() {
             let segs = segment::parse_paragraph(&p.text, lang::by_code("en"));
@@ -1511,6 +1582,7 @@ mod tests {
                 p.voice_map.insert("vale".into(), "vv".into());
                 p.settings.audio_tags.density = "rich".into();
                 p.settings.audio_tags.direction = "Keep Voss calm.".into();
+                p.settings.dialogue.enabled = false;
                 db.update_project(&p)?;
                 let cid = db.import_chapter(pid, "One", VALE)?;
                 for par in db.paragraphs(cid)? {

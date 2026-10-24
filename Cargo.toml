@@ -8,12 +8,17 @@ publish = false
 
 [dependencies]
 anyhow = "1.0.104"
+# Text-to-Dialogue returns its audio as base64.
+base64 = "0.23"
 directories = "6.0.0"
 eframe = "0.37"
 env_logger = "0.11.11"
 hex = "0.4.3"
 hound = "3.5"
+# Unicode normalisation for checking dialogue alignments (already in the tree via idna).
+icu_normalizer = { version = "2", default-features = false, features = ["compiled_data"] }
 imagesize = { version = "0.15", default-features = false, features = ["jpeg", "png"] }
+libc = "0.2"
 log = "0.4.34"
 rand = "0.10.3"
 reqwest = { version = "0.13", features = ["json"] }
@@ -22,8 +27,16 @@ rodio = { version = "0.23", default-features = false, features = ["playback", "m
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+sha1 = "0.11"
 sha2 = "0.11.1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "process", "io-util"] }
+# Local take check (feature `whisper`); log_backend routes whisper.cpp logs into `log`.
+whisper-rs = { version = "0.16", features = ["log_backend"], optional = true }
+
+[features]
+default = ["whisper"]
+# Local Whisper take check. Building it needs cmake, a C++ compiler and libclang.
+whisper = ["dep:whisper-rs"]
 
 [dev-dependencies]
 tempfile = "3"

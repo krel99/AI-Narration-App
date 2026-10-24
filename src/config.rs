@@ -51,6 +51,8 @@ pub struct AppConfig {
     pub price_per_1000_credits: Option<f64>,
     /// Currency label for `price_per_1000_credits` ("USD", "€").
     pub credit_currency: String,
+    /// Local take check (Whisper): machine-dependent, so app-level.
+    pub check: crate::check::CheckConfig,
 }
 
 fn dirs() -> Option<directories::ProjectDirs> {

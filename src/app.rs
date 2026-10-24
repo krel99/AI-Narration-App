@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use eframe::egui::{self, Color32, Key, RichText, Sense, Stroke, UiBuilder, Vec2};
 
-use crate::audio;
 use crate::config::AppConfig;
 use crate::db::{ChapterStats, Db, Library};
 use crate::export;
@@ -20,9 +19,12 @@ use crate::theme::{self, Palette, primary_button, speaker_color};
 use crate::tts::VoiceInfo;
 use crate::worker::{self, Command, Event, WorkerHandle};
 
+mod check;
 mod costs;
+mod dialogue;
 mod retail;
 mod voice_picker;
+mod waveform;
 
 const ROW_H: f32 = 46.0;
 
@@ -163,6 +165,8 @@ pub struct App {
     takes: Vec<Take>,
     takes_for: Option<Id>,
     tag_edit: Option<TagEdit>,
+    wave: waveform::WaveState,
+    check: check::CheckState,
 
     in_flight: HashSet<Id>,
     failures: HashMap<Id, String>,
@@ -267,6 +271,8 @@ impl App {
             takes: vec![],
             takes_for: None,
             tag_edit: None,
+            wave: Default::default(),
+            check: Default::default(),
             in_flight: HashSet::new(),
             failures: HashMap::new(),
             segmenting: None,
@@ -282,6 +288,10 @@ impl App {
             voice_ui: Default::default(),
             retail: Default::default(),
         };
+        app.worker
+            .send(Command::Check(crate::check::CheckCommand::Config(
+                app.cfg.check.clone(),
+            )));
         if let Some(e) = app.player.error.clone() {
             app.note(true, e);
         }
@@ -458,6 +468,7 @@ impl App {
         .filter(|_| !self.view.segments.is_empty());
         self.takes_for = None;
         self.reload_cost_stats();
+        self.reload_checks();
     }
 
     fn selected_segment(&self) -> Option<&Segment> {
@@ -613,6 +624,10 @@ impl App {
                 Event::Account(info) => self.on_account(info),
                 Event::ClaudeCode(d) => self.on_claude_detection(*d),
                 Event::AcxChecked { summary, verdict } => self.on_acx_checked(summary, verdict),
+                ev @ (Event::TakeChecked { .. }
+                | Event::CheckProgress { .. }
+                | Event::ModelDownload { .. }
+                | Event::ModelDownloadFinished { .. }) => self.on_check_event(ev),
             }
         }
         if self.dirty {
@@ -636,12 +651,10 @@ impl App {
     }
 
     fn play_take(&mut self, segment_id: Id, take_id: Id) {
-        let pcm = self
-            .db
-            .take(take_id)
-            .and_then(|t| audio::read_wav(&self.lib.audio_path(&t.audio_path)));
+        let pcm = self.db.take(take_id).and_then(|t| self.take_audio(&t));
         if let Some(pcm) = self.try_db(pcm) {
             self.player.play(vec![(segment_id, pcm)], 0);
+            self.wave.playing_take = Some(take_id);
         }
     }
 
@@ -657,11 +670,7 @@ impl App {
         for j in self.view.paragraph_range(i) {
             let seg = &self.view.segments[j];
             if let Some(t) = seg.current_take_id {
-                match self
-                    .db
-                    .take(t)
-                    .and_then(|t| audio::read_wav(&self.lib.audio_path(&t.audio_path)))
-                {
+                match self.db.take(t).and_then(|t| self.take_audio(&t)) {
                     Ok(pcm) => items.push((seg.id, pcm)),
                     Err(e) => log::warn!("{e:#}"),
                 }
@@ -671,6 +680,7 @@ impl App {
             self.note(true, "No audio in this paragraph yet.".into());
         } else {
             self.player.play(items, gap);
+            self.wave.playing_take = None;
         }
     }
 
@@ -1294,6 +1304,7 @@ impl App {
                 if st.rejected > 0 {
                     chip(ui, format!("{} rejected", st.rejected), p.rejected);
                 }
+                self.check_chip(ui);
                 if st.unassigned > 0 {
                     chip(
                         ui,
@@ -1378,6 +1389,8 @@ impl App {
                     self.worker.send(Command::Cancel);
                 }
             }
+            self.auto_trim_chapter_button(ui, cid);
+            self.check_toolbar(ui, cid);
             ui.separator();
             let complete = st.segments > 0 && st.approved == st.segments;
             if ui
@@ -1513,6 +1526,7 @@ impl App {
                         if let Some(err) = self.failures.get(&seg.id) {
                             status_label.on_hover_text(format!("Last generation failed: {err}"));
                         }
+                        self.check_marker(ui, seg);
                         let unassigned = project
                             .as_ref()
                             .is_none_or(|p| p.voice_for(&seg.speaker).is_none());
@@ -1737,6 +1751,8 @@ impl App {
                         self.dialogs.split = Some((seg.id, seg.text.clone(), None));
                     }
                 });
+                self.waveform_section(ui, &seg, locked);
+                self.check_section(ui, &seg, locked, i);
 
                 ui.add_space(6.0);
                 egui::CollapsingHeader::new(RichText::new("✦ Audio tags").strong())
@@ -1839,6 +1855,7 @@ impl App {
                         };
                         let text = format!("#{} · seed {} · {cost} · {}", n + 1, t.seed, t.created_at);
                         ui.label(if current { RichText::new(text).strong() } else { RichText::new(text) });
+                        dialogue::take_chip(ui, t);
                         if current {
                             chip(ui, "current", p.approved);
                         } else if ui.add_enabled(!locked, egui::Button::new("Use").small()).clicked() {
@@ -1943,6 +1960,7 @@ impl App {
         let mut save = false;
         let mut cancel = false;
         let mut check = false;
+        let mut check_cmd = None;
         egui::Window::new("Settings").collapsible(false).default_width(560.0).show(ctx, |ui| {
             check = costs::claude_settings_section(ui, cfg, &self.costs);
             ui.separator();
@@ -1977,6 +1995,7 @@ impl App {
                     .small()
                     .color(theme::palette(ui).muted),
             );
+            check_cmd = check::settings_section(ui, &mut cfg.check, &self.check, &self.lib);
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 save = ui.add(primary_button(ui, "Save")).clicked();
@@ -1987,9 +2006,16 @@ impl App {
             let path = cfg.claude_code_path.clone();
             self.request_detection(path);
         }
+        if let Some(c) = check_cmd {
+            self.send_check(c);
+        }
         if save {
             let cfg = self.dialogs.settings.take().unwrap();
             self.worker.send(Command::SetKeys(cfg.api_keys()));
+            self.worker
+                .send(Command::Check(crate::check::CheckCommand::Config(
+                    cfg.check.clone(),
+                )));
             theme::apply(ctx, cfg.dark_mode);
             self.settings_saved(&cfg);
             self.cfg = cfg;
@@ -2071,6 +2097,9 @@ impl App {
                             .hint_text("e.g. Military sci-fi. Keep the narrator calm and clipped; save whispers for real tension."),
                     );
 
+                    section(ui, "MULTI-SPEAKER DIALOGUE");
+                    dialogue::settings_ui(ui, &mut p.settings.dialogue, &p.tts_model, &p.default_voice_settings);
+
                     section(ui, "DEFAULT VOICE SETTINGS");
                     ui.horizontal_wrapped(|ui| voice_settings_ui(ui, &mut p.default_voice_settings));
 
@@ -2089,6 +2118,9 @@ impl App {
                             ui.end_row();
                         }
                     });
+
+                    section(ui, "SILENCE TRIMMING");
+                    waveform::trim_settings_ui(ui, &mut p.settings.trim);
 
                     section(ui, "CLAUDE");
                     let g = &mut p.settings.segmentation;
@@ -2371,6 +2403,7 @@ impl App {
                         format!("{} segments skipped: unassigned voice.", plan.unassigned),
                     );
                 }
+                self.dialogue_generate_note(ui, &plan.ids, plan.reroll);
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     go = ui
