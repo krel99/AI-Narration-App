@@ -142,6 +142,8 @@ pub fn qualifies(
         let Some(v) = project.voice_for(&s.speaker) else {
             return Err(Skip::Unassigned);
         };
+        // Counted as sent (`inputs` trims the id).
+        let v = v.trim();
         if !voices.contains(&v) {
             voices.push(v);
         }
@@ -619,6 +621,11 @@ mod tests {
         assert_eq!(qualifies(&q, &paras[1], &req, false), Err(Skip::Model));
         q.tts_model = "eleven_v3".into();
         assert_eq!(qualifies(&q, &paras[1], &req, false), Ok(()));
+        // Voice ids count as they are sent: trimmed.
+        let mut q = p.clone();
+        q.voice_map.insert("guard".into(), " vn ".into());
+        q.voice_map.insert("vortram".into(), "vn".into());
+        assert_eq!(qualifies(&q, &paras[1], &req, false), Err(Skip::OneVoice));
         let mut q = p.clone();
         q.settings.dialogue.enabled = false;
         assert_eq!(qualifies(&q, &paras[1], &req, false), Err(Skip::Disabled));

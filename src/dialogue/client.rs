@@ -113,15 +113,21 @@ pub struct Reply {
 pub enum CallError {
     /// The request failed (HTTP status or network), as for text-to-speech.
     Api(TtsError),
-    /// ElevenLabs answered 200 but the answer cannot be used (billed).
-    Unusable(String),
+    /// ElevenLabs answered 200 but the answer cannot be used (billed: the
+    /// `character-cost` header, when it was sent).
+    Unusable {
+        message: String,
+        character_cost: Option<i64>,
+    },
 }
 
 impl std::fmt::Display for CallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CallError::Api(e) => write!(f, "{e}"),
-            CallError::Unusable(m) => write!(f, "unusable dialogue response: {m}"),
+            CallError::Unusable { message, .. } => {
+                write!(f, "unusable dialogue response: {message}")
+            }
         }
     }
 }
@@ -240,7 +246,10 @@ pub async fn convert_with_timestamps(
     let character_cost = header("character-cost")
         .and_then(|s| parse_cost(&s))
         .or_else(|| header("x-character-count").and_then(|s| parse_cost(&s)));
-    parse_reply(&body, request_id, character_cost).map_err(CallError::Unusable)
+    parse_reply(&body, request_id, character_cost).map_err(|message| CallError::Unusable {
+        message,
+        character_cost,
+    })
 }
 
 #[cfg(test)]

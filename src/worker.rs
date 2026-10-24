@@ -847,7 +847,7 @@ async fn generate(ctx: &Ctx, segment_ids: Vec<Id>, reroll: bool) -> Result<()> {
         .collect();
     ctx.out.emit(Event::GenerationStarted { segment_ids: ids });
     // Multi-speaker paragraphs that go through Text-to-Dialogue.
-    let through_dialogue = dialogue::plan_request(ctx, &segment_ids, reroll);
+    let through_dialogue = Arc::new(dialogue::plan_request(ctx, &segment_ids, reroll));
     let semaphore = Arc::new(Semaphore::new(concurrency));
     // (generated, cached, failed, credits)
     let stats = Arc::new(Mutex::new((0usize, 0usize, 0usize, 0i64)));
@@ -859,10 +859,11 @@ async fn generate(ctx: &Ctx, segment_ids: Vec<Id>, reroll: bool) -> Result<()> {
         let semaphore = semaphore.clone();
         let stats = stats.clone();
         let as_dialogue = through_dialogue.contains(&paragraph_id);
+        let plan = through_dialogue.clone();
         handles.push(tokio::spawn(async move {
             // What dialogue does not (or cannot) generate goes per segment.
             let jobs = if as_dialogue {
-                dialogue::generate_paragraph(&ctx, &semaphore, started, &stats, jobs).await
+                dialogue::generate_paragraph(&ctx, &semaphore, started, &stats, &plan, jobs).await
             } else {
                 jobs
             };

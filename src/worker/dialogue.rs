@@ -9,6 +9,7 @@
 
 use std::collections::HashSet;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Result, anyhow};
 use tokio::sync::Semaphore;
@@ -26,11 +27,30 @@ use crate::tts::TtsError;
 /// `generate`'s counters: (generated, cached, failed, credits).
 pub(super) type Stats = Mutex<(usize, usize, usize, i64)>;
 
+/// After this many billed dialogues are discarded in one Generate run, its
+/// remaining paragraphs go per segment straight away: a systematic problem
+/// (say, a change in the API's answers) must not bill every paragraph twice.
+const MAX_DISCARDED_PER_RUN: usize = 2;
+
+/// The paragraphs of one Generate run that go through dialogue.
+#[derive(Default)]
+pub(super) struct RunPlan {
+    paragraphs: HashSet<Id>,
+    /// Billed dialogues discarded so far in this run.
+    discarded: AtomicUsize,
+}
+
+impl RunPlan {
+    pub(super) fn contains(&self, paragraph_id: &Id) -> bool {
+        self.paragraphs.contains(paragraph_id)
+    }
+}
+
 /// The paragraphs of this request that go through dialogue. Planning
 /// problems only mean per-segment generation.
-pub(super) fn plan_request(ctx: &Ctx, segment_ids: &[Id], reroll: bool) -> HashSet<Id> {
+pub(super) fn plan_request(ctx: &Ctx, segment_ids: &[Id], reroll: bool) -> RunPlan {
     if reroll {
-        return HashSet::new();
+        return RunPlan::default();
     }
     let requested: HashSet<Id> = segment_ids.iter().copied().collect();
     let planned = ctx.db(|db| {
@@ -51,19 +71,32 @@ pub(super) fn plan_request(ctx: &Ctx, segment_ids: &[Id], reroll: bool) -> HashS
         }
         Ok(out)
     });
-    planned.unwrap_or_else(|e| {
-        log::warn!("planning dialogue paragraphs: {e:#}");
-        HashSet::new()
-    })
+    RunPlan {
+        paragraphs: planned.unwrap_or_else(|e| {
+            log::warn!("planning dialogue paragraphs: {e:#}");
+            HashSet::new()
+        }),
+        discarded: AtomicUsize::new(0),
+    }
 }
 
 enum Outcome {
     /// Every segment got its take.
     Done { cached: bool, credits: i64 },
-    /// Generate the paragraph per segment. `billed` is `None` when it no
-    /// longer qualifies (nothing to report); otherwise the user is told, and
-    /// whether the discarded dialogue was billed.
-    PerSegment { why: String, billed: Option<bool> },
+    /// Generate the paragraph per segment; `spent` says what the discarded
+    /// dialogue cost.
+    PerSegment { why: String, spent: Spent },
+}
+
+/// What a dialogue that is not used cost.
+enum Spent {
+    /// Nothing was sent (the paragraph no longer qualifies): nothing to report.
+    Nothing,
+    /// ElevenLabs refused the request: not billed.
+    Refused,
+    /// Answered and billed: the `character-cost` header (`exact`), or the
+    /// characters as an estimate.
+    Billed { credits: i64, exact: bool },
 }
 
 /// Generate one qualifying paragraph through dialogue. Returns the jobs that
@@ -74,13 +107,17 @@ pub(super) async fn generate_paragraph(
     semaphore: &Semaphore,
     started: u64,
     stats: &Stats,
+    plan: &RunPlan,
     jobs: Vec<Job>,
 ) -> Vec<Job> {
-    if jobs.is_empty() || ctx.cancelled(started) {
+    if jobs.is_empty()
+        || ctx.cancelled(started)
+        || plan.discarded.load(Ordering::SeqCst) >= MAX_DISCARDED_PER_RUN
+    {
         return jobs;
     }
     let chapter_id = jobs[0].chapter_id;
-    match run(ctx, semaphore, &jobs).await {
+    match run(ctx, semaphore, plan, &jobs).await {
         Ok(Outcome::Done { cached, credits }) => {
             if let Ok(mut s) = stats.lock() {
                 s.0 += jobs.len();
@@ -97,14 +134,29 @@ pub(super) async fn generate_paragraph(
             ctx.out.emit(Event::SegmentsChanged { chapter_id });
             vec![]
         }
-        Ok(Outcome::PerSegment { why, billed }) => {
+        Ok(Outcome::PerSegment { why, spent }) => {
             log::warn!("dialogue paragraph: {why}; generating per segment");
-            if let Some(billed) = billed {
-                let paid = if billed {
-                    " The dialogue's characters were billed; the segments are billed again."
-                } else {
-                    ""
+            if !matches!(spent, Spent::Nothing) {
+                let mut paid = match spent {
+                    Spent::Billed { credits, exact } => {
+                        // The discarded dialogue counts in this run's credits used.
+                        if let Ok(mut s) = stats.lock() {
+                            s.3 += credits;
+                        }
+                        let about = if exact { "" } else { "about " };
+                        format!(
+                            " The dialogue was billed ({about}{credits} credits); the segments are billed again."
+                        )
+                    }
+                    _ => String::new(),
                 };
+                if matches!(spent, Spent::Billed { .. })
+                    && plan.discarded.fetch_add(1, Ordering::SeqCst) + 1 == MAX_DISCARDED_PER_RUN
+                {
+                    paid.push_str(&format!(
+                        " After {MAX_DISCARDED_PER_RUN} such paragraphs, the rest of this generation goes per segment."
+                    ));
+                }
                 // The paragraph as the Review list numbers it (¶ 3).
                 let number = ctx
                     .db(|db| {
@@ -155,6 +207,21 @@ fn dialogue_request_of(db: &Db, paragraph_id: Id) -> Result<Option<String>> {
     Ok(rid)
 }
 
+/// The cost of a billed dialogue that is discarded: the header, or the
+/// characters as an estimate (as for the takes' credits).
+fn billed(character_cost: Option<i64>, inputs: &[Input]) -> Spent {
+    match character_cost {
+        Some(credits) => Spent::Billed {
+            credits,
+            exact: true,
+        },
+        None => Spent::Billed {
+            credits: inputs.iter().map(|i| i.text.chars().count() as i64).sum(),
+            exact: false,
+        },
+    }
+}
+
 /// Group and take hashes for `seed`.
 fn hashes(
     inputs: &[Input],
@@ -170,7 +237,7 @@ fn hashes(
     (group, takes)
 }
 
-async fn run(ctx: &Ctx, semaphore: &Semaphore, jobs: &[Job]) -> Result<Outcome> {
+async fn run(ctx: &Ctx, semaphore: &Semaphore, plan: &RunPlan, jobs: &[Job]) -> Result<Outcome> {
     let chapter_id = jobs[0].chapter_id;
     // Read fresh: the paragraph may have changed since the request was planned.
     let (project, segs, previous_text, future_text, previous_ids) = ctx.db(|db| {
@@ -209,13 +276,13 @@ async fn run(ctx: &Ctx, semaphore: &Semaphore, jobs: &[Job]) -> Result<Outcome> 
     if let Err(skip) = dialogue::qualifies(&project, &refs, &requested, false) {
         return Ok(Outcome::PerSegment {
             why: skip.reason().into(),
-            billed: None,
+            spent: Spent::Nothing,
         });
     }
     let Some(inputs) = dialogue::inputs(&project, &refs) else {
         return Ok(Outcome::PerSegment {
             why: Skip::Unassigned.reason().into(),
-            billed: None,
+            spent: Spent::Nothing,
         });
     };
     let model = project.tts_model.clone();
@@ -292,6 +359,14 @@ async fn run(ctx: &Ctx, semaphore: &Semaphore, jobs: &[Job]) -> Result<Outcome> 
     let reply = loop {
         let result = {
             let _permit = semaphore.acquire().await?;
+            // Checked when the request would go out: paragraphs wait here
+            // for a free slot while earlier dialogues are being validated.
+            if plan.discarded.load(Ordering::SeqCst) >= MAX_DISCARDED_PER_RUN {
+                return Ok(Outcome::PerSegment {
+                    why: "earlier dialogues of this generation could not be cut".into(),
+                    spent: Spent::Nothing,
+                });
+            }
             client::convert_with_timestamps(&ctx.http, &key, &ctx.endpoints.elevenlabs, &req).await
         };
         match result {
@@ -324,16 +399,19 @@ async fn run(ctx: &Ctx, semaphore: &Semaphore, jobs: &[Job]) -> Result<Outcome> 
             Err(CallError::Api(e @ TtsError::Rejected { .. })) => {
                 return Ok(Outcome::PerSegment {
                     why: format!("the dialogue request was refused: {e}"),
-                    billed: Some(false),
+                    spent: Spent::Refused,
                 });
             }
             // Out of retries for a temporary error: per-segment calls would
             // only meet the same outage, so the segments fail (Generate retries).
             Err(CallError::Api(e)) => return Err(e.into()),
-            Err(CallError::Unusable(m)) => {
+            Err(CallError::Unusable {
+                message,
+                character_cost,
+            }) => {
                 return Ok(Outcome::PerSegment {
-                    why: format!("unusable dialogue response: {m}"),
-                    billed: Some(true),
+                    why: format!("unusable dialogue response: {message}"),
+                    spent: billed(character_cost, &inputs),
                 });
             }
         }
@@ -347,6 +425,7 @@ async fn run(ctx: &Ctx, semaphore: &Semaphore, jobs: &[Job]) -> Result<Outcome> 
         None => (chars.iter().sum::<usize>() as i64, false),
     };
     let request_id = reply.request_id.clone();
+    let reply_cost = reply.character_cost;
 
     // Decode, validate, cut and write the takes off the async threads.
     let trim_settings = project.settings.trim.clone();
@@ -381,7 +460,7 @@ async fn run(ctx: &Ctx, semaphore: &Semaphore, jobs: &[Job]) -> Result<Outcome> 
         Err(why) => {
             return Ok(Outcome::PerSegment {
                 why: format!("the dialogue could not be cut reliably: {why}"),
-                billed: Some(true),
+                spent: billed(reply_cost, &inputs),
             });
         }
     };

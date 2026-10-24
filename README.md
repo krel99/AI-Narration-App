@@ -188,12 +188,15 @@ reviewed, approved and re-rolled on its own
   the pause between two lines, never inside speech; played back to back,
   the takes are the dialogue exactly. If any check fails, the dialogue audio
   is discarded and the paragraph is generated per segment instead, which
-  bills its characters a second time; the status bar says so.
+  bills its characters a second time; the status bar says so, and the
+  discarded dialogue counts in the credits used. After two such paragraphs
+  in one generation, the rest of it goes per segment straight away.
 - Takes cut from a dialogue are marked **dialogue** in the take list. Each
   carries the request id and its share of the request's credits, by
   characters. Re-rolling a segment later generates it on its own.
-- With automatic silence trimming on, only the paragraph's outer edges are
-  trimmed: the pauses between speakers are the dialogue's own timing.
+- With automatic silence trimming on, and with **Auto-trim chapter**, only
+  the paragraph's outer edges are trimmed: the pauses between speakers are
+  the dialogue's own timing.
 
 ## Data
 

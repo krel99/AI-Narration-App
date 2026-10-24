@@ -480,19 +480,32 @@ verified research (`plan/research/eleven-dialogue.verify.md`).
   never past the middle of either line, widened to the character times'
   end and start of speech when those agree with the voice segments) the
   10 ms frames quieter than the speech level minus 30 dB (−65…−40 dBFS; one
-  10 dB relaxation) form pauses of at least 20 ms. The pause touching the
-  boundary (the longest of those), otherwise the nearest, is cut in the
-  middle, moved to the quietest sample within 2 ms. No pause means
-  validation fails. The first take starts at 0 and the last ends with the
-  audio, so the takes back to back are exactly the dialogue; with 0 ms
-  within a paragraph, export and paragraph playback keep its timing.
+  10 dB relaxation) form pauses of at least 20 ms, measured over the whole
+  stretch between the two lines' middles. A pause of at least 80 ms
+  touching the boundary is the turn (the longest of those). Otherwise the
+  timings are off by more than the pause, and the nearest quiet stretch may
+  be a stop consonant inside a word, so each pause is weighed by its length
+  minus its distance from the boundary: the turn's longer pause a little
+  further away wins over a 40 ms gap right next to it (tested with the
+  boundary 50–200 ms early or late and no character times). The chosen
+  pause is cut in the middle, moved to the quietest sample within 2 ms. No
+  pause means validation fails. An `alignment` without characters counts as
+  no alignment (the counts are checked) instead of failing the paragraph.
+  The first take starts at 0 and the last ends with the audio, so the takes
+  back to back are exactly the dialogue; with 0 ms within a paragraph,
+  export and paragraph playback keep its timing.
 - **Fallback.** A failed validation, an unreadable answer or a refused
   request (4xx except 401) discards the dialogue and returns the paragraph's
   jobs to the per-segment loop, with a status message naming the paragraph
-  and whether the dialogue was billed. A 401, or a 429/5xx still failing
-  after the text-to-speech retry policy (6 rate-limit and 3 temporary
-  retries), fails the segments instead: per-segment calls would meet the
-  same problem and spend more.
+  and whether (and how much) the dialogue was billed; a billed, discarded
+  dialogue counts in the run's "credits used". After two billed dialogues
+  are discarded in one Generate run, the run sends no more dialogue
+  requests (checked when a request would go out, so at most the requests
+  already being validated follow): a systematic problem, such as a change
+  in the API's answers, must not bill every paragraph twice. A 401, or a
+  429/5xx still failing after the text-to-speech retry policy (6 rate-limit
+  and 3 temporary retries), fails the segments instead: per-segment calls
+  would meet the same problem and spend more.
 - **Takes.** One WAV and one take row per segment, stored in one
   transaction. Hash: a group hash over all inputs' text and voice, the
   settings, model, seed and output format (`take.dialogue_group`, a new
@@ -509,7 +522,11 @@ verified research (`plan/research/eleven-dialogue.verify.md`).
 - **Trimming and checking.** New dialogue takes are queued for the take
   check like any other. With automatic trimming on, only the paragraph's
   outer edges are trimmed (the first take's start, the last take's end);
-  the pauses between speakers are left as the dialogue made them.
+  the pauses between speakers are left as the dialogue made them. **Auto-trim
+  chapter** does the same for takes cut from a dialogue (a piece whose
+  neighbour in the paragraph is from the same dialogue keeps that edge, and
+  a middle piece is stored untrimmed); the per-take **✂ Auto-trim** button
+  still trims the whole take, as asked.
 
 Not verified here (api.elevenlabs.io was unreachable): real responses, how
 precise v4's voice-segment timings are, how the server counts non-ASCII
@@ -525,4 +542,7 @@ thresholds, which were tuned on synthetic audio.
 - Text-to-Dialogue: that cuts land in the pauses on real v4 and v3 output
   (and on the MP3 fallback, whose decoder delay shifts the timings
   slightly), how often the fallback triggers, the `character-cost` header,
-  and how non-ASCII text is counted in `voice_segments`.
+  and how non-ASCII text is counted in `voice_segments`; how far the
+  voice-segment boundaries sit from the real pauses and how long real turn
+  pauses are (the 80 ms turn threshold and the length-minus-distance choice
+  were tuned on synthetic audio).

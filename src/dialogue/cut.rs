@@ -37,6 +37,9 @@ const HINT_TOL: f64 = 0.25;
 const FRAME_MS: usize = 10;
 /// A pause is at least two quiet 10 ms frames.
 const MIN_PAUSE_FRAMES: usize = 2;
+/// A pause at least this long (80 ms) touching the timings' boundary is the
+/// turn; shorter gaps (stop consonants, word gaps) are weighed by length.
+const TURN_PAUSE_FRAMES: usize = 8;
 /// An input needs at least three frames of sound.
 const MIN_SOUND_FRAMES: usize = 3;
 
@@ -266,8 +269,13 @@ fn quiet_runs(levels: &[f32], lo: usize, hi: usize, threshold: f32) -> Vec<(usiz
     runs
 }
 
-/// The pause to cut in: one that touches the boundary region (the longest
-/// of those), otherwise the nearest one (the longer on ties).
+/// The pause to cut in. A real pause (at least 80 ms) touching the boundary
+/// region is the turn (the longest of those). Otherwise the timings are off
+/// by more than the pause, and the nearest quiet stretch may be a stop
+/// consonant inside a word, so each run is weighed by its length minus its
+/// distance: the longer pause between the lines a little further away wins
+/// over a short gap right next to the boundary. Runs further than the search
+/// margin from the boundary region are not considered.
 fn pick_run(runs: &[(usize, usize)], core: (f64, f64), frame_secs: f64) -> Option<(usize, usize)> {
     let secs = |(a, b): (usize, usize)| (a as f64 * frame_secs, b as f64 * frame_secs);
     let distance = |r: (usize, usize)| {
@@ -280,10 +288,25 @@ fn pick_run(runs: &[(usize, usize)], core: (f64, f64), frame_secs: f64) -> Optio
             0.0
         }
     };
-    runs.iter().copied().min_by(|&x, &y| {
-        distance(x)
-            .total_cmp(&distance(y))
-            .then((y.1 - y.0).cmp(&(x.1 - x.0)))
+    let len = |r: (usize, usize)| r.1 - r.0;
+    let near: Vec<(usize, usize)> = runs
+        .iter()
+        .copied()
+        .filter(|&r| distance(r) <= SEARCH_MARGIN)
+        .collect();
+    let turn = near
+        .iter()
+        .copied()
+        .filter(|&r| distance(r) == 0.0 && len(r) >= TURN_PAUSE_FRAMES)
+        .min_by_key(|&r| (std::cmp::Reverse(len(r)), r.0));
+    if turn.is_some() {
+        return turn;
+    }
+    let score = |r: (usize, usize)| len(r) as f64 * frame_secs - distance(r);
+    near.into_iter().min_by(|&x, &y| {
+        score(y)
+            .total_cmp(&score(x))
+            .then(distance(x).total_cmp(&distance(y)))
     })
 }
 
@@ -303,6 +326,9 @@ pub fn cut_points(
         return Err("no audio".into());
     }
     let (spans, mut notes) = spans(n, segments, inputs)?;
+    // An alignment without characters says nothing: check the counts
+    // instead of failing (and paying again for) the whole paragraph.
+    let alignment = alignment.filter(|a| !a.characters.is_empty());
     let duration = pcm.samples.len() as f64 / pcm.rate as f64;
     for (i, s) in spans.iter().enumerate() {
         if s.t1 - s.t0 < 0.001 {
@@ -389,10 +415,11 @@ pub fn cut_points(
             }
         }
         let prev = *bounds.last().unwrap();
-        let lo = (core.0 - SEARCH_MARGIN).max((a.t0 + a.t1) / 2.0);
-        let hi = (core.1 + SEARCH_MARGIN)
-            .min((b.t0 + b.t1) / 2.0)
-            .min(duration);
+        // Pauses are measured over the whole stretch between the middles of
+        // the two lines (so one reaching past the search margin keeps its
+        // full length); only those within the margin of the boundary count.
+        let lo = (a.t0 + a.t1) / 2.0;
+        let hi = ((b.t0 + b.t1) / 2.0).min(duration);
         // Whole frames inside the window, after the previous cut.
         let f_lo = ((lo.max(0.0) / frame_secs).ceil() as usize).max(prev.div_ceil(frame));
         let f_hi = ((hi / frame_secs).floor() as usize).min(levels.len());
@@ -537,6 +564,93 @@ mod tests {
             *x = 0;
         }
         assert_cuts_in_gaps(&s, &run(&s, &TEXTS, &VOICES).unwrap());
+    }
+
+    /// Silence `from..to` ms after sample `at` (a stop consonant's closure).
+    fn gap(s: &mut Synth, at: usize, from: usize, to: usize) {
+        let ms = |m: usize| RATE as usize * m / 1000;
+        for x in &mut s.pcm.samples[at + ms(from)..at + ms(to)] {
+            *x = 0;
+        }
+    }
+
+    #[test]
+    fn timings_off_by_a_syllable_still_cut_in_the_pause() {
+        // The boundary between two lines lands inside speech, next to a
+        // 40 ms gap in a word; without character times to correct it, the
+        // longer pause between the lines must still win.
+        for off in [50i64, 100, 150, 200, -50, -100, -150, -200] {
+            let mut s = synth(&TEXTS, &VOICES, RATE);
+            for k in 0..2 {
+                let (end, start) = (s.speech[k].1, s.speech[k + 1].0);
+                let at = if off > 0 {
+                    // Late: a gap 150-190 ms into the next line.
+                    gap(&mut s, start, 150, 190);
+                    start as f64 / RATE as f64 + off as f64 / 1000.0
+                } else {
+                    // Early: a gap 190-150 ms before the end of the line.
+                    gap(&mut s, end - RATE as usize * 190 / 1000, 0, 40);
+                    end as f64 / RATE as f64 + off as f64 / 1000.0
+                };
+                s.segments[k].end_time_seconds = at;
+                s.segments[k + 1].start_time_seconds = at;
+            }
+            if off > 0 {
+                // The short last line keeps a plausible length: it runs to
+                // the end of the audio.
+                s.segments[2].end_time_seconds = s.pcm.samples.len() as f64 / RATE as f64;
+            }
+            let cuts = cut_points(&s.pcm, &inputs(&TEXTS, &VOICES), &s.segments, None)
+                .unwrap_or_else(|e| panic!("{off} ms: {e}"));
+            for k in 0..2 {
+                let (end, start) = (s.speech[k].1, s.speech[k + 1].0);
+                let cut = cuts.bounds[k + 1];
+                assert!(
+                    cut > end && cut < start,
+                    "{off} ms: cut {cut} not in {end}..{start}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fast_turn_taking_keeps_the_short_turn_pause() {
+        // Only 40 ms between the speakers, a 100 ms pause inside the first
+        // line 150 ms before its end: the boundary's own pause wins.
+        let mut s = synth(&TEXTS, &VOICES, RATE);
+        let (end, start) = (s.speech[0].1, s.speech[1].0);
+        let ms = |m: usize| RATE as usize * m / 1000;
+        // Close the turn pause to 40 ms by filling the rest with tone.
+        for j in end..start - ms(40) {
+            s.pcm.samples[j] = ((j as f64 * 0.07).sin() * 8000.0) as i16;
+        }
+        gap(&mut s, end - ms(250), 0, 100);
+        let t = (start - ms(20)) as f64 / RATE as f64;
+        s.segments[0].end_time_seconds = t;
+        s.segments[1].start_time_seconds = t;
+        let cuts = run(&s, &TEXTS, &VOICES).unwrap();
+        let cut = cuts.bounds[1];
+        assert!(cut > start - ms(40) && cut < start, "cut {cut}");
+    }
+
+    #[test]
+    fn an_empty_alignment_is_no_alignment() {
+        // An alignment object without characters must not fail (and bill
+        // again) a paragraph whose voice segments are fine.
+        let s = synth(&TEXTS, &VOICES, RATE);
+        let cuts = cut_points(
+            &s.pcm,
+            &inputs(&TEXTS, &VOICES),
+            &s.segments,
+            Some(&Alignment::default()),
+        )
+        .unwrap();
+        assert_cuts_in_gaps(&s, &cuts);
+        assert!(
+            cuts.notes
+                .iter()
+                .any(|n| n.contains("no character alignment"))
+        );
     }
 
     #[test]

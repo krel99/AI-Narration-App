@@ -3,6 +3,7 @@
 //! is never touched and no credits are spent. Detection reads the WAV, so it
 //! runs on the blocking pool.
 
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
 use anyhow::Result;
@@ -16,6 +17,51 @@ async fn detect(ctx: &Ctx, settings: &TrimSettings, take_id: Id) -> Result<Optio
     let take = ctx.db(|db| db.take(take_id))?;
     let (lib, settings) = (ctx.lib.clone(), settings.clone());
     tokio::task::spawn_blocking(move || trim::detect_take(&lib, &take, &settings)).await?
+}
+
+/// A dialogue take's trim: only the outer edges of its paragraph's dialogue
+/// (`first` / `last` piece), as automatic trimming does when it is cut.
+/// `None` when the take is silent; `Some(None)` when it is kept whole.
+async fn detect_dialogue(
+    ctx: &Ctx,
+    settings: &TrimSettings,
+    take_id: Id,
+    first: bool,
+    last: bool,
+) -> Result<Option<Option<(u32, u32)>>> {
+    let take = ctx.db(|db| db.take(take_id))?;
+    let (lib, settings) = (ctx.lib.clone(), settings.clone());
+    tokio::task::spawn_blocking(move || {
+        let pcm = crate::audio::read_wav(&lib.audio_path(&take.audio_path))?;
+        Ok(trim::detect(&pcm, &settings)
+            .map(|_| crate::dialogue::edge_trim(&pcm, &settings, first, last)))
+    })
+    .await?
+}
+
+/// Dialogue takes among the current takes of `segments`: whether each is the
+/// first and the last piece of its dialogue in the paragraph.
+fn dialogue_edges(ctx: &Ctx, segments: &[Segment]) -> Result<HashMap<Id, (bool, bool)>> {
+    let groups: Vec<Option<String>> = ctx.db(|db| {
+        segments
+            .iter()
+            .map(|s| match s.current_take_id {
+                Some(t) => Ok(db.take(t)?.dialogue_group),
+                None => Ok(None),
+            })
+            .collect()
+    })?;
+    let same = |i: usize, j: usize| {
+        segments[i].paragraph_id == segments[j].paragraph_id && groups[i] == groups[j]
+    };
+    Ok((0..segments.len())
+        .filter(|&i| groups[i].is_some())
+        .map(|i| {
+            let first = i == 0 || !same(i - 1, i);
+            let last = i + 1 == segments.len() || !same(i, i + 1);
+            (segments[i].id, (first, last))
+        })
+        .collect())
 }
 
 /// After a new take row is stored: trim it when automatic trimming is on.
@@ -50,7 +96,9 @@ pub(super) async fn trim_new_take(ctx: &Ctx, project: &Project, take_id: Id) {
 
 /// Detect and store the trim of the current take of every unapproved segment
 /// in the chapter, with the project's settings (whether or not automatic
-/// trimming is on). Replaces earlier trims, manual ones included.
+/// trimming is on). Replaces earlier trims, manual ones included. Takes cut
+/// from a multi-speaker dialogue keep the pauses between the speakers: only
+/// the dialogue's outer edges are trimmed.
 pub(super) async fn auto_trim_chapter(ctx: &Ctx, chapter_id: Id) -> Result<()> {
     let started = ctx.epoch.load(Ordering::SeqCst);
     let (project, segments) = ctx.db(|db| {
@@ -60,7 +108,8 @@ pub(super) async fn auto_trim_chapter(ctx: &Ctx, chapter_id: Id) -> Result<()> {
             db.chapter_segments(chapter_id)?,
         ))
     })?;
-    let (mut trimmed, mut silent, mut failed) = (0usize, 0usize, 0usize);
+    let edges = dialogue_edges(ctx, &segments)?;
+    let (mut trimmed, mut silent, mut failed, mut whole) = (0usize, 0usize, 0usize, 0usize);
     for seg in &segments {
         if ctx.cancelled(started) {
             break;
@@ -71,7 +120,15 @@ pub(super) async fn auto_trim_chapter(ctx: &Ctx, chapter_id: Id) -> Result<()> {
         if seg.status == SegmentStatus::Approved {
             continue;
         }
-        let range = match detect(ctx, &project.settings.trim, take_id).await {
+        let detected = match edges.get(&seg.id) {
+            Some(&(first, last)) => {
+                detect_dialogue(ctx, &project.settings.trim, take_id, first, last).await
+            }
+            None => detect(ctx, &project.settings.trim, take_id)
+                .await
+                .map(|r| r.map(Some)),
+        };
+        let range = match detected {
             Ok(Some(range)) => range,
             Ok(None) => {
                 silent += 1;
@@ -90,10 +147,13 @@ pub(super) async fn auto_trim_chapter(ctx: &Ctx, chapter_id: Id) -> Result<()> {
             if now.status == SegmentStatus::Approved || now.current_take_id != Some(take_id) {
                 return Ok(false);
             }
-            db.set_take_trim(take_id, Some(range))?;
+            db.set_take_trim(take_id, range)?;
             Ok(true)
         })?;
-        trimmed += stored as usize;
+        match range {
+            Some(_) => trimmed += stored as usize,
+            None => whole += stored as usize,
+        }
     }
     ctx.out.emit(Event::SegmentsChanged { chapter_id });
     let mut msg = format!("Auto-trim: {trimmed} takes trimmed");
@@ -101,6 +161,11 @@ pub(super) async fn auto_trim_chapter(ctx: &Ctx, chapter_id: Id) -> Result<()> {
         msg.push_str(&format!(
             ", {silent} left as they are (nothing above {} dB)",
             project.settings.trim.threshold_db
+        ));
+    }
+    if whole > 0 {
+        msg.push_str(&format!(
+            ", {whole} dialogue takes kept whole (the pauses between speakers stay)"
         ));
     }
     if failed > 0 {

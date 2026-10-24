@@ -334,9 +334,9 @@ fn bad_voice_segments_fall_back_to_per_segment_requests() {
             assert_eq!(t.dialogue_group, None, "{name}");
             assert!(t.request_id.unwrap().starts_with("tts-"), "{name}");
         }
-        let infos: Vec<String> = s
-            .events
-            .try_iter()
+        let events: Vec<Event> = s.events.try_iter().collect();
+        let infos: Vec<&String> = events
+            .iter()
             .filter_map(|e| match e {
                 Event::Info(m) => Some(m),
                 _ => None,
@@ -345,9 +345,16 @@ fn bad_voice_segments_fall_back_to_per_segment_requests() {
         assert!(
             infos.iter().any(|m| m.contains("for ¶ 1 (")
                 && m.contains("one by one")
-                && m.contains("billed")),
+                && m.contains("billed (43 credits)")),
             "{name}: {infos:?}"
         );
+        // The discarded dialogue counts in the credits used: 43 for it and
+        // 43 again for the three segments.
+        let credits = events.iter().find_map(|e| match e {
+            Event::GenerationFinished { credits, .. } => Some(*credits),
+            _ => None,
+        });
+        assert_eq!(credits, Some(86), "{name}");
         // Nothing is left behind from the discarded dialogue.
         let files = std::fs::read_dir(s.lib.audio_dir()).unwrap().count();
         assert_eq!(files, 3, "{name}");
@@ -380,6 +387,49 @@ fn bad_voice_segments_fall_back_to_per_segment_requests() {
         info.contains("model not supported") && !info.contains("billed"),
         "{info}"
     );
+    // Refused, so not billed: only the segments count.
+    assert_eq!(finished(&s.events).3, 43);
+}
+
+#[test]
+fn repeated_billed_fallbacks_stop_dialogue_for_the_run() {
+    // Every dialogue answer fails validation (as after a change in the API):
+    // after two discarded (billed) dialogues the run stops sending them, so
+    // not every paragraph is billed twice.
+    let (url, requests) = fake_eleven(|n, body| {
+        dialogue_reply(n, body, &|s| {
+            let t = s.segments[1].start_time_seconds;
+            s.segments[1].end_time_seconds = t;
+            s.segments[2].start_time_seconds = t;
+        })
+    });
+    let s = setup(&url, "en", |p| p.settings.concurrency = 1);
+    let text: Vec<String> = (1..=6)
+        .map(|i| format!("“Who goes there, {i}?” asked guard {i}. “Only me, {i}.”"))
+        .collect();
+    let (_, segs) = import(&s, &text.join("\n\n"), &["guard", "vortram"]);
+    assert_eq!(segs.len(), 18);
+    rt().block_on(generate(&s.ctx, ids(&segs), false)).unwrap();
+    let sent = dialogue_bodies(&requests).len();
+    // Two discarded, plus at most what was already waiting to be validated.
+    assert!((2..=4).contains(&sent), "{sent} dialogue requests");
+    assert_eq!(tts_count(&requests), 18, "every segment per segment");
+    for seg in &segs {
+        assert_eq!(current(&s.ctx, seg.id).dialogue_group, None);
+    }
+    let events: Vec<Event> = s.events.try_iter().collect();
+    let stops = events
+        .iter()
+        .filter(|e| matches!(e, Event::Info(m) if m.contains("rest of this generation goes per segment")))
+        .count();
+    assert_eq!(stops, 1);
+    let credits = events.iter().find_map(|e| match e {
+        Event::GenerationFinished { credits, .. } => Some(*credits),
+        _ => None,
+    });
+    // Every segment once, plus each discarded dialogue.
+    let all: i64 = segs.iter().map(|s| s.text.chars().count() as i64).sum();
+    assert_eq!(credits, Some(all + all / 6 * sent as i64));
 }
 
 #[test]
@@ -566,6 +616,45 @@ fn automatic_trimming_keeps_the_pauses_between_speakers() {
     // The default 80 ms kept after the speech, of the 200 ms tail (within
     // one 10 ms detector frame).
     assert!((dur(&takes[2]) - end).abs_diff(120) <= 10, "{end}");
+}
+
+#[test]
+fn auto_trim_chapter_keeps_the_pauses_between_speakers() {
+    // Generated with automatic trimming off, then "Auto-trim chapter": the
+    // dialogue's outer edges are trimmed, the cuts between the speakers stay
+    // (a manual trim on the middle take is replaced by "whole", as Auto-trim
+    // chapter replaces manual trims).
+    let (url, _) = fake_eleven(|n, body| dialogue_reply(n, body, &|_| {}));
+    let s = setup(&url, "en", |_| {});
+    let (cid, segs) = import(&s, CHAPTER, &["guard", "vortram"]);
+    rt().block_on(generate(&s.ctx, ids(&segs), false)).unwrap();
+    let para = &segs[1..4];
+    let middle = current(&s.ctx, para[1].id);
+    s.ctx
+        .db(|db| db.set_take_trim(middle.id, Some((10, 200))))
+        .unwrap();
+    let _: Vec<Event> = s.events.try_iter().collect();
+
+    rt().block_on(super::super::autotrim::auto_trim_chapter(&s.ctx, cid))
+        .unwrap();
+    let takes: Vec<Take> = para.iter().map(|seg| current(&s.ctx, seg.id)).collect();
+    let dur = |t: &Take| {
+        crate::trim::duration_ms(&audio::read_wav(&s.lib.audio_path(&t.audio_path)).unwrap())
+    };
+    assert_eq!(takes[0].trim_ms, Some((80, dur(&takes[0]))));
+    assert_eq!(takes[1].trim_ms, None);
+    let (start, end) = takes[2].trim_ms.unwrap();
+    assert_eq!(start, 0);
+    assert!(end < dur(&takes[2]));
+    let info = s
+        .events
+        .try_iter()
+        .find_map(|e| match e {
+            Event::Info(m) => Some(m),
+            _ => None,
+        })
+        .unwrap();
+    assert!(info.contains("1 dialogue takes kept whole"), "{info}");
 }
 
 #[test]
