@@ -396,7 +396,11 @@ impl App {
         let r = self.db.chapters(pid);
         self.chapters = self.try_db(r).unwrap_or_default();
         self.reload_stats();
-        self.reload_retail();
+        // Every chapter's export staleness is a whole-project query: only
+        // while the Retail window shows it (or for another project).
+        if self.retail_needs_reload() {
+            self.reload_retail();
+        }
     }
 
     fn reload_stats(&mut self) {
@@ -480,7 +484,7 @@ impl App {
         }
         .filter(|_| !self.view.segments.is_empty());
         self.takes_for = None;
-        self.reload_cost_stats();
+        self.cost_stats_for_view();
         self.reload_checks();
         self.reload_trims();
     }
@@ -514,6 +518,7 @@ impl App {
                     total,
                 } => {
                     self.segmenting = Some((chapter_id, done, total));
+                    self.reload_cost_stats();
                 }
                 Event::SegmentationFinished {
                     chapter_id,
@@ -524,6 +529,7 @@ impl App {
                 } => {
                     self.segmenting = None;
                     self.dirty = true;
+                    self.reload_cost_stats();
                     let title = self.chapter_title(chapter_id);
                     let tokens = format!("{input_tokens} input / {output_tokens} output tokens");
                     let msg = if fallback_paragraphs > 0 {
@@ -543,6 +549,7 @@ impl App {
                     total,
                 } => {
                     self.directing = Some((chapter_id, done, total));
+                    self.reload_cost_stats();
                 }
                 Event::DirectionFinished {
                     chapter_id,
@@ -553,6 +560,7 @@ impl App {
                 } => {
                     self.directing = None;
                     self.dirty = true;
+                    self.reload_cost_stats();
                     let rejected = if rejected > 0 {
                         format!(", {rejected} suggestions rejected for changing the text")
                     } else {
@@ -603,6 +611,8 @@ impl App {
                     if self.in_flight.is_empty() {
                         self.generating = None;
                     }
+                    // New takes teach the credit rate.
+                    self.reload_cost_stats();
                     self.note(
                         failed > 0,
                         format!(

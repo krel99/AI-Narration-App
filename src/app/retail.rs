@@ -24,9 +24,14 @@ pub(super) struct RetailUi {
     state: RetailState,
     state_for: Option<Id>,
     sample: Option<SampleDialog>,
-    /// The last cover inspected, by resolved path (covers in the library
-    /// are named by content, so a new picture gets a new path).
-    cover: Option<(PathBuf, Result<CoverInfo, String>)>,
+    /// Covers inspected, by resolved path (covers in the library are named
+    /// by content, so a new picture gets a new path). Several, because
+    /// Project settings (a cover just chosen) and the Retail window (the
+    /// stored one) can show different files in the same frame.
+    covers: HashMap<PathBuf, Result<CoverInfo, String>>,
+    /// Natural width of the chapter grid (last frame), so the window opens
+    /// wide enough for it when the screen allows.
+    grid_w: f32,
     /// Silence trims of the open chapter's takes, for its report's
     /// fingerprint (refreshed with the view and on every trim edit).
     pub(super) trims: HashMap<Id, (u32, u32)>,
@@ -40,6 +45,9 @@ struct SampleDialog {
     from_selected: bool,
     minutes: f32,
     sources: Result<Vec<SampleSource>, String>,
+    /// Frames left in which the dialog is raised again (opened, or asked
+    /// for again, by a click on the Retail window).
+    raise: u8,
 }
 
 /// Width of the chapter titles in the Retail & ACX grid.
@@ -83,7 +91,7 @@ fn checks_tooltip(r: &FileReport, stale: bool) -> String {
 impl App {
     fn cover_info(&mut self, publication: &Publication) -> Option<Result<CoverInfo, String>> {
         let path = retail::cover_file(&self.lib.root, &publication.cover_path)?;
-        Some(cached_cover(&mut self.retail.cover, path))
+        Some(cached_cover(&mut self.retail.covers, path))
     }
 
     /// Reload the stored checks (after exports, on project changes).
@@ -133,8 +141,19 @@ impl App {
         }
     }
 
+    /// The Retail & ACX window (which covers most of Review) or the sample
+    /// dialog is open: Review's keys stay off, so A or R cannot approve or
+    /// re-roll (and pay for) a segment the user cannot see.
     pub(super) fn retail_dialog_open(&self) -> bool {
-        self.retail.sample.is_some()
+        self.retail.open || self.retail.sample.is_some()
+    }
+
+    /// Whether the stored checks need reading on this reload: only while
+    /// the Retail window shows them, or for another project. The ACX chip
+    /// compares the open chapter with the segments on screen, and reports
+    /// change only on exports (AcxChecked reloads them).
+    pub(super) fn retail_needs_reload(&self) -> bool {
+        self.retail.open || self.retail.state_for != self.project.as_ref().map(|p| p.id)
     }
 
     pub(super) fn on_acx_checked(&mut self, summary: String, verdict: Verdict) {
@@ -219,10 +238,17 @@ impl App {
         let mut sample = false;
         let can_sample =
             self.view.chapter_id.is_some() && !self.view.segments.is_empty() && !self.exporting;
+        // Never wider than the window (the minimum is 900 px): the grid
+        // scrolls sideways instead, so the Result column stays reachable.
+        let room = (ctx.content_rect().width() - 40.0).max(400.0);
         egui::Window::new("Retail & ACX")
             .open(&mut open)
-            .default_width(1000.0)
-            .default_pos([160.0, 90.0])
+            .default_width(1000.0_f32.min(room))
+            .max_width(room)
+            .default_pos([
+                (ctx.content_rect().width() - 1000.0_f32.min(room)).clamp(0.0, 160.0),
+                90.0,
+            ])
             .show(ctx, |ui| {
                 let p = *theme::palette(ui);
                 ui.label(
@@ -246,10 +272,14 @@ impl App {
                         ui.add(egui::Label::new(RichText::new(acx::POLICY_NOTE).small()).wrap());
                     });
                 ui.add_space(8.0);
-                egui::ScrollArea::vertical()
+                // As wide as the grid where the screen allows; narrower
+                // windows scroll it sideways.
+                let grid = egui::ScrollArea::both()
                     .max_height(360.0)
                     .auto_shrink([false, true])
+                    .min_scrolled_width(self.retail.grid_w.min(room - 40.0).max(64.0))
                     .show(ui, |ui| self.chapter_grid(ui, &chapters));
+                self.retail.grid_w = grid.content_size.x;
                 ui.add_space(8.0);
                 ui.label(RichText::new("BOOK").small().strong().color(p.muted));
                 for c in &book_checks {
@@ -320,9 +350,11 @@ impl App {
             .num_columns(10)
             .spacing([14.0, 6.0])
             .show(ui, |ui| {
+                // The verdict right after the title: in a narrow window the
+                // measurements scroll, the result stays in view.
                 for h in [
-                    "#", "Chapter", "Length", "RMS", "Peak", "Floor", "Head", "Tail", "Format",
-                    "Result",
+                    "#", "Chapter", "Result", "Length", "RMS", "Peak", "Floor", "Head", "Tail",
+                    "Format",
                 ] {
                     ui.label(RichText::new(h).small().strong().color(p.muted));
                 }
@@ -346,6 +378,25 @@ impl App {
                         ui.end_row();
                         continue;
                     };
+                    let stale = self.report_stale(c.id, r);
+                    let v = r.verdict();
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!("{} {}", v.symbol(), v.word()))
+                                .strong()
+                                .color(verdict_color(&p, v)),
+                        )
+                        .on_hover_text(checks_tooltip(r, stale));
+                        if r.draft {
+                            ui.label(RichText::new("draft").small().color(p.muted));
+                        }
+                        if stale {
+                            ui.label(RichText::new("outdated").small().color(p.warning))
+                                .on_hover_text(
+                                    "Takes or approvals changed after this export; export again to re-check.",
+                                );
+                        }
+                    });
                     for key in ["length", "rms", "peak", "floor", "head", "tail"] {
                         match r.check(key) {
                             Some(c) => {
@@ -384,25 +435,6 @@ impl App {
                         .collect();
                     ui.label(RichText::new(format).color(verdict_color(&p, fv)))
                         .on_hover_text(format_notes.join("\n"));
-                    let stale = self.report_stale(c.id, r);
-                    let v = r.verdict();
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            RichText::new(format!("{} {}", v.symbol(), v.word()))
-                                .strong()
-                                .color(verdict_color(&p, v)),
-                        )
-                        .on_hover_text(checks_tooltip(r, stale));
-                        if r.draft {
-                            ui.label(RichText::new("draft").small().color(p.muted));
-                        }
-                        if stale {
-                            ui.label(RichText::new("outdated").small().color(p.warning))
-                                .on_hover_text(
-                                    "Takes or approvals changed after this export; export again to re-check.",
-                                );
-                        }
-                    });
                     ui.end_row();
                 }
             });
@@ -448,6 +480,7 @@ impl App {
             selected,
             minutes: (retail::SAMPLE_DEFAULT_MS / 60_000) as f32,
             sources,
+            raise: 2,
         });
     }
 
@@ -462,11 +495,14 @@ impl App {
         let mut go = false;
         let mut cancel = ctx.input(|i| i.key_pressed(egui::Key::Escape));
         let exporting = self.exporting;
-        egui::Window::new("Retail sample")
+        // Above the Retail & ACX window it belongs to: a click there (which
+        // raises that window) must not bury it.
+        let shown = egui::Window::new("Retail sample")
             .collapsible(false)
             .resizable(false)
+            .order(egui::Order::Foreground)
             .default_width(460.0)
-            .anchor(egui::Align2::CENTER_TOP, [0.0, 110.0])
+            .default_pos([(ctx.content_rect().center().x - 230.0).max(0.0), 110.0])
             .show(ctx, |ui| {
                 let p = *theme::palette(ui);
                 ui.set_max_width(460.0);
@@ -570,6 +606,12 @@ impl App {
                     cancel |= ui.button("Cancel").clicked();
                 });
             });
+        if d.raise > 0 {
+            d.raise -= 1;
+            if let Some(r) = &shown {
+                ctx.move_to_top(r.response.layer_id);
+            }
+        }
         if go {
             let d = self.retail.sample.take().expect("dialog open");
             let start_segment = d.selected.filter(|_| d.from_selected).map(|s| s.0);
@@ -602,17 +644,20 @@ impl App {
     }
 }
 
+/// The cover check of `path`, read from disk once per path (it reads the
+/// whole file, which can be large, on the UI thread).
 fn cached_cover(
-    cache: &mut Option<(PathBuf, Result<CoverInfo, String>)>,
+    cache: &mut HashMap<PathBuf, Result<CoverInfo, String>>,
     path: PathBuf,
 ) -> Result<CoverInfo, String> {
-    if let Some((p, r)) = cache
-        && *p == path
-    {
+    if let Some(r) = cache.get(&path) {
         return r.clone();
     }
+    if cache.len() >= 8 {
+        cache.clear();
+    }
     let r = retail::inspect_cover(&path).map_err(|e| format!("{e:#}"));
-    *cache = Some((path, r.clone()));
+    cache.insert(path, r.clone());
     r
 }
 
@@ -632,7 +677,7 @@ pub(super) fn publication_ui(
     library_root: &std::path::Path,
     state: &mut RetailUi,
 ) {
-    let cover_cache = &mut state.cover;
+    let cover_cache = &mut state.covers;
     let p = *theme::palette(ui);
     ui.add_space(8.0);
     ui.label(RichText::new("PUBLICATION").small().strong().color(p.muted));
@@ -734,4 +779,37 @@ pub(super) fn publication_ui(
         )
         .wrap(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn png(w: u32, h: u32) -> Vec<u8> {
+        let mut d = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+        d.extend(w.to_be_bytes());
+        d.extend(h.to_be_bytes());
+        d.extend([8, 2, 0, 0, 0, 0, 0, 0, 0]);
+        d
+    }
+
+    /// Project settings (a cover just chosen) and the Retail window (the
+    /// stored cover) ask for two files every frame: each is read once.
+    #[test]
+    fn two_covers_shown_together_are_each_read_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("new.png"), dir.path().join("stored.png"));
+        std::fs::write(&a, png(3000, 3000)).unwrap();
+        std::fs::write(&b, png(2400, 2400)).unwrap();
+        let mut cache = HashMap::new();
+        for _ in 0..3 {
+            assert_eq!(cached_cover(&mut cache, a.clone()).unwrap().width, 3000);
+            assert_eq!(cached_cover(&mut cache, b.clone()).unwrap().width, 2400);
+        }
+        // Still answered from the cache once the files are gone.
+        std::fs::remove_file(&a).unwrap();
+        std::fs::remove_file(&b).unwrap();
+        assert_eq!(cached_cover(&mut cache, a).unwrap().width, 3000);
+        assert_eq!(cached_cover(&mut cache, b).unwrap().width, 2400);
+    }
 }

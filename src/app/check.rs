@@ -193,7 +193,14 @@ impl App {
     pub(super) fn check_toolbar(&mut self, ui: &mut egui::Ui, chapter_id: Id) {
         let (done, total) = self.check.progress;
         if total > 0 {
-            ui.add(egui::Spinner::new());
+            // A still bar, not a spinner: a spinner repaints the whole window
+            // every frame, for the hours a book's check can take, competing
+            // with the idle-priority transcription. Progress events repaint.
+            ui.add(
+                egui::ProgressBar::new(done as f32 / total as f32)
+                    .desired_width(60.0)
+                    .desired_height(6.0),
+            );
             ui.label(format!("Checking takes {done}/{total}"))
                 .on_hover_text("Transcribing on this computer at low priority");
             if ui.small_button("Stop").clicked() {

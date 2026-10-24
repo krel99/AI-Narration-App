@@ -40,6 +40,8 @@ pub(super) struct CostState {
     /// every frame; the rate only changes with new takes or list rates, so
     /// it is read from the database on reload, not per frame.
     rate: Option<(String, CreditRate)>,
+    /// The chapter `usage` was read for.
+    usage_for: Option<Id>,
 }
 
 impl App {
@@ -136,7 +138,12 @@ impl App {
         }
     }
 
+    /// Read the open chapter's Claude usage and the credit rate. They change
+    /// only with Claude passes and new takes, so this runs when the chapter
+    /// changes and on those events, not on every segment change (each
+    /// generated take reloads the view).
     pub(super) fn reload_cost_stats(&mut self) {
+        self.costs.usage_for = self.view.chapter_id;
         self.costs.usage = match self.view.chapter_id {
             Some(cid) => self.db.chapter_llm_usage(cid).unwrap_or_else(|e| {
                 log::warn!("Claude usage: {e:#}");
@@ -145,6 +152,13 @@ impl App {
             None => vec![],
         };
         self.refresh_credit_rate();
+    }
+
+    /// On a view reload: only when another chapter is open.
+    pub(super) fn cost_stats_for_view(&mut self) {
+        if self.costs.usage_for != self.view.chapter_id {
+            self.reload_cost_stats();
+        }
     }
 
     fn refresh_credit_rate(&mut self) {
