@@ -10,9 +10,9 @@ A native Linux desktop app that turns long prose into multi-voice narration thro
 - Single user, local only. No server, no accounts.
 - One language per project, chosen by the user. Not multilingual.
 - The user assigns an ElevenLabs voice ID to every speaker, including the narrator.
-- Speaker attribution is done by an LLM (Claude API).
-- API calls draw from the user's ElevenLabs subscription credits first, then pay-as-you-go balance. Every re-roll costs the segment's full character count again.
-- Status: planning complete, implementation starts in a new repo.
+- Speaker attribution is done by an LLM (Claude, through the user's Claude Code subscription by default, or the Claude API).
+- API calls draw from the user's ElevenLabs subscription credits first, then pay-as-you-go balance. Every re-roll costs the segment's characters again, at the plan's rate.
+- Status: implemented; the notes below record how each build settled the plan.
 
 ## Segmentation rules
 
@@ -137,10 +137,13 @@ Open decisions:
 
 ---
 
-## Implementation notes (first build)
+## Implementation notes
 
-How the first implementation resolves or defers each open item, and where it
-goes beyond the plan. Everything below is a default that can be changed.
+How the implementation resolves or defers each open item, and where it goes
+beyond the plan. Sections marked "added after the first build" describe the
+features built later (in two parallel lanes, then merged; see
+[Integration](#integration-of-the-later-features)). Everything below is a
+default that can be changed.
 
 ### Open decisions
 
@@ -472,9 +475,11 @@ chapter) and a short retail sample clip."
   = 0 OR export_report.draft = 1`), so `ACX report.md` keeps describing the
   delivery file and the status line says so. Each row also keeps
   `takes_key`, a hash of the chapter's segments in order with their current
-  take and approval at export time (`retail::takes_key`); the report is
-  "outdated" when that no longer matches (a new take, an older take picked
-  again, an approval changed, segments re-split). The open chapter's chip
+  take, approval and the take's silence trim at export time
+  (`retail::takes_key`); the report is "outdated" when that no longer
+  matches (a new take, an older take picked again, an approval or a trim
+  changed, segments re-split). An untrimmed take hashes as it did before
+  trims existed, so older keys keep matching. The open chapter's chip
   compares against the segments on screen, so it follows an approval at
   once. Rows without a key fall back to "a take was created after
   `checked_at`".
@@ -531,8 +536,13 @@ so "0 ms within a paragraph" did not give even gaps.
   the range is never empty or inverted.
 - **Applying** is a cut plus a linear fade-in and fade-out (10 ms, at most half
   the kept length), done when the audio is loaded. `trim::load_take` is the
-  only loader of a take's audio: single-take playback, paragraph playback and
-  every export go through it. A stale or invalid trim plays the whole take.
+  only loader of a take's audio: single-take playback, paragraph playback,
+  every chapter and book export (so the ACX measurements too) and the retail
+  sample go through it; the sample planner sizes takes with
+  `trim::take_duration_ms`, which reads only the WAV header and applies the
+  same range rule. The take check is the one deliberate exception: it judges
+  the generated audio, untrimmed. A stale or invalid trim plays the whole
+  take.
 - **Automatic trimming** of new takes is off by default
   (`ProjectSettings.trim.enabled`). When it is on, the worker trims each newly
   stored take on the blocking pool. This includes cache-hit takes created for
@@ -772,9 +782,13 @@ verified research (`plan/research/eleven-dialogue.verify.md`).
   settings, model, seed and output format (`take.dialogue_group`, a new
   nullable column with an idempotent migration), and per take a hash of the
   group and the input index, which never equals a text-to-speech hash.
-  Every take carries the dialogue's request id. The credits (header, or the
-  characters as an inexact estimate) are split over the takes in proportion
-  to their characters, largest remainder first, so they sum exactly.
+  Every take carries the dialogue's request id. The credits (the header, or
+  an inexact estimate at the learned rate, `Db::credit_rate`, exactly as for
+  a text-to-speech take) are split over the takes in proportion to their
+  characters, largest remainder first, so they sum exactly. Each new take
+  records its model and spoken characters (`record_take_cost`), so exact
+  dialogue takes teach the learned rate and estimated ones never do. A
+  billed dialogue that is discarded is reported at the same rate.
 - **Cache.** If every take of an identical paragraph exists with its file,
   they are reused without a request (the segment's own row, or a new free
   row). If only part of it is left, the paragraph is generated under a
@@ -793,6 +807,43 @@ Not verified here (api.elevenlabs.io was unreachable): real responses, how
 precise v4's voice-segment timings are, how the server counts non-ASCII
 characters, whether `character-cost` is sent on dialogue, and the cut
 thresholds, which were tuned on synthetic audio.
+
+### Integration of the later features
+
+The six later features were built in two lanes (A: Claude Code and costs,
+voice picker, retail export; B: silence trimming, take check, multi-speaker
+dialogue) and merged. Where they meet:
+
+- **Credits.** Dialogue takes use lane A's bookkeeping (above). The Generate
+  confirmation is one dialog: lane A's estimate (credits, money, share of
+  the balance, the rate's basis) covers the dialogue paragraphs too, since
+  dialogue is billed by the same characters, and lane B's note adds what
+  re-generating the largest dialogue paragraph per segment would bill again
+  and that a run stops using dialogue after `MAX_DISCARDED_PER_RUN`
+  discarded dialogues.
+- **Trims everywhere.** Lane A's mastering and retail sample load takes
+  through `trim::load_take`; ACX reports go outdated when a trim changes.
+- **Take check.** Every new take row is queued once: per-segment takes and
+  cache-hit rows from `generate_one` (after lane A's cost bookkeeping and
+  the automatic trim) and every take of a dialogue paragraph, including
+  reused ones. The queue de-duplicates by take id.
+- **Claude.** The default backend is Claude Code (the user's request); see
+  the Claude Code section. `LlmError` messages name the transport.
+- **Errors.** Export failures come as `Event::ExportFailed`, the only event
+  that ends the UI's export state; every other job reports through
+  `Event::Error`, which no longer touches it.
+- **UI.** The Review toolbar's chips wrap as whole widgets (review state,
+  costs, delivery); the top bar compacts below 1180 px, so the 900x560
+  minimum has no overlaps. The detail panel's default height follows the
+  window (60%, at most 440 px), enough for the waveform and the take
+  check's summary at 1400x900. Settings (Claude, ElevenLabs, money, take
+  checking) and Project settings (general, voice, tags, dialogue, silences,
+  trimming, Claude, publication) scroll inside the window with Save always
+  visible.
+- **Not tracked.** The fade length and other project settings changed after
+  an export do not mark its report outdated, and a discarded dialogue's
+  credits appear in the run's summary and the log, not in the chapter's
+  take total.
 
 ### To verify against a real account
 
