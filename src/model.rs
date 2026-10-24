@@ -206,6 +206,8 @@ pub struct ProjectSettings {
     pub silence: SilenceSettings,
     pub segmentation: SegmentationSettings,
     pub audio_tags: AudioTagSettings,
+    /// Book metadata, cover and delivery options for the retail export.
+    pub publication: crate::retail::Publication,
 }
 
 impl Default for ProjectSettings {
@@ -218,6 +220,7 @@ impl Default for ProjectSettings {
             silence: SilenceSettings::default(),
             segmentation: SegmentationSettings::default(),
             audio_tags: AudioTagSettings::default(),
+            publication: Default::default(),
         }
     }
 }

@@ -21,6 +21,7 @@ use crate::tts::VoiceInfo;
 use crate::worker::{self, Command, Event, WorkerHandle};
 
 mod costs;
+mod retail;
 mod voice_picker;
 
 const ROW_H: f32 = 46.0;
@@ -176,6 +177,7 @@ pub struct App {
     dialogs: Dialogs,
     costs: costs::CostState,
     voice_ui: voice_picker::VoiceUi,
+    retail: retail::RetailUi,
 }
 
 fn status_icon(s: SegmentStatus, p: &Palette) -> (&'static str, Color32) {
@@ -278,6 +280,7 @@ impl App {
             dialogs: Dialogs::default(),
             costs: Default::default(),
             voice_ui: Default::default(),
+            retail: Default::default(),
         };
         if let Some(e) = app.player.error.clone() {
             app.note(true, e);
@@ -370,6 +373,7 @@ impl App {
         let r = self.db.chapters(pid);
         self.chapters = self.try_db(r).unwrap_or_default();
         self.reload_stats();
+        self.reload_retail();
     }
 
     fn reload_stats(&mut self) {
@@ -608,6 +612,7 @@ impl App {
                 Event::VoicePreview { voice_id, result } => self.on_voice_preview(voice_id, result),
                 Event::Account(info) => self.on_account(info),
                 Event::ClaudeCode(d) => self.on_claude_detection(*d),
+                Event::AcxChecked { summary, verdict } => self.on_acx_checked(summary, verdict),
             }
         }
         if self.dirty {
@@ -874,6 +879,7 @@ impl App {
             || d.delete_project.is_some()
             || d.resegment.is_some()
             || d.resplit
+            || self.retail_dialog_open()
     }
 
     /// Save the Text tab. Returns false if nothing could be saved yet.
@@ -1082,6 +1088,7 @@ impl App {
                         }
                         ui.close();
                     }
+                    self.retail_menu_item(ui);
                     if ui
                         .add_enabled(
                             self.draft.chapter_id.is_some(),
@@ -1311,6 +1318,7 @@ impl App {
                     "Credits as reported by ElevenLabs."
                 });
                 self.cost_chips(ui);
+                self.acx_chip(ui);
                 if !self.tags_active() {
                     chip(ui, "model ignores audio tags", p.muted).on_hover_text(
                         "Choose Eleven v4 or v3 in Project settings to perform [tags]",
@@ -1860,6 +1868,7 @@ impl App {
         self.dialog_split(ctx);
         self.dialog_generate(ctx);
         self.dialog_confirmations(ctx);
+        self.dialog_retail(ctx);
         if self.dialogs.log {
             let mut open = true;
             egui::Window::new("Log")
@@ -2106,6 +2115,7 @@ impl App {
                         ui.add(egui::DragValue::new(&mut g.max_retries).range(0..=5));
                         ui.end_row();
                     });
+                    retail::publication_ui(ui, p, &self.lib.root, &mut self.retail);
                 });
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -2119,7 +2129,8 @@ impl App {
                 });
             });
         if save {
-            let p = self.dialogs.project_settings.take().unwrap();
+            let mut p = self.dialogs.project_settings.take().unwrap();
+            self.store_cover(&mut p);
             let r = self.db.update_project(&p);
             self.try_db(r);
             self.reload_projects();

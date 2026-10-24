@@ -1,6 +1,7 @@
 //! Assemble approved takes into a chapter (or a whole book) and encode the
 //! delivery formats in one ffmpeg pass. Assembly streams straight to a WAV
-//! file so a long book never has to fit in memory.
+//! file so a long book never has to fit in memory. Loudness, tags and cover
+//! art: `export/mastering.rs`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -12,8 +13,9 @@ use crate::audio::{self, Pcm};
 use crate::db::{Db, Library};
 use crate::model::*;
 
-/// loudnorm targets inside ACX limits (RMS -23…-18 dB, peaks below -3 dB).
-const LOUDNORM: &str = "loudnorm=I=-19:TP=-3.5:LRA=11";
+mod mastering;
+pub use mastering::{Mastered, export_sample, sample_file_name, sample_sources};
+
 const OUTPUT_RATE: u32 = 44100;
 /// Placeholder for a missing take in a draft export.
 const GAP_MS: u32 = 1000;
@@ -221,7 +223,7 @@ pub fn ffmpeg_available() -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
-fn export_dir(lib: &Library, project: &Project) -> Result<PathBuf> {
+pub fn export_dir(lib: &Library, project: &Project) -> Result<PathBuf> {
     let dir = lib.exports_dir().join(slug(&project.name));
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
@@ -236,6 +238,10 @@ pub struct ExportResult {
     pub files: Vec<PathBuf>,
     pub gaps: Vec<Id>,
     pub duration_ms: u64,
+    /// The loudness pass and how the delivery file measured.
+    pub mastered: Option<Mastered>,
+    /// Things to tell the user (a missing cover file).
+    pub notes: Vec<String>,
 }
 
 /// Export one chapter as MP3 192 kbps CBR 44.1 kHz (ACX) plus a FLAC master.
@@ -271,52 +277,20 @@ pub fn export_chapter(
 
     let mp3 = dir.join(format!("{base}.mp3"));
     let flac = dir.join(format!("{base}.flac"));
-    let args: Vec<String> = vec![
-        "-hide_banner".into(),
-        "-y".into(),
-        "-i".into(),
-        master.display().to_string(),
-        "-filter_complex".into(),
-        format!("[0:a]{LOUDNORM},aresample={OUTPUT_RATE},asplit=2[mp3][flac]"),
-        "-map".into(),
-        "[mp3]".into(),
-        "-c:a".into(),
-        "libmp3lame".into(),
-        "-b:a".into(),
-        "192k".into(),
-        "-ar".into(),
-        OUTPUT_RATE.to_string(),
-        "-ac".into(),
-        "1".into(),
-        "-metadata".into(),
-        format!("title={}", chapter.title),
-        "-metadata".into(),
-        format!("album={}", project.name),
-        "-metadata".into(),
-        format!("track={}", chapter.order),
-        mp3.display().to_string(),
-        "-map".into(),
-        "[flac]".into(),
-        "-c:a".into(),
-        "flac".into(),
-        "-sample_fmt".into(),
-        "s16".into(),
-        "-metadata".into(),
-        format!("title={}", chapter.title),
-        flac.display().to_string(),
-    ];
-    let result = run_ffmpeg(&args);
+    let result = mastering::encode_chapter(db, lib, project, chapter, &master, &mp3, &flac);
     let _ = std::fs::remove_file(&master);
-    result?;
+    let (mastered, notes) = result?;
     Ok(ExportResult {
         files: vec![mp3, flac],
         gaps: report.gaps,
         duration_ms: report.duration_ms,
+        mastered: Some(mastered),
+        notes,
     })
 }
 
-/// FFMETADATA chapter list for the M4B container.
-pub fn ffmetadata(title: &str, chapters: &[(String, u64, u64)]) -> String {
+/// FFMETADATA for the M4B container: global tags, then the chapter list.
+pub fn ffmetadata(tags: &[(&str, String)], chapters: &[(String, u64, u64)]) -> String {
     let esc = |s: &str| {
         s.chars()
             .flat_map(|c| match c {
@@ -325,7 +299,10 @@ pub fn ffmetadata(title: &str, chapters: &[(String, u64, u64)]) -> String {
             })
             .collect::<String>()
     };
-    let mut s = format!(";FFMETADATA1\ntitle={}\n", esc(title));
+    let mut s = ";FFMETADATA1\n".to_string();
+    for (k, v) in tags {
+        s.push_str(&format!("{k}={}\n", esc(v)));
+    }
     for (t, start, end) in chapters {
         s.push_str(&format!(
             "\n[CHAPTER]\nTIMEBASE=1/1000\nSTART={start}\nEND={end}\ntitle={}\n",
@@ -357,44 +334,20 @@ pub fn export_book(db: &Db, lib: &Library, project: &Project) -> Result<ExportRe
     }
     let duration_ms = w.position_ms();
     w.finish()?;
-    std::fs::write(&meta_path, ffmetadata(&project.name, &marks))?;
+    let tags = project.settings.publication.m4b_tags(&project.name);
+    std::fs::write(&meta_path, ffmetadata(&tags, &marks))?;
 
     let m4b = dir.join(format!("{}.m4b", slug(&project.name)));
-    let args: Vec<String> = vec![
-        "-hide_banner".into(),
-        "-y".into(),
-        "-i".into(),
-        master.display().to_string(),
-        "-i".into(),
-        meta_path.display().to_string(),
-        "-map".into(),
-        "0:a".into(),
-        "-map_metadata".into(),
-        "1".into(),
-        "-map_chapters".into(),
-        "1".into(),
-        "-af".into(),
-        format!("{LOUDNORM},aresample={OUTPUT_RATE}"),
-        "-c:a".into(),
-        "aac".into(),
-        "-b:a".into(),
-        "128k".into(),
-        "-ac".into(),
-        "1".into(),
-        "-movflags".into(),
-        "+faststart".into(),
-        "-f".into(),
-        "mp4".into(),
-        m4b.display().to_string(),
-    ];
-    let result = run_ffmpeg(&args);
+    let result = mastering::encode_book(lib, project, &master, &meta_path, &m4b);
     let _ = std::fs::remove_file(&master);
     let _ = std::fs::remove_file(&meta_path);
-    result?;
+    let (mastered, notes) = result?;
     Ok(ExportResult {
         files: vec![m4b],
         gaps: vec![],
         duration_ms,
+        mastered: Some(mastered),
+        notes,
     })
 }
 
@@ -407,9 +360,10 @@ mod tests {
     #[test]
     fn metadata_escapes_and_lists_chapters() {
         let m = ffmetadata(
-            "My=Book",
+            &[("title", "My=Book".into()), ("comment", "a\nb".into())],
             &[("One; start".into(), 0, 1500), ("Two".into(), 1500, 3000)],
         );
+        assert!(m.contains("comment=a\\\nb\n"));
         assert!(m.starts_with(";FFMETADATA1\ntitle=My\\=Book\n"));
         assert!(m.contains("START=1500\nEND=3000\ntitle=Two"));
         assert!(m.contains("title=One\\; start"));

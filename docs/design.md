@@ -200,10 +200,12 @@ goes beyond the plan. Everything below is a default that can be changed.
 ### Export details
 
 - Chapter export: MP3 192 kbps CBR 44.1 kHz mono plus a FLAC master, both from
-  one ffmpeg call (`loudnorm=I=-19:TP=-3.5:LRA=11`, then `asplit`). The FLAC
-  master is the loudness-normalised version.
+  one ffmpeg call (`asplit`). The FLAC master is the mastered version. The
+  first build normalised with single-pass `loudnorm=I=-19:TP=-3.5:LRA=11`;
+  that is replaced by RMS-targeted gain and a limiter, measured afterwards
+  (see "Retail export" below).
 - Book export: every fully approved chapter in one M4B (AAC 128 kbps) with
-  chapter markers from an FFMETADATA file.
+  chapter markers, book tags and the cover from an FFMETADATA file.
 - Assembly streams to a temporary WAV, so book length is not limited by memory.
 - Draft export uses current takes regardless of approval and fills missing
   audio with 1 s of silence, reporting the number of gaps.
@@ -400,6 +402,94 @@ casting.
 - **Free plan.** When the balance says `tier: free`, the picker notes that
   ElevenLabs may refuse Voice Library voices for API use (reported as 402
   `payment_required`; not verified here).
+
+### Retail export (added after the first build)
+
+Requested: "M4B gets cover art, author and narrator metadata; the app
+produces an ACX compliance report (loudness, peak and noise floor per
+chapter) and a short retail sample clip."
+
+- **Why the loudness pipeline changed.** Single-pass `loudnorm` runs in
+  dynamic mode and targets integrated loudness, not RMS: on test speech the
+  whole-file RMS landed anywhere from -21.3 to -18.2 dB depending on how many
+  pauses a chapter has, 0.2 dB from ACX's ceiling, and the output was never
+  measured. Now (`export/mastering.rs`): measure the assembly WAV's RMS in
+  Rust, then one ffmpeg call with `volume=<-20 - RMS>dB,alimiter=limit=0.6310
+  (-4 dBFS):level=false:latency=true:attack=5:release=50,aresample=44100`
+  (`level=false` matters: alimiter's default auto-level would push the RMS to
+  about -16 dB). The encoded file is measured; outside -22.5…-18.5 dB RMS or
+  above -3.5 dB peak it is encoded once more with a corrected gain (and a
+  lower ceiling if the peak overshot). LAME 192k lowers RMS by about 0.26 dB,
+  which the measurement on the encoded file absorbs. The gain is clamped to
+  ±30 dB; a silent file gets none.
+- **Room tone.** Assembly inserts digital zeros, whose floor measures -inf
+  and which ACX Check calls "dead silence". `Publication.room_tone` (on by
+  default) mixes `anoisesrc=color=pink:amplitude=0.0012:seed=7`
+  (about -72.7 dB RMS, a -73.4 dB floor) in after the gain stage (`amix
+  duration=first normalize=0`, both set explicitly), so the floor does not
+  move with the gain, and after the sample's fades, so faded ends do not
+  measure as silence. Whether ACX rejects digital silence is not verified.
+- **Meter** (`acx.rs`). ffmpeg decodes to mono 44.1 kHz f32 on stdout
+  (stderr is discarded, so a chatty decode cannot block). Per 50 ms block it
+  keeps n, Σx and Σx²: whole-file RMS with the DC offset removed (variance),
+  sample peak, noise floor = the quietest 0.5 s window at a 0.1 s hop over
+  complete blocks (whole file when shorter), head and tail = runs of blocks
+  below -50 dBFS mean square, the last block counted by its real length.
+  This is the ACX Check plugin's method (McCown: RMS of the quietest 500 ms;
+  Daulton: 0.4 s, 0.1 s hop). ffmpeg's astats `Noise floor dB` is a minimum
+  of windowed peak maxima and reads -inf on real room tone, so it is not
+  used. The peak is taken before DC removal (Daulton does not remove DC).
+- **Checks.** RMS: pass -23…-18, warning -25…-23 and -18…-16, fail beyond.
+  Peak: fail above -3, pass -6…-3, warning -9…-6, fail below -9. Floor:
+  fail above -60, warning below -90 or -inf. Head/tail room tone: fail above
+  5 s (ACX's Dec 2021 rule), warning below 0.5 s (head) or 1 s (tail); the
+  legacy "0.5–1 s head" rule is not enforced because the operative rule is
+  the 5 s limit and the measured head is about 1.05 s with the 750 ms
+  lead-in (takes carry their own leading silence). ffprobe: codec mp3,
+  44.1 kHz, ≥192 kbps (the audio stream's bit rate; the format's includes the
+  cover). CBR: the first frame's `Info` tag (ffmpeg rewrites `Xing` to
+  `Info` when no frame's rate differed); `Xing`/`VBRI` fail, no tag warns.
+  Length: fail above 120 min, warning above 119; size: fail above 170 MB.
+  Samples: no head/tail check, fail above 5 min, warning under 1 min. A
+  report "passes" only when every line passes.
+- **Storage.** `export_report` (one row per chapter, the latest export,
+  draft or not, `ON DELETE CASCADE`) and `retail_sample` (one per project,
+  the source chapter `ON DELETE SET NULL`), created with `CREATE TABLE IF NOT
+  EXISTS` from `db/retail.rs`. -inf levels are stored as NULL. Each row keeps
+  its checks as JSON. A report is "outdated" when a take of the chapter was
+  created after `checked_at` (picking an older take is not detected).
+- **Tags** (`retail.rs`). ID3v2.3 (`-id3v2_version 3 -write_id3v1 1`):
+  title, album, artist, album_artist, composer (narrator), genre, date
+  (TYER), track n/N (position among the project's chapters), publisher
+  (TPUB), copyright (TCOP), TIT3 (subtitle); description is left out because
+  ffmpeg cannot write COMM. Cover: `-c:v copy -disposition:v:0 attached_pic`
+  with stream comment "Cover (front)" (APIC type 3); never re-encoded. FLAC:
+  the same as Vorbis comments plus the picture. M4B: FFMETADATA with title,
+  album (title: subtitle, as Audiobookshelf writes it), artist,
+  album_artist, composer, genre, date, comment/description/synopsis,
+  copyright, `media_type=2` (stik Audiobook), chapters; `-brand "M4B "`.
+  ffmpeg drops `publisher` for MP4, so the copyright line falls back to
+  "© year publisher". Narrator display in Apple Books is not verified
+  (ffmpeg cannot write ©nrt).
+- **Cover check.** `imagesize` (jpeg, png features) for type and size; the
+  colour model from the first JPEG SOFn component count (3 RGB/YCbCr, 4
+  CMYK, 1 grey) or the PNG IHDR colour type. Warnings only. The chosen file
+  is copied to `<library>/covers/project-<id>-<10 hex of its content>.<ext>`
+  on Save; a cover that went missing is reported and the export continues
+  without art.
+- **Retail sample.** Planned from the chapter's segments and their current
+  takes' WAV headers (pure `retail::plan_sample`, shown live in the dialog):
+  from the selected segment or the chapter start, the same pauses as the
+  chapter, 0.5 s room tone before and 1 s after, up to the chosen length
+  (1–5 min), ending at the last paragraph end that fits, else the last
+  segment, else cut inside a single long segment. It stops before the first
+  segment that is not approved (or whose take cannot be read). Fades 0.5 s
+  in and 3 s out on the voice. The worker plans again from the database.
+- **Report.** `ACX report.md` (one table, the book-level checks, the
+  sample, every problem in words, the rules and the policy note) is
+  rewritten after every chapter and sample export. The profile is called
+  "ACX/Findaway technical spec", and the AI-narration policy note is
+  information only.
 
 ### To verify against a real account
 

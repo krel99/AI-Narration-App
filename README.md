@@ -23,8 +23,8 @@ Requirements:
 
 - Rust 1.95 or newer (eframe 0.37 requires it)
 - Build dependencies: `pkg-config`, `libasound2-dev` (ALSA headers for audio playback)
-- Runtime: `ffmpeg` with `libmp3lame` on `PATH` (export only), and a desktop
-  session (X11 or Wayland)
+- Runtime: `ffmpeg` with `libmp3lame`, and `ffprobe`, on `PATH` (export and
+  its ACX checks only), and a desktop session (X11 or Wayland)
 
 ```sh
 sudo apt install pkg-config libasound2-dev ffmpeg   # Debian/Ubuntu
@@ -32,8 +32,8 @@ cargo build --release
 ./target/release/narration-studio
 ```
 
-Run the tests with `cargo test`. The export test also encodes with ffmpeg when
-it is installed. The pipeline tests drive the workers against local fake
+Run the tests with `cargo test`. The export tests also encode with ffmpeg and
+inspect the files with ffprobe when they are installed. The pipeline tests drive the workers against local fake
 Claude and ElevenLabs servers, so they need no API keys.
 
 ## Setup
@@ -168,6 +168,63 @@ ways to run it:
    available in the take picker.
 6. **Export chapter** once every segment is approved, or use **Draft export**
    at any time. **Export book (M4B)** combines all fully approved chapters.
+   Every export is mastered and checked against the ACX spec (see
+   [Retail export](#retail-export)).
+
+## Retail export
+
+Exports are ready for retail: loudness to the ACX spec, the book's metadata
+and cover art in every file, an ACX report and a retail sample
+([screenshot](docs/screenshots/retail.png)).
+
+- **Publication** (Project settings): title (the project name when empty),
+  subtitle, author, narrator, publisher, year, genre (`Audiobook`),
+  copyright and description, plus the cover. *Choose…* picks a JPG or PNG;
+  on *Save* it is copied into the library (`covers/`). The dialog checks the
+  picture without opening it: ACX wants it square, at least 2400×2400 px,
+  RGB (not CMYK, greyscale or palette), at most 8 MB. Anything else gets an
+  amber note; the cover is used anyway.
+- **What goes into the files.** Chapter MP3s get ID3v2.3 tags: chapter
+  title, book title as album, author as artist and album artist, narrator as
+  composer, track *n/N*, genre, year, publisher, copyright, subtitle, and the
+  cover (*Embed the cover in the chapter MP3s* can turn that off, in case a
+  retailer's uploader objects). The FLAC masters get the same tags and the
+  cover. The M4B gets the book's tags (album carries the subtitle,
+  `media_type` marks it as an audiobook, the publisher goes into the
+  copyright line because MP4 has no publisher field), the cover and the
+  chapter markers.
+- **Loudness.** Each file is brought to -20 dB RMS under a -4 dB limiter,
+  encoded, and measured again; one correction pass follows if it landed
+  outside -22.5…-18.5 dB RMS or above -3.5 dB peak. *Room tone* (on by
+  default) lays a very quiet pink-noise bed (about -73 dB) under the audio,
+  so pauses are room tone instead of digital silence, which ACX Check flags
+  as "dead silence".
+- **ACX report.** After every chapter export the MP3 is measured and checked:
+  RMS -23…-18 dB, peak at most -3 dB, noise floor (the quietest half second)
+  at most -60 dB, 44.1 kHz, 192 kbps constant bit rate, at most 120 minutes
+  and 170 MB, and 0.5–5 s of room tone at the start and 1–5 s at the end.
+  Each check is *pass*, *warning* (close, or worth a look) or *fail*, with
+  the bands of the ACX Check plugin. The Review toolbar shows the open
+  chapter's result (*ACX ✓*, *ACX ⚠ …*, *ACX ✗ RMS -24.1*; *draft* and
+  *outdated* when it came from a draft export or takes changed since);
+  hover for every check, click for the **Retail & ACX** window (also in the
+  ⋯ menu), which lists all chapters, the book-level checks (cover, mono or
+  stereo throughout, retail sample, opening and closing credits) and opens
+  the export folder. `ACX report.md` in the export folder has the same
+  table and is rewritten after every export.
+- **Retail sample.** *Export retail sample…* in that window builds
+  `<Book title> - Retail Sample.mp3` from approved takes only, starting at
+  the segment selected in Review (or the chapter start), 1 to 5 minutes
+  (3 by default), ending at a paragraph end where it can, faded in over
+  0.5 s and out over 3 s, mastered and tagged like the chapters. If the
+  range reaches a segment that is not approved, the sample stops before it
+  and says so. ACX wants up to 5 minutes from the book itself (not the
+  credits) and recommends the opening.
+- **What this is not.** The checks cover the technical audio spec
+  ("ACX/Findaway technical spec"), not acceptance. ACX does not accept
+  unauthorized AI or text-to-speech narration; Findaway Voices by Spotify
+  accepts ElevenLabs narration and labels it as digitally narrated. Nothing
+  here blocks an export.
 
 ### Keyboard
 
@@ -187,9 +244,10 @@ All state lives in one library directory (default
 
 ```
 library.sqlite              projects, characters, chapters, paragraphs, segments, takes,
-                            Claude usage, credit rates
+                            Claude usage, credit rates, ACX checks of the exports
 audio/<take_hash>.wav       every take, 16-bit mono PCM (opens in Audacity)
-exports/<project>/          chapter MP3 + FLAC, book M4B
+exports/<project>/          chapter MP3 + FLAC, book M4B, retail sample, ACX report.md
+covers/                     cover art copied in from Project settings
 claude-cwd/                 empty working directory for Claude Code runs
 voice-previews/             downloaded voice previews (<voice_id>-<url hash>.mp3)
 ```
@@ -207,11 +265,13 @@ Every pipeline stage resumes from this state after a restart.
 | `src/costs.rs` | Claude prices, credit-rate learning, token and credit estimates, number formats |
 | `src/tts.rs` | ElevenLabs text-to-speech (`tts/account.rs`: balance and model rates; `tts/voices.rs`: your voices, lookups by id, preview downloads) |
 | `src/voices.rs` | Voice picker search and filters, "used by", preview sources and the preview cache |
-| `src/worker.rs` | Command/event channels, segmentation pass, TTS worker pool, export jobs |
-| `src/db.rs` | SQLite schema and queries (`db/costs.rs`: usage and rate tables) |
+| `src/worker.rs` | Command/event channels, segmentation pass, TTS worker pool, export jobs (`worker/retail.rs`: exports with their ACX checks) |
+| `src/db.rs` | SQLite schema and queries (`db/costs.rs`: usage and rate tables; `db/retail.rs`: export reports) |
 | `src/audio.rs` | PCM/WAV handling, MP3-fallback decode |
-| `src/export.rs` | Streaming assembly with silences; ffmpeg loudnorm and encode |
+| `src/export.rs` | Streaming assembly with silences (`export/mastering.rs`: loudness, tags, cover art, retail sample) |
+| `src/acx.rs` | ACX meter (RMS, peak, noise floor, room tone), ffprobe and CBR checks, pass/warning/fail bands, `ACX report.md` |
+| `src/retail.rs` | Publication metadata and tag mapping, cover checks, retail-sample planning, book-level checks |
 | `src/hash.rs` | Take hash |
 | `src/player.rs` | rodio playback queue |
-| `src/app.rs` | egui UI (Text and Review tabs, dialogs; `app/costs.rs`: balance, estimates, Claude settings; `app/voice_picker.rs`: voice picker and previews) |
+| `src/app.rs` | egui UI (Text and Review tabs, dialogs; `app/costs.rs`: balance, estimates, Claude settings; `app/voice_picker.rs`: voice picker and previews; `app/retail.rs`: Publication settings, ACX chip, Retail & ACX window, retail sample) |
 | `src/theme.rs` | Light (default) and dark themes, semantic colours |

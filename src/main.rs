@@ -1,5 +1,6 @@
 //! Narration Studio: multi-voice audiobook narration with per-segment review.
 
+mod acx;
 mod app;
 mod audio;
 mod claude_code;
@@ -12,6 +13,7 @@ mod lang;
 mod llm;
 mod model;
 mod player;
+mod retail;
 mod segment;
 mod tags;
 mod theme;

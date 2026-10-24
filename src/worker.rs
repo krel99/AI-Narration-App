@@ -15,7 +15,6 @@ use tokio::sync::Semaphore;
 
 use crate::audio;
 use crate::db::{Db, Library, NewTake};
-use crate::export;
 use crate::hash::take_hash;
 use crate::lang;
 use crate::llm::{self, ClaudeClient, LlmError, PromptParagraph};
@@ -26,6 +25,7 @@ use crate::tts::{ElevenLabsClient, TtsError, TtsRequest, VoiceInfo};
 
 mod account;
 mod claude;
+mod retail;
 mod voices;
 
 /// Seed of a segment's first take. Fixed, so identical lines with the same
@@ -65,6 +65,13 @@ pub enum Command {
     },
     ExportBook {
         project_id: Id,
+    },
+    /// "<Book title> - Retail Sample.mp3" from approved takes, starting at
+    /// `start_segment` (or the chapter start), at most `max_ms` long.
+    ExportSample {
+        chapter_id: Id,
+        start_segment: Option<Id>,
+        max_ms: u64,
     },
     /// The voices in the user's account (answered by `Event::Voices`).
     FetchVoices,
@@ -156,6 +163,12 @@ pub enum Event {
     },
     Account(crate::tts::account::AccountInfo),
     ClaudeCode(Box<crate::claude_code::Detection>),
+    /// An exported chapter (or, without a chapter, the retail sample) was
+    /// checked against the ACX/Findaway spec; the report is stored.
+    AcxChecked {
+        summary: String,
+        verdict: crate::acx::Verdict,
+    },
 }
 
 pub struct WorkerHandle {
@@ -296,40 +309,14 @@ async fn run(ctx: &Ctx, cmd: Command) -> Result<()> {
             reroll,
         } => generate(ctx, segment_ids, reroll).await,
         Command::ExportChapter { chapter_id, draft } => {
-            let lib = ctx.lib.clone();
-            let res = tokio::task::spawn_blocking(move || -> Result<export::ExportResult> {
-                let db = lib.open()?;
-                let chapter = db.chapter(chapter_id)?;
-                let project = db.project(chapter.project_id)?;
-                let res = export::export_chapter(&db, &lib, &project, &chapter, draft)?;
-                if !draft {
-                    db.set_chapter_status(chapter_id, ChapterStatus::Exported)?;
-                }
-                Ok(res)
-            })
-            .await??;
-            ctx.out.emit(Event::ExportFinished {
-                files: res.files,
-                gaps: res.gaps.len(),
-                duration_ms: res.duration_ms,
-            });
-            Ok(())
+            retail::export_chapter(ctx, chapter_id, draft).await
         }
-        Command::ExportBook { project_id } => {
-            let lib = ctx.lib.clone();
-            let res = tokio::task::spawn_blocking(move || -> Result<export::ExportResult> {
-                let db = lib.open()?;
-                let project = db.project(project_id)?;
-                export::export_book(&db, &lib, &project)
-            })
-            .await??;
-            ctx.out.emit(Event::ExportFinished {
-                files: res.files,
-                gaps: 0,
-                duration_ms: res.duration_ms,
-            });
-            Ok(())
-        }
+        Command::ExportBook { project_id } => retail::export_book(ctx, project_id).await,
+        Command::ExportSample {
+            chapter_id,
+            start_segment,
+            max_ms,
+        } => retail::export_sample(ctx, chapter_id, start_segment, max_ms).await,
         Command::FetchVoices => voices::fetch_voices(ctx).await,
         Command::LookupVoices { ids } => voices::lookup_voices(ctx, ids).await,
         Command::PreviewVoice { voice, language } => {
@@ -1134,6 +1121,7 @@ mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
 
     mod costs;
+    mod retail;
     mod voices;
 
     #[test]
