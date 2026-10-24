@@ -331,10 +331,15 @@ The design follows the verified research
   token-level edit distance that accepts British/American spelling variants
   by explicit rules (not an edit distance, which accepted dead/deed and
   than/then), merges ("every day" / "everyday"), English contractions
-  ("don't" / "do not") and fillers.
+  ("don't" / "do not", "we'll" / "we will", "they'd" / "they had") and
+  fillers. Fillers count on neither side: an extra "um" is not an error,
+  and neither is an "um" or "oh" of the text that Whisper leaves out
+  (it tends to drop disfluencies).
 - **Verdict** (heuristic thresholds from the research, in one
-  `Thresholds` struct, to be calibrated on real takes): nothing heard flags;
-  an audio tag heard as extra words flags; lines of at most three words
+  `Thresholds` struct, to be calibrated on real takes): none of the text's
+  words heard flags (a line that is only an interjection, "Hmm." or
+  "Ha ha!", never flags on its words: a silent take is the length check's
+  job); an audio tag heard as extra words flags; lines of at most three words
   (dialogue tags) flag only when nothing matches or two words differ; three
   missing/extra/wrong words in a row flag; otherwise a WER above 20 % (with
   at least three errors, under 15 words) or 12 % (15 words or more) flags,
@@ -354,18 +359,31 @@ The design follows the verified research
   and never one the text itself contains. Filtering on the no-speech
   probability alone would erase real speech.
 - **Whisper settings.** The chapter's language (never auto-detect), greedy
-  decoding, no context, a single segment for takes up to 28 s, suppressed
+  decoding, no context, a single segment without timestamps for takes up
+  to 28 s in English and 20 s otherwise (whisper.cpp stops a window after
+  220 tokens and, without timestamps, cannot resume; a fast Czech take of
+  25 s needs about that many), suppressed
   blanks and non-speech tokens, no initial prompt (the expected text would
   bias Whisper toward it). Input is resampled to 16 kHz with a windowed-sinc
   polyphase filter (`audio::resample_linear` has no anti-alias filter).
   Takes under 1.5 s get a 200 ms lead-in and are padded to 1.5 s. Decoding
-  is capped at about 10 tokens per second of audio (some three times natural
-  speech) so a hallucination loop cannot run to the window limit; that cap
-  is an addition to the research.
-- **One background thread.** A dedicated thread at nice 19 and SCHED_IDLE
-  (both per thread on Linux and inherited by ggml's worker threads) checks
-  one take at a time from a de-duplicated queue, with its own database
-  connection. It never holds up generation or the UI. The model is loaded on
+  is capped at 16 + 15 tokens per second of audio so a hallucination loop
+  cannot run to the window limit; that cap is an addition to the research.
+  Whisper's tokenizer needs about 0.2 tokens per character for English but
+  about 0.48 for Czech and Slovak (measured with its `multilingual.tiktoken`
+  vocabulary), 7–9 tokens a second at narration pace, so a tighter cap
+  would cut Czech transcripts short and flag them.
+- **One checker, two threads.** A "take-check" thread takes one take at a
+  time from a de-duplicated queue: it reads the take with its own database
+  connection, runs the length check and the comparison and stores the
+  result. It mostly waits, at normal priority. The transcription itself
+  (model loading and hashing, resampling, Whisper) runs on a
+  "take-check-asr" thread at nice 19 and SCHED_IDLE (both per thread on
+  Linux and inherited by ggml's worker threads). Database work is kept off
+  the idle-priority thread on purpose: SCHED_IDLE gets almost no CPU on a
+  busy machine, and preempted while holding SQLite's write lock it could
+  make generation's own write of a paid take time out (busy timeout 5 s).
+  Neither thread holds up generation or the UI. The model is loaded on
   first use and dropped after five idle minutes. Cancelling uses whisper.cpp's
   raw abort callback (whisper-rs's `set_abort_callback_safe` is broken in
   0.13–0.16) and is checked before each transcription; whisper.cpp polls it

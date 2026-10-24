@@ -1974,7 +1974,7 @@ impl App {
             });
         });
         if let Some(c) = check_cmd {
-            self.worker.send(Command::Check(c));
+            self.send_check(c);
         }
         if save {
             let cfg = self.dialogs.settings.take().unwrap();

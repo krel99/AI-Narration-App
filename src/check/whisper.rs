@@ -65,7 +65,8 @@ impl Transcriber for Whisper {
         if pcm16k.len() < WHISPER_RATE as usize / 10 {
             return Err(anyhow!("audio shorter than 100 ms").into());
         }
-        let one_window = pcm16k.len() as f32 / WHISPER_RATE as f32 <= 28.0;
+        let secs = pcm16k.len() as f32 / WHISPER_RATE as f32;
+        let one_window = single_window(secs, lang);
         let mut p = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         p.set_n_threads(threads.clamp(1, 64) as i32);
         // The chapter's language, never auto-detect.
@@ -76,8 +77,10 @@ impl Transcriber for Whisper {
         p.set_no_timestamps(one_window);
         p.set_single_segment(one_window);
         // Bound runaway decoding (a hallucination loop on silence, or noise)
-        // at about 10 tokens per second of audio: some 3x natural speech.
-        let secs = pcm16k.len() as f32 / WHISPER_RATE as f32;
+        // at about 15 tokens per second of audio. Whisper's tokenizer needs
+        // about 0.2 tokens per character for English but about 0.48 for
+        // Czech and Slovak (measured), i.e. 7-9 tokens/s at narration pace:
+        // a tighter cap would cut real transcripts short and flag them.
         p.set_max_tokens(max_tokens(secs));
         p.set_suppress_blank(true);
         // Blanks exact "(", "[", ... tokens only; annotations are still
@@ -116,10 +119,20 @@ impl Transcriber for Whisper {
     }
 }
 
+/// Decode the take as one segment without timestamps? whisper.cpp ends a
+/// window's decoding after 220 tokens, and without timestamps it cannot
+/// resume after them, so the rest of the take would be lost. English needs
+/// about 0.2 tokens per character, so 28 s is safe; Czech and Slovak about
+/// 0.48 (about 9 a second when spoken fast), so longer takes there use
+/// timestamps, which let whisper.cpp continue where it stopped.
+fn single_window(secs: f32, lang: &str) -> bool {
+    secs <= if lang == "en" { 28.0 } else { 20.0 }
+}
+
 /// Token cap per segment for `secs` of audio (a 30 s window holds at most
 /// 224 text tokens anyway).
 fn max_tokens(secs: f32) -> i32 {
-    (16.0 + 10.0 * secs).min(224.0) as i32
+    (16.0 + 15.0 * secs).min(224.0) as i32
 }
 
 #[cfg(test)]
@@ -128,9 +141,21 @@ mod tests {
 
     #[test]
     fn token_cap_scales_with_the_audio() {
-        assert_eq!(max_tokens(1.5), 31);
-        assert_eq!(max_tokens(8.0), 96);
+        assert_eq!(max_tokens(1.5), 38);
+        assert_eq!(max_tokens(8.0), 136);
         assert_eq!(max_tokens(60.0), 224);
+        // Czech at a fast 18 characters a second, about 0.48 tokens per
+        // character (measured with Whisper's tokenizer), with a margin, for
+        // every take decoded as a single segment.
+        for secs in [1.5f32, 4.0, 10.0, 15.0, 20.0] {
+            assert!(single_window(secs, "cs"));
+            let needed = secs * 18.0 * 0.48;
+            assert!(max_tokens(secs) as f32 > needed * 1.25, "{secs} s");
+            // ...and within whisper.cpp's own 220 tokens per window.
+            assert!(needed * 1.25 < 220.0, "{secs} s");
+        }
+        assert!(!single_window(24.0, "cs"));
+        assert!(single_window(24.0, "en") && !single_window(29.0, "en"));
     }
 
     /// Runs only with `NS_WHISPER_MODEL=<ggml model>`. With `NS_WHISPER_WAV`

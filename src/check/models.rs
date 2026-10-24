@@ -274,6 +274,34 @@ async fn hf_sha256(http: &reqwest::Client, base: &str, file: &str) -> Option<(St
     (oid.len() == 64 && oid.bytes().all(|b| b.is_ascii_hexdigit())).then_some((oid, size))
 }
 
+/// A download gives up after this long without any data.
+const STALL: Duration = Duration::from_secs(60);
+
+/// Await `fut`, but give up when `cancel` is set or after `stall` (the
+/// connection can hang without ever delivering another chunk, and the client
+/// has no timeout of its own: model files take minutes).
+async fn guarded<T>(
+    fut: impl std::future::Future<Output = T>,
+    cancel: &AtomicBool,
+    stall: Duration,
+) -> Result<T> {
+    tokio::pin!(fut);
+    let deadline = Instant::now() + stall;
+    loop {
+        tokio::select! {
+            r = &mut fut => return Ok(r),
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                if cancel.load(Ordering::Relaxed) {
+                    bail!("download cancelled");
+                }
+                if Instant::now() >= deadline {
+                    bail!("download stalled: no data for {} s", stall.as_secs());
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Downloaded {
     pub path: PathBuf,
@@ -293,6 +321,18 @@ pub async fn download(
     cancel: &AtomicBool,
     progress: impl Fn(u64, Option<u64>),
 ) -> Result<Downloaded> {
+    download_with_stall(http, base, lib, m, cancel, progress, STALL).await
+}
+
+async fn download_with_stall(
+    http: &reqwest::Client,
+    base: &str,
+    lib: &Library,
+    m: &ModelInfo,
+    cancel: &AtomicBool,
+    progress: impl Fn(u64, Option<u64>),
+    stall: Duration,
+) -> Result<Downloaded> {
     let dir = models_dir(lib);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let path = model_path(lib, m);
@@ -308,9 +348,8 @@ pub async fn download(
     {
         req = req.bearer_auth(token.trim());
     }
-    let mut resp = req
-        .send()
-        .await
+    let mut resp = guarded(req.send(), cancel, stall)
+        .await?
         .with_context(|| format!("downloading {}", m.file_name()))?;
     if !resp.status().is_success() {
         bail!("downloading {}: HTTP {}", m.url(base), resp.status());
@@ -323,7 +362,10 @@ pub async fn download(
         let mut received = 0u64;
         let mut last = Instant::now();
         progress(0, total);
-        while let Some(chunk) = resp.chunk().await.context("download interrupted")? {
+        while let Some(chunk) = guarded(resp.chunk(), cancel, stall)
+            .await?
+            .context("download interrupted")?
+        {
             if cancel.load(Ordering::Relaxed) {
                 bail!("download cancelled");
             }
@@ -424,6 +466,74 @@ mod tests {
         );
         assert!(info("small").unwrap().hint().contains("466 MiB download"));
         assert!(info("small-q8_0").unwrap().hint().starts_with("≈252 MiB"));
+    }
+
+    /// A server that sends the headers and a few bytes, then hangs.
+    fn hanging_server() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                let mut s = stream.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf);
+                let _ =
+                    s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1000000\r\n\r\n0123456789");
+                let _ = s.flush();
+                std::thread::sleep(Duration::from_secs(10));
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn a_hanging_download_can_be_cancelled_and_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = Library::new(dir.path().to_path_buf());
+        let m = info("base").unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let base = hanging_server();
+        // Cancel while no data arrives.
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let c2 = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            c2.store(true, Ordering::SeqCst);
+        });
+        let t = Instant::now();
+        let e = rt
+            .block_on(download_with_stall(
+                &http,
+                &base,
+                &lib,
+                m,
+                &cancel,
+                |_, _| {},
+                Duration::from_secs(30),
+            ))
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("cancelled"), "{e:#}");
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        // Nothing arrives for the stall time: it gives up.
+        let never = AtomicBool::new(false);
+        let e = rt
+            .block_on(download_with_stall(
+                &http,
+                &base,
+                &lib,
+                m,
+                &never,
+                |_, _| {},
+                Duration::from_millis(400),
+            ))
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("stalled"), "{e:#}");
+        assert_eq!(installed(&lib, m), Installed::No);
+        assert!(!part_path(&model_path(&lib, m)).exists(), "no .part left");
     }
 
     #[test]

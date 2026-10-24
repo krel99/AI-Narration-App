@@ -130,7 +130,8 @@ take, never blocks approving it and never costs credits
 
 - **Settings → Take checking**: pick a model and **Download** it (from
   Hugging Face, into the library's `models/` folder; the checksum is verified
-  before the file is kept). *small* (466 MiB, about 780 MB of memory, about
+  before the file is kept; a download that receives nothing for a minute
+  gives up). *small* (466 MiB, about 780 MB of memory, about
   5 s per take with 4 threads) is the default. *base* is faster and less
   accurate. *Large v3 Turbo, 5-bit* is the better choice for Czech and other
   non-English projects, at about five times the cost of *small*. The check

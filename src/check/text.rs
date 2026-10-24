@@ -97,8 +97,9 @@ pub enum Op {
     MergeHyp(usize, usize),
     /// Wrong word.
     Sub(usize, usize),
-    /// expected[i] missing from the audio.
-    Del(usize),
+    /// expected[i] missing from the audio. `filler` = the text's own
+    /// um/oh/hmm, which Whisper often leaves out: not counted.
+    Del { i: usize, filler: bool },
     /// Extra word hyp[j] in the audio. `filler` = um/uh/haha..., not counted.
     Ins { j: usize, filler: bool },
 }
@@ -107,7 +108,7 @@ impl Op {
     pub fn is_error(&self) -> bool {
         matches!(
             self,
-            Op::Sub(..) | Op::Del(_) | Op::Ins { filler: false, .. }
+            Op::Sub(..) | Op::Del { filler: false, .. } | Op::Ins { filler: false, .. }
         )
     }
 }
@@ -687,6 +688,37 @@ fn contraction(w: &str) -> Option<(&'static str, &'static str)> {
     })
 }
 
+/// Contractions with more than one expansion, or whose apostrophe-less form
+/// is also a word ("we'll" / "well"). Only ever used to accept the exact
+/// two-word expansion on the other side, so "well" vs "we will" is the only
+/// thing they can excuse.
+fn contraction_alt(w: &str) -> &'static [(&'static str, &'static str)] {
+    match w {
+        "ill" => &[("i", "will")],
+        "well" => &[("we", "will")],
+        "hell" => &[("he", "will")],
+        "shell" => &[("she", "will")],
+        "itll" => &[("it", "will")],
+        "thatll" => &[("that", "will")],
+        "id" => &[("i", "would"), ("i", "had")],
+        "youd" => &[("you", "would"), ("you", "had")],
+        "hed" => &[("he", "would"), ("he", "had")],
+        "shed" => &[("she", "would"), ("she", "had")],
+        "wed" => &[("we", "would"), ("we", "had")],
+        "theyd" => &[("they", "would"), ("they", "had")],
+        "itd" => &[("it", "would"), ("it", "had")],
+        "hes" => &[("he", "has")],
+        "shes" => &[("she", "has")],
+        "its" => &[("it", "has")],
+        "couldve" => &[("could", "have")],
+        "wouldve" => &[("would", "have")],
+        "shouldve" => &[("should", "have")],
+        "mightve" => &[("might", "have")],
+        "mustve" => &[("must", "have")],
+        _ => &[],
+    }
+}
+
 /// `one` said as the two words `a b`: "everyday" / "every day", and in
 /// English "don't" / "do not".
 fn joins(one: &Tok, a: &Tok, b: &Tok, lang: Lang) -> bool {
@@ -695,7 +727,8 @@ fn joins(one: &Tok, a: &Tok, b: &Tok, lang: Lang) -> bool {
     }
     let (o, a, b) = (one.norm.as_str(), a.norm.as_str(), b.norm.as_str());
     (o.len() == a.len() + b.len() && o.starts_with(a) && o.ends_with(b))
-        || (lang == Lang::En && contraction(o) == Some((a, b)))
+        || (lang == Lang::En
+            && (contraction(o) == Some((a, b)) || contraction_alt(o).contains(&(a, b))))
 }
 
 #[derive(PartialEq)]
@@ -776,6 +809,13 @@ pub fn align(exp: &[Tok], hyp: &[Tok], lang: Lang) -> Vec<Op> {
             C_ERR
         }
     };
+    let del_cost = |i: usize| {
+        if is_filler(&exp[i].norm) {
+            C_FILLER
+        } else {
+            C_ERR
+        }
+    };
     d[0] = 0;
     for i in 0..=n {
         for j in 0..=m {
@@ -806,7 +846,7 @@ pub fn align(exp: &[Tok], hyp: &[Tok], lang: Lang) -> Vec<Op> {
                 consider(d[(i - 1) * w + j - 1] + c, 0);
             }
             if i > 0 {
-                consider(d[(i - 1) * w + j] + C_ERR, 1);
+                consider(d[(i - 1) * w + j] + del_cost(i - 1), 1);
             }
             if j > 0 {
                 consider(d[i * w + j - 1] + ins_cost(j - 1), 2);
@@ -835,7 +875,10 @@ pub fn align(exp: &[Tok], hyp: &[Tok], lang: Lang) -> Vec<Op> {
                 j -= 1;
             }
             1 if i > 0 => {
-                ops.push(Op::Del(i - 1));
+                ops.push(Op::Del {
+                    i: i - 1,
+                    filler: is_filler(&exp[i - 1].norm),
+                });
                 i -= 1;
             }
             3 => {
@@ -857,7 +900,10 @@ pub fn align(exp: &[Tok], hyp: &[Tok], lang: Lang) -> Vec<Op> {
                     });
                     j -= 1;
                 } else {
-                    ops.push(Op::Del(i - 1));
+                    ops.push(Op::Del {
+                        i: i - 1,
+                        filler: is_filler(&exp[i - 1].norm),
+                    });
                     i -= 1;
                 }
             }
@@ -924,14 +970,18 @@ pub fn check(
         })
         .count();
     let real_heard = heard.iter().filter(|t| !is_filler(&t.norm)).count();
+    // The text's own words; interjections ("Hmm.", "Oh!") are fillers.
+    let real_expected = expected.iter().filter(|t| !is_filler(&t.norm)).count();
     let f = if lang == Lang::En {
         1.0
     } else {
         t.non_english_factor
     };
 
-    let verdict = if n == 0 {
-        if real_heard == 0 {
+    let verdict = if real_expected == 0 {
+        // No text, or only interjections ("Hmm.", "Ha ha!"), which Whisper
+        // often leaves out; a silent take is the length check's job.
+        if real_heard == 0 || errors == 0 {
             Verdict::Match
         } else {
             Verdict::Minor
@@ -985,7 +1035,8 @@ pub fn render(c: &Check, expected_text: &str) -> String {
             Op::MergeRef(i, j) => s += &format!("{} {}~{}", e(i), e(i + 1), h(j)),
             Op::MergeHyp(i, j) => s += &format!("{}~{} {}", e(i), h(j), h(j + 1)),
             Op::Sub(i, j) => s += &format!("[-{}-]{{+{}+}}", e(i), h(j)),
-            Op::Del(i) => s += &format!("[-{}-]", e(i)),
+            Op::Del { i, filler: false } => s += &format!("[-{}-]", e(i)),
+            Op::Del { i, filler: true } => s += &format!("(-{}-)", e(i)),
             Op::Ins { j, filler: false } => s += &format!("{{+{}+}}", h(j)),
             Op::Ins { j, filler: true } => s += &format!("({})", h(j)),
         }
@@ -1328,6 +1379,56 @@ mod tests {
         let c = chk(exp, heard, Lang::En);
         assert_eq!(c.errors, 2);
         assert!(matches!(c.verdict, Verdict::Flag(_)));
+    }
+
+    #[test]
+    fn interjections_and_the_texts_own_fillers() {
+        // Lines that are only interjections are fillers on both sides: an
+        // exact transcript matches, and Whisper leaving them out is normal
+        // (a silent take is the length check's job).
+        for line in ["Hmm.", "Oh!", "Ha ha ha!", "Mm-hmm."] {
+            assert_eq!(
+                chk(line, &format!(" {line}"), Lang::En).verdict,
+                Verdict::Match,
+                "{line}"
+            );
+            assert_eq!(chk(line, "", Lang::En).verdict, Verdict::Match, "{line}");
+        }
+        assert_eq!(chk("Hm.", " Hm.", Lang::Cs).verdict, Verdict::Match);
+        assert_eq!(chk("Hmm.", " Thank you.", Lang::En).verdict, Verdict::Minor);
+        // The text's own "um" left out: not an error, but shown.
+        let exp = "Um, I don't know.";
+        let c = chk(exp, " I don't know.", Lang::En);
+        assert_eq!((c.errors, c.verdict.clone()), (0, Verdict::Match));
+        assert_eq!(render(&c, exp), "(-Um-) I don't know");
+        assert_eq!(chk("Ehm, nevím.", " Nevím.", Lang::Cs).errors, 0);
+        // A real word missing still counts, interjection or not.
+        assert_eq!(
+            chk("Oh, hello.", " Oh.", Lang::En).verdict,
+            Verdict::Flag("nothing recognisable was heard")
+        );
+        assert_eq!(chk("Oh, hello there.", " Oh, there.", Lang::En).errors, 1);
+    }
+
+    #[test]
+    fn contractions_with_several_expansions() {
+        for (exp, heard) in [
+            ("We'll see.", " We will see."),
+            ("They'd gone.", " They had gone."),
+            ("They'd go.", " They would go."),
+            ("He's been here.", " He has been here."),
+            ("I'd like that.", " I would like that."),
+            ("You should've known.", " You should have known."),
+            ("We will see.", " We'll see."),
+        ] {
+            assert_eq!(chk(exp, heard, Lang::En).verdict, Verdict::Match, "{exp}");
+        }
+        // Only the exact expansion is excused.
+        assert!(matches!(
+            chk("We'll see.", " We still see.", Lang::En).verdict,
+            Verdict::Flag(_)
+        ));
+        assert!(chk("Well, see.", " We, see.", Lang::En).errors > 0);
     }
 
     #[test]

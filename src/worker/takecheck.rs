@@ -1,9 +1,11 @@
-//! The take checker: ONE dedicated thread at the lowest practical priority
-//! that checks takes one at a time from a queue of take ids. It reads the
-//! take, checks its length, and (when a Whisper model is installed)
-//! transcribes it and compares the words with the segment's text. It has its
-//! own database connection, so it never holds up generation or the UI, and
-//! it only stores a result: it never changes a segment or spends credits.
+//! The take checker: ONE dedicated thread that checks takes one at a time
+//! from a queue of take ids. It reads the take, checks its length, and (when
+//! a Whisper model is installed) has it transcribed and compares the words
+//! with the segment's text. The transcription runs on a second thread at the
+//! lowest practical priority; database work stays on the first one. It has
+//! its own database connection, so it never holds up generation or the UI,
+//! and it only stores a result: it never changes a segment or spends
+//! credits.
 //!
 //! Also here: the take-check commands and the model download job.
 
@@ -58,6 +60,8 @@ struct Queue {
     /// Progress since the queue was last empty.
     done: usize,
     total: usize,
+    /// Bumped by Stop: a job taken before it no longer counts as progress.
+    epoch: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -196,6 +200,7 @@ pub(super) async fn run_command(ctx: &Ctx, cmd: CheckCommand) -> Result<()> {
                 q.queued.clear();
                 q.done = 0;
                 q.total = 0;
+                q.epoch += 1;
                 // Aborts the take being checked, not one queued later.
                 inner.abort.store(true, Ordering::SeqCst);
                 ctx.out.emit(Event::CheckProgress { done: 0, total: 0 });
@@ -232,11 +237,22 @@ pub(super) async fn run_command(ctx: &Ctx, cmd: CheckCommand) -> Result<()> {
 
 async fn download(ctx: &Ctx, model: &str) -> Result<()> {
     let inner = &ctx.checker.inner;
-    let m = models::info(model).ok_or_else(|| anyhow!("unknown model {model}"))?;
+    // Every request ends with ModelDownloadFinished (the UI shows it as
+    // running from the click on).
+    let refuse = |error: String| {
+        ctx.out.emit(Event::ModelDownloadFinished {
+            model: model.to_string(),
+            error: Some(error),
+        });
+        Ok(())
+    };
+    let Some(m) = models::info(model) else {
+        return refuse(format!("unknown model {model}"));
+    };
     {
         let mut d = inner.downloading.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(other) = d.as_deref() {
-            return Err(anyhow!("{other} is already being downloaded"));
+            return refuse(format!("{other} is already being downloaded"));
         }
         *d = Some(m.name.to_string());
     }
@@ -287,8 +303,15 @@ async fn download(ctx: &Ctx, model: &str) -> Result<()> {
     Ok(())
 }
 
-/// Start the checker thread. `loader` is `None` when built without Whisper
-/// (only the length check runs then).
+/// Start the checker. `loader` is `None` when built without Whisper (only
+/// the length check runs then).
+///
+/// Two threads: "take-check" reads takes, runs the cheap checks and stores
+/// results at normal priority (it mostly waits), and "take-check-asr" loads
+/// the model and transcribes at the lowest priority. Database work never runs
+/// on the idle-priority thread: starved by a busy CPU while holding SQLite's
+/// write lock, it could make generation's own writes (storing a paid take)
+/// time out.
 pub(super) fn start(ctx: &Ctx, loader: Option<Arc<Loader>>) {
     let inner = ctx.checker.inner.clone();
     *inner.loader.lock().unwrap_or_else(|e| e.into_inner()) = loader;
@@ -307,7 +330,7 @@ struct Loaded {
     transcriber: Box<dyn Transcriber>,
 }
 
-/// Model state of the checker thread.
+/// Model state of the transcription thread.
 struct Backend {
     loader: Option<Arc<Loader>>,
     loaded: Option<Loaded>,
@@ -351,36 +374,127 @@ impl Backend {
     }
 }
 
-fn thread_main(inner: Arc<Inner>, lib: Library, out: Emitter) {
+/// One take for the transcription thread.
+struct AsrJob {
+    model: String,
+    /// Drop the loaded model (and a remembered load failure) first.
+    reload: bool,
+    /// The take as stored; resampled on the low-priority thread.
+    pcm: audio::Pcm,
+    lang: String,
+    threads: usize,
+}
+
+enum AsrReply {
+    Heard(check::Transcript),
+    /// The model is English-only and the project is not.
+    EnglishOnly,
+    Failed(String),
+    Cancelled,
+}
+
+/// The low-priority transcription thread, (re)started on first use.
+struct Asr {
+    inner: Arc<Inner>,
+    lib: Library,
+    tx: Option<std::sync::mpsc::Sender<(AsrJob, std::sync::mpsc::Sender<AsrReply>)>>,
+}
+
+impl Asr {
+    /// Transcribe on the low-priority thread and wait for the result.
+    fn run(&mut self, job: AsrJob) -> AsrReply {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        if self.tx.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (inner, lib) = (self.inner.clone(), self.lib.clone());
+            let spawned = std::thread::Builder::new()
+                .name("take-check-asr".into())
+                .spawn(move || asr_main(inner, lib, rx));
+            if let Err(e) = spawned {
+                return AsrReply::Failed(format!("could not start the Whisper thread: {e}"));
+            }
+            self.tx = Some(tx);
+        }
+        if let Some(tx) = &self.tx
+            && tx.send((job, reply_tx)).is_ok()
+            && let Ok(r) = reply_rx.recv()
+        {
+            return r;
+        }
+        // The thread is gone (a panic): start a new one next time.
+        self.tx = None;
+        AsrReply::Failed("the Whisper thread stopped unexpectedly".into())
+    }
+}
+
+fn asr_main(
+    inner: Arc<Inner>,
+    lib: Library,
+    rx: std::sync::mpsc::Receiver<(AsrJob, std::sync::mpsc::Sender<AsrReply>)>,
+) {
     check::background_priority();
-    let mut db: Option<Db> = None;
     let mut backend = Backend {
         loader: inner.loader(),
         loaded: None,
         failed: None,
     };
     loop {
-        let (job, cfg) = {
+        let (job, reply_to) = match rx.recv_timeout(IDLE_UNLOAD) {
+            Ok(j) => j,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if backend.loaded.take().is_some() {
+                    log::info!("take check: idle, model unloaded");
+                }
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+        };
+        if job.reload {
+            backend.loaded = None;
+            backend.failed = None;
+        }
+        let reply = match backend.transcriber(&lib, &job.model) {
+            Err(e) => AsrReply::Failed(e),
+            Ok(t) if !t.is_multilingual() && job.lang != "en" => AsrReply::EnglishOnly,
+            Ok(t) => {
+                let pcm16k = resample::pad_for_whisper(resample::to_whisper_input(
+                    &job.pcm.samples,
+                    job.pcm.rate,
+                ));
+                match t.transcribe(&pcm16k, &job.lang, job.threads.max(1), &inner.abort) {
+                    Ok(tr) => AsrReply::Heard(tr),
+                    Err(AsrError::Cancelled) => AsrReply::Cancelled,
+                    Err(AsrError::Other(e)) => AsrReply::Failed(format!("{e:#}")),
+                }
+            }
+        };
+        let _ = reply_to.send(reply);
+    }
+}
+
+fn thread_main(inner: Arc<Inner>, lib: Library, out: Emitter) {
+    let mut db: Option<Db> = None;
+    let has_loader = inner.loader().is_some();
+    let mut asr = Asr {
+        inner: inner.clone(),
+        lib: lib.clone(),
+        tx: None,
+    };
+    // A reload requested while only lengths were checked waits for the next
+    // transcription.
+    let mut reload = false;
+    loop {
+        let (job, cfg, epoch) = {
             let mut q = inner.queue();
             loop {
                 if let Some(job) = q.jobs.pop_front() {
                     q.queued.remove(&job.take_id);
                     // Under the lock: a Stop after this aborts this job.
                     inner.abort.store(false, Ordering::SeqCst);
-                    if std::mem::take(&mut q.reload) {
-                        backend.loaded = None;
-                        backend.failed = None;
-                    }
-                    break (job, q.config.clone());
+                    reload |= std::mem::take(&mut q.reload);
+                    break (job, q.config.clone(), q.epoch);
                 }
-                let (guard, wait) = inner
-                    .wake
-                    .wait_timeout(q, IDLE_UNLOAD)
-                    .unwrap_or_else(|e| e.into_inner());
-                q = guard;
-                if wait.timed_out() && q.jobs.is_empty() && backend.loaded.take().is_some() {
-                    log::info!("take check: idle, model unloaded");
-                }
+                q = inner.wake.wait(q).unwrap_or_else(|e| e.into_inner());
             }
         };
         if db.is_none() {
@@ -391,7 +505,14 @@ fn thread_main(inner: Arc<Inner>, lib: Library, out: Emitter) {
         }
         let checked = match &db {
             Some(db) => {
-                check_take(db, &lib, job, &cfg, &mut backend, &inner.abort).unwrap_or_else(|e| {
+                let mut env = Env {
+                    db,
+                    lib: &lib,
+                    has_loader,
+                    asr: &mut asr,
+                    reload: &mut reload,
+                };
+                check_take(&mut env, job, &cfg).unwrap_or_else(|e| {
                     log::warn!("take check of take {}: {e:#}", job.take_id);
                     None
                 })
@@ -402,7 +523,9 @@ fn thread_main(inner: Arc<Inner>, lib: Library, out: Emitter) {
             out.emit(Event::TakeChecked { segment_id });
         }
         let mut q = inner.queue();
-        q.done = (q.done + 1).min(q.total);
+        if q.epoch == epoch {
+            q.done = (q.done + 1).min(q.total);
+        }
         if q.jobs.is_empty() {
             q.done = 0;
             q.total = 0;
@@ -414,21 +537,24 @@ fn thread_main(inner: Arc<Inner>, lib: Library, out: Emitter) {
     }
 }
 
+/// What `check_take` works with.
+struct Env<'a> {
+    db: &'a Db,
+    lib: &'a Library,
+    has_loader: bool,
+    asr: &'a mut Asr,
+    reload: &'a mut bool,
+}
+
 /// Check one take and store the result. Returns its segment when a result
 /// was stored (nothing is stored when the take is gone, already checked, or
 /// the check was aborted).
-fn check_take(
-    db: &Db,
-    lib: &Library,
-    job: Job,
-    cfg: &CheckConfig,
-    backend: &mut Backend,
-    abort: &AtomicBool,
-) -> Result<Option<Id>> {
+fn check_take(env: &mut Env, job: Job, cfg: &CheckConfig) -> Result<Option<Id>> {
+    let db = env.db;
     let Ok(take) = db.take(job.take_id) else {
         return Ok(None);
     };
-    let key = model_key(lib, backend.loader.is_some(), cfg);
+    let key = model_key(env.lib, env.has_loader, cfg);
     if !job.force {
         if !check::needs_check(db.take_check(take.id)?.as_ref(), &key) {
             return Ok(None);
@@ -458,7 +584,7 @@ fn check_take(
     };
     // The generated audio as it is, untrimmed: the check judges the take's
     // file (shared by cache hits), not the editable trim.
-    let path: PathBuf = lib.audio_path(&take.audio_path);
+    let path: PathBuf = env.lib.audio_path(&take.audio_path);
     let pcm = match audio::read_wav(&path) {
         Ok(p) => p,
         Err(e) => {
@@ -494,33 +620,33 @@ fn check_take(
         speed,
         check::speech_ms(&pcm),
     );
-    let mut model_used = key.clone();
     let words = if key.is_empty() {
-        Words::NotChecked(not_checked_reason(backend.loader.is_some(), cfg))
+        Words::NotChecked(not_checked_reason(env.has_loader, cfg))
     } else {
-        match backend.transcriber(lib, &key) {
-            Err(e) => Words::Failed(e),
-            Ok(t) if !t.is_multilingual() && project.language != "en" => {
-                model_used.clear();
-                Words::NotChecked(format!(
-                    "the model is English-only and the project is in {}",
-                    lang::by_code(&project.language).name
-                ))
-            }
-            Ok(t) => {
-                let pcm16k =
-                    resample::pad_for_whisper(resample::to_whisper_input(&pcm.samples, pcm.rate));
-                match t.transcribe(&pcm16k, &project.language, cfg.threads.max(1), abort) {
-                    Ok(tr) => Words::Heard(tr),
-                    Err(AsrError::Cancelled) => return Ok(None),
-                    Err(AsrError::Other(e)) => Words::Failed(format!("{e:#}")),
-                }
-            }
+        let reply = env.asr.run(AsrJob {
+            model: key.clone(),
+            reload: std::mem::take(env.reload),
+            pcm,
+            lang: project.language.clone(),
+            threads: cfg.threads,
+        });
+        match reply {
+            AsrReply::Heard(tr) => Words::Heard(tr),
+            AsrReply::EnglishOnly => Words::NotChecked(format!(
+                "the model is English-only and the project is in {}",
+                lang::by_code(&project.language).name
+            )),
+            AsrReply::Failed(e) => Words::Failed(e),
+            AsrReply::Cancelled => return Ok(None),
         }
     };
-    if matches!(words, Words::NotChecked(_)) {
-        model_used.clear();
-    }
+    // The model is recorded only when it actually heard the take, so a
+    // length-only or failed check is redone once Whisper works.
+    let model_used = if matches!(words, Words::Heard(_)) {
+        key
+    } else {
+        String::new()
+    };
     let ev = check::evaluate(
         &expected,
         &length,
@@ -924,11 +1050,204 @@ mod tests {
         assert_eq!(c.status, CheckStatus::Error);
         assert!(c.issues.iter().any(|i| i.message.contains("bad magic")));
         assert!(c.issues.iter().any(|i| i.kind == check::IssueKind::Length));
+        assert_eq!(
+            c.model, "",
+            "Whisper heard nothing, so no model is recorded"
+        );
         // The take itself is untouched.
         assert_eq!(
             ctx.db(|db| db.segment(segs[0])).unwrap().status,
             SegmentStatus::Generated
         );
+        // A take whose length flags while Whisper fails is still redone by
+        // "Check chapter" once Whisper works (it was stored as "flagged").
+        let take = ctx.db(|db| db.take(c.take_id)).unwrap();
+        crate::audio::write_wav(
+            &lib.audio_path(&take.audio_path),
+            &crate::audio::Pcm {
+                rate: RATE as u32,
+                samples: vec![0; RATE],
+            },
+        )
+        .unwrap();
+        rt().block_on(run_command(
+            &ctx,
+            CheckCommand::Segment {
+                segment_id: segs[0],
+            },
+        ))
+        .unwrap();
+        wait_checked(&events, 1);
+        let c = ctx.db(|db| db.take_check(take.id)).unwrap().unwrap();
+        assert_eq!((c.status, c.model.as_str()), (CheckStatus::Flagged, ""));
+        assert_eq!(c.reason(), Some("The take is silent."));
+        let cid = ctx.db(|db| db.segment_chapter_id(segs[0])).unwrap();
+        assert!(
+            ctx.db(|db| db.takes_to_check(cid, "small"))
+                .unwrap()
+                .contains(&take.id)
+        );
+    }
+
+    /// The scheduling policy of the calling thread (`/proc`).
+    #[cfg(target_os = "linux")]
+    fn policy_of(task: &str) -> u32 {
+        let s = std::fs::read_to_string(format!("/proc/self/task/{task}/stat")).unwrap();
+        let f: Vec<&str> = s[s.rfind(')').unwrap() + 2..].split_whitespace().collect();
+        f[41 - 3].parse().unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn my_policy() -> u32 {
+        policy_of(&unsafe { libc::gettid() }.to_string())
+    }
+
+    /// Blocks in `transcribe` while `hold` is set, then returns Cancelled if
+    /// the cancel flag is set; records the scheduling policy it runs at.
+    struct Slow {
+        hold: Arc<AtomicBool>,
+        started: Arc<AtomicUsize>,
+        policies: Arc<Mutex<Vec<u32>>>,
+    }
+
+    impl Transcriber for Slow {
+        fn is_multilingual(&self) -> bool {
+            true
+        }
+        fn transcribe(
+            &mut self,
+            _pcm16k: &[f32],
+            _lang: &str,
+            _threads: usize,
+            cancel: &AtomicBool,
+        ) -> Result<Transcript, AsrError> {
+            #[cfg(target_os = "linux")]
+            self.policies.lock().unwrap().push(my_policy());
+            self.started.fetch_add(1, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while self.hold.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if cancel.load(Ordering::SeqCst) {
+                return Err(AsrError::Cancelled);
+            }
+            Ok(Transcript {
+                segments: vec![HeardSegment {
+                    text: " It is.".into(),
+                    no_speech_prob: 0.0,
+                }],
+            })
+        }
+    }
+
+    #[test]
+    fn stop_aborts_the_running_take_and_only_whisper_runs_at_idle_priority() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = Library::new(dir.path().to_path_buf());
+        let (ctx, events) = test_ctx(&lib, "http://unused", &eleven());
+        let off = CheckConfig {
+            enabled: false,
+            ..CheckConfig::default()
+        };
+        rt().block_on(run_command(&ctx, CheckCommand::Config(off)))
+            .unwrap();
+        let (cid, segs) = ctx
+            .db(|db| {
+                let pid = db.create_project("Book", "en")?;
+                let mut p = db.project(pid)?;
+                p.voice_map.insert(NARRATOR.into(), "vn".into());
+                p.voice_map.insert("vortram".into(), "vv".into());
+                p.settings.output_format = "pcm_24000".into();
+                db.update_project(&p)?;
+                let cid = import(db, pid);
+                let segs: Vec<Id> = db.chapter_segments(cid)?.iter().map(|s| s.id).collect();
+                Ok((cid, segs))
+            })
+            .unwrap();
+        rt().block_on(generate(&ctx, segs.clone(), false)).unwrap();
+        install_model(&lib);
+        let hold = Arc::new(AtomicBool::new(true));
+        let started = Arc::new(AtomicUsize::new(0));
+        let policies = Arc::new(Mutex::new(Vec::new()));
+        let (h, st, pol) = (hold.clone(), started.clone(), policies.clone());
+        start(
+            &ctx,
+            Some(Arc::new(move |_: &std::path::Path| {
+                #[cfg(target_os = "linux")]
+                pol.lock().unwrap().push(my_policy());
+                Ok(Box::new(Slow {
+                    hold: h.clone(),
+                    started: st.clone(),
+                    policies: pol.clone(),
+                }) as Box<dyn Transcriber>)
+            })),
+        );
+        rt().block_on(run_command(&ctx, CheckCommand::Chapter { chapter_id: cid }))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while started.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "transcription never started");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The checker's database thread is not at idle priority; Whisper is.
+        #[cfg(target_os = "linux")]
+        {
+            let mut db_threads = 0;
+            for t in std::fs::read_dir("/proc/self/task").unwrap() {
+                let t = t.unwrap().file_name().into_string().unwrap();
+                let Ok(comm) = std::fs::read_to_string(format!("/proc/self/task/{t}/comm")) else {
+                    continue;
+                };
+                if comm.trim() == "take-check" {
+                    db_threads += 1;
+                    assert_eq!(policy_of(&t), libc::SCHED_OTHER as u32);
+                }
+            }
+            assert!(db_threads >= 1);
+            let p = policies.lock().unwrap().clone();
+            assert_eq!(p.len(), 2, "load and transcribe: {p:?}");
+            assert!(p.iter().all(|&x| x == libc::SCHED_IDLE as u32), "{p:?}");
+        }
+        // Stop aborts the take being transcribed (segment 0's), and a
+        // Re-check queued meanwhile is not aborted by it.
+        rt().block_on(run_command(&ctx, CheckCommand::Stop))
+            .unwrap();
+        rt().block_on(run_command(
+            &ctx,
+            CheckCommand::Segment {
+                segment_id: segs[1],
+            },
+        ))
+        .unwrap();
+        hold.store(false, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut checked = Vec::new();
+        loop {
+            match events.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(Event::TakeChecked { segment_id }) => checked.push(segment_id),
+                Ok(Event::CheckProgress { done, total }) => {
+                    if checked.is_empty() {
+                        // The aborted take is not progress of the new queue.
+                        assert!(
+                            total == 0 || done < total,
+                            "{done}/{total} before any result"
+                        );
+                    } else if total == 0 {
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => panic!("the Re-check never finished"),
+            }
+        }
+        assert_eq!(checked, vec![segs[1]]);
+        assert_eq!(started.load(Ordering::SeqCst), 2, "the queue was emptied");
+        let by_seg = ctx.db(|db| db.chapter_checks(cid)).unwrap();
+        assert!(
+            !by_seg.contains_key(&segs[0]),
+            "an aborted check was stored"
+        );
+        assert_eq!(by_seg[&segs[1]].model, "small");
     }
 
     // ---- model download -------------------------------------------------

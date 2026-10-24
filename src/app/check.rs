@@ -30,6 +30,10 @@ pub(super) struct CheckState {
     /// Checker queue: done of total; 0 of 0 when idle.
     progress: (usize, usize),
     download: Option<Download>,
+    /// Whether the chosen model is installed, for the toolbar: (model, when
+    /// looked up, installed). Re-read every few seconds instead of touching
+    /// the disk on every frame.
+    installed: Option<(String, std::time::Instant, bool)>,
 }
 
 struct Download {
@@ -80,7 +84,8 @@ impl App {
                 });
             }
             Event::ModelDownloadFinished { model, error } => {
-                if let Some(e) = &error {
+                self.check.installed = None;
+                if let Some(e) = error.as_ref().filter(|e| !e.contains("download cancelled")) {
                     log::warn!("downloading the Whisper model {model}: {e}");
                     self.note(
                         true,
@@ -97,6 +102,21 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Send a command from the Settings section. A download shows as running
+    /// right away, so it cannot be started twice before its first progress.
+    pub(super) fn send_check(&mut self, c: CheckCommand) {
+        if let CheckCommand::Download { model } = &c {
+            self.check.download = Some(Download {
+                model: model.clone(),
+                received: 0,
+                total: None,
+                running: true,
+                error: None,
+            });
+        }
+        self.worker.send(Command::Check(c));
     }
 
     /// The current take's check, if it has one.
@@ -180,10 +200,8 @@ impl App {
             }
             return;
         }
-        let model = &self.cfg.check.model;
-        let words = BUILT_WITH_WHISPER
-            && models::info(model)
-                .is_some_and(|m| models::installed(&self.lib, m) != models::Installed::No);
+        let model = self.cfg.check.model.clone();
+        let words = BUILT_WITH_WHISPER && self.model_installed(&model);
         let hover = if words {
             format!(
                 "Transcribe the current takes that have no result yet with Whisper ({model}) on this computer, and flag differences from the text. Free; runs in the background."
@@ -199,6 +217,20 @@ impl App {
             self.worker
                 .send(Command::Check(CheckCommand::Chapter { chapter_id }));
         }
+    }
+
+    /// Whether `model` is installed (cached for a few seconds).
+    fn model_installed(&mut self, model: &str) -> bool {
+        if let Some((m, at, yes)) = &self.check.installed
+            && m == model
+            && at.elapsed() < std::time::Duration::from_secs(3)
+        {
+            return *yes;
+        }
+        let yes = models::info(model)
+            .is_some_and(|m| models::installed(&self.lib, m) != models::Installed::No);
+        self.check.installed = Some((model.to_string(), std::time::Instant::now(), yes));
+        yes
     }
 
     fn diff_for(
@@ -410,6 +442,11 @@ fn diff_job(ui: &egui::Ui, expected: &str, heard: &str, c: &text::Check, p: &Pal
         italics: true,
         ..normal.clone()
     };
+    let filler_missing = egui::TextFormat {
+        color: p.muted,
+        strikethrough: Stroke::new(1.0, p.muted),
+        ..normal.clone()
+    };
     let mut job = LayoutJob::default();
     let mut cursor = 0usize;
     let span = |i: usize| c.expected[i].span;
@@ -427,7 +464,7 @@ fn diff_job(ui: &egui::Ui, expected: &str, heard: &str, c: &text::Check, p: &Pal
                 | text::Op::MergeRef(i, _)
                 | text::Op::MergeHyp(i, _)
                 | text::Op::Sub(i, _)
-                | text::Op::Del(i) => Some(span(i).0),
+                | text::Op::Del { i, .. } => Some(span(i).0),
                 text::Op::Ins { .. } => None,
             })
             .unwrap_or(expected.len())
@@ -455,7 +492,9 @@ fn diff_job(ui: &egui::Ui, expected: &str, heard: &str, c: &text::Check, p: &Pal
                 word(&mut job, &mut cursor, i, &normal);
                 word(&mut job, &mut cursor, i + 1, &normal);
             }
-            text::Op::Del(i) => word(&mut job, &mut cursor, i, &missing),
+            text::Op::Del { i, filler: false } => word(&mut job, &mut cursor, i, &missing),
+            // The text's own "um"/"oh", left out by Whisper: not an error.
+            text::Op::Del { i, filler: true } => word(&mut job, &mut cursor, i, &filler_missing),
             text::Op::Sub(i, j) => {
                 word(&mut job, &mut cursor, i, &missing);
                 push(&mut job, " ", &normal);
