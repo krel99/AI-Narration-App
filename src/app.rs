@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use eframe::egui::{self, Color32, Key, RichText, Sense, Stroke, UiBuilder, Vec2};
 
-use crate::audio;
 use crate::config::AppConfig;
 use crate::db::{ChapterStats, Db, Library};
 use crate::export;
@@ -19,6 +18,13 @@ use crate::tags;
 use crate::theme::{self, Palette, primary_button, speaker_color};
 use crate::tts::VoiceInfo;
 use crate::worker::{self, Command, Event, WorkerHandle};
+
+mod check;
+mod costs;
+mod dialogue;
+mod retail;
+mod voice_picker;
+mod waveform;
 
 const ROW_H: f32 = 46.0;
 
@@ -159,6 +165,8 @@ pub struct App {
     takes: Vec<Take>,
     takes_for: Option<Id>,
     tag_edit: Option<TagEdit>,
+    wave: waveform::WaveState,
+    check: check::CheckState,
 
     in_flight: HashSet<Id>,
     failures: HashMap<Id, String>,
@@ -171,6 +179,9 @@ pub struct App {
     voices: Vec<VoiceInfo>,
     dirty: bool,
     dialogs: Dialogs,
+    costs: costs::CostState,
+    voice_ui: voice_picker::VoiceUi,
+    retail: retail::RetailUi,
 }
 
 fn status_icon(s: SegmentStatus, p: &Palette) -> (&'static str, Color32) {
@@ -220,15 +231,28 @@ fn tagged_job(
 }
 
 /// A small rounded label with a coloured outline.
+/// Height of a settings dialog's scrolling body: the window minus room for
+/// the title bar and the Save row, so Save is reachable at 900x560 too.
+fn dialog_body_height(ctx: &egui::Context) -> f32 {
+    (ctx.content_rect().height() - 250.0).clamp(200.0, 640.0)
+}
+
+/// A small outlined label. One widget that never wraps its text, so in a
+/// wrapping row (the Review toolbar) a chip that does not fit moves to the
+/// next line whole.
 fn chip(ui: &mut egui::Ui, text: impl Into<String>, color: Color32) -> egui::Response {
-    egui::Frame::new()
-        .stroke(Stroke::new(1.0, color.gamma_multiply(0.6)))
-        .corner_radius(10)
-        .inner_margin(egui::Margin::symmetric(8, 2))
-        .show(ui, |ui| {
-            ui.label(RichText::new(text.into()).color(color).small())
-        })
-        .response
+    let padding = ui.spacing().button_padding;
+    ui.spacing_mut().button_padding = Vec2::new(8.0, 2.0);
+    let r = ui.add(
+        egui::Button::new(RichText::new(text.into()).color(color).small())
+            .fill(Color32::TRANSPARENT)
+            .stroke(Stroke::new(1.0, color.gamma_multiply(0.6)))
+            .corner_radius(10)
+            .wrap_mode(egui::TextWrapMode::Extend)
+            .sense(Sense::hover()),
+    );
+    ui.spacing_mut().button_padding = padding;
+    r
 }
 
 impl App {
@@ -260,6 +284,8 @@ impl App {
             takes: vec![],
             takes_for: None,
             tag_edit: None,
+            wave: Default::default(),
+            check: Default::default(),
             in_flight: HashSet::new(),
             failures: HashMap::new(),
             segmenting: None,
@@ -271,7 +297,14 @@ impl App {
             voices: vec![],
             dirty: false,
             dialogs: Dialogs::default(),
+            costs: Default::default(),
+            voice_ui: Default::default(),
+            retail: Default::default(),
         };
+        app.worker
+            .send(Command::Check(crate::check::CheckCommand::Config(
+                app.cfg.check.clone(),
+            )));
         if let Some(e) = app.player.error.clone() {
             app.note(true, e);
         }
@@ -289,6 +322,7 @@ impl App {
         if let Some(id) = last.or_else(|| app.projects.first().map(|p| p.id)) {
             app.select_project(id);
         }
+        app.costs_startup();
         Ok(app)
     }
 
@@ -362,6 +396,7 @@ impl App {
         let r = self.db.chapters(pid);
         self.chapters = self.try_db(r).unwrap_or_default();
         self.reload_stats();
+        self.reload_retail();
     }
 
     fn reload_stats(&mut self) {
@@ -445,6 +480,9 @@ impl App {
         }
         .filter(|_| !self.view.segments.is_empty());
         self.takes_for = None;
+        self.reload_cost_stats();
+        self.reload_checks();
+        self.reload_trims();
     }
 
     fn selected_segment(&self) -> Option<&Segment> {
@@ -465,7 +503,8 @@ impl App {
         while let Ok(ev) = self.worker.events.try_recv() {
             match ev {
                 Event::Info(m) => self.note(false, m),
-                Event::Error(m) => {
+                Event::Error(m) => self.note(true, m),
+                Event::ExportFailed(m) => {
                     self.exporting = false;
                     self.note(true, m)
                 }
@@ -570,6 +609,7 @@ impl App {
                             "Generation finished: {generated} takes ({cached} from cache), {failed} failed, {credits} credits used."
                         ),
                     );
+                    self.request_account(false);
                 }
                 Event::ExportFinished {
                     files,
@@ -591,10 +631,18 @@ impl App {
                     );
                     self.dirty = true;
                 }
-                Event::Voices(v) => {
-                    self.note(false, format!("Loaded {} voices from ElevenLabs.", v.len()));
-                    self.voices = v;
+                Event::Voices(v) => self.on_voices(v),
+                Event::VoicesLookedUp { found, missing } => {
+                    self.on_voices_looked_up(found, missing)
                 }
+                Event::VoicePreview { voice_id, result } => self.on_voice_preview(voice_id, result),
+                Event::Account(info) => self.on_account(info),
+                Event::ClaudeCode(d) => self.on_claude_detection(*d),
+                Event::AcxChecked { summary, verdict } => self.on_acx_checked(summary, verdict),
+                ev @ (Event::TakeChecked { .. }
+                | Event::CheckProgress { .. }
+                | Event::ModelDownload { .. }
+                | Event::ModelDownloadFinished { .. }) => self.on_check_event(ev),
             }
         }
         if self.dirty {
@@ -618,12 +666,10 @@ impl App {
     }
 
     fn play_take(&mut self, segment_id: Id, take_id: Id) {
-        let pcm = self
-            .db
-            .take(take_id)
-            .and_then(|t| audio::read_wav(&self.lib.audio_path(&t.audio_path)));
+        let pcm = self.db.take(take_id).and_then(|t| self.take_audio(&t));
         if let Some(pcm) = self.try_db(pcm) {
             self.player.play(vec![(segment_id, pcm)], 0);
+            self.wave.playing_take = Some(take_id);
         }
     }
 
@@ -639,11 +685,7 @@ impl App {
         for j in self.view.paragraph_range(i) {
             let seg = &self.view.segments[j];
             if let Some(t) = seg.current_take_id {
-                match self
-                    .db
-                    .take(t)
-                    .and_then(|t| audio::read_wav(&self.lib.audio_path(&t.audio_path)))
-                {
+                match self.db.take(t).and_then(|t| self.take_audio(&t)) {
                     Ok(pcm) => items.push((seg.id, pcm)),
                     Err(e) => log::warn!("{e:#}"),
                 }
@@ -653,6 +695,7 @@ impl App {
             self.note(true, "No audio in this paragraph yet.".into());
         } else {
             self.player.play(items, gap);
+            self.wave.playing_take = None;
         }
     }
 
@@ -768,10 +811,12 @@ impl App {
     }
 
     fn segment_chapter(&mut self, chapter_id: Id) {
-        if self.cfg.api_keys().anthropic.is_empty() {
+        if self.cfg.claude_backend == crate::config::ClaudeBackend::ApiKey
+            && self.cfg.api_keys().anthropic.is_empty()
+        {
             self.note(
                 true,
-                "No Anthropic API key: dialogue will be split by the parser only, with speaker 'unknown'.".into(),
+                "No Anthropic API key: dialogue will be split by the parser only, with speaker 'unknown'. Add a key, or choose Claude Code in Settings.".into(),
             );
         }
         self.worker.send(Command::SegmentChapter { chapter_id });
@@ -859,6 +904,7 @@ impl App {
             || d.delete_project.is_some()
             || d.resegment.is_some()
             || d.resplit
+            || self.retail_dialog_open()
     }
 
     /// Save the Text tab. Returns false if nothing could be saved yet.
@@ -961,6 +1007,7 @@ impl App {
             rename_from: String::new(),
             rename_to: String::new(),
         });
+        self.voices_dialog_opened();
     }
 
     // ---- top bar --------------------------------------------------------------
@@ -968,14 +1015,22 @@ impl App {
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         let p = *theme::palette(ui);
         ui.add_space(6.0);
+        // Narrow windows (down to the 900 px minimum) get a shorter brand and
+        // narrower pickers, so the right-hand buttons never cover the tabs.
+        let compact = ui.available_width() < 1180.0;
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new("◖ Narration Studio")
-                    .strong()
-                    .size(16.0)
-                    .color(p.accent),
-            );
-            ui.add_space(14.0);
+                RichText::new(if compact {
+                    "◖"
+                } else {
+                    "◖ Narration Studio"
+                })
+                .strong()
+                .size(16.0)
+                .color(p.accent),
+            )
+            .on_hover_text("Narration Studio");
+            ui.add_space(if compact { 8.0 } else { 14.0 });
 
             let current = self
                 .project
@@ -985,7 +1040,7 @@ impl App {
             let mut pick = None;
             egui::ComboBox::from_id_salt("project")
                 .selected_text(current)
-                .width(170.0)
+                .width(if compact { 120.0 } else { 170.0 })
                 .show_ui(ui, |ui| {
                     for p in &self.projects {
                         let sel = self.project.as_ref().is_some_and(|c| c.id == p.id);
@@ -1017,7 +1072,7 @@ impl App {
                 let mut new = false;
                 egui::ComboBox::from_id_salt("chapter")
                     .selected_text(chapter_label)
-                    .width(220.0)
+                    .width(if compact { 150.0 } else { 220.0 })
                     .show_ui(ui, |ui| {
                         for c in self.chapters.iter().rev() {
                             let st = self.stats.get(&c.id).cloned().unwrap_or_default();
@@ -1066,6 +1121,7 @@ impl App {
                         }
                         ui.close();
                     }
+                    self.retail_menu_item(ui);
                     if ui
                         .add_enabled(
                             self.draft.chapter_id.is_some(),
@@ -1078,9 +1134,14 @@ impl App {
                     }
                 });
 
-                ui.add_space(18.0);
+                ui.add_space(if compact { 8.0 } else { 18.0 });
                 let has_segments = !self.view.segments.is_empty();
-                for (tab, label) in [(Tab::Text, "1  Text"), (Tab::Review, "2  Review")] {
+                let tabs = if compact {
+                    [(Tab::Text, "Text"), (Tab::Review, "Review")]
+                } else {
+                    [(Tab::Text, "1  Text"), (Tab::Review, "2  Review")]
+                };
+                for (tab, label) in tabs {
                     let enabled = tab == Tab::Text || has_segments || self.segmenting.is_some();
                     let selected = self.tab == tab;
                     let text = if selected {
@@ -1114,6 +1175,7 @@ impl App {
                 {
                     self.open_voice_editor();
                 }
+                self.account_chip(ui);
             });
         });
         ui.add_space(6.0);
@@ -1168,7 +1230,7 @@ impl App {
                             .color(p.warning),
                     );
                 }
-                let footer_h = 56.0;
+                let footer_h = 92.0;
                 let editor_h = (ui.available_height() - footer_h).max(160.0);
                 egui::Frame::new()
                     .fill(p.card)
@@ -1238,6 +1300,7 @@ impl App {
                         }
                     });
                 });
+                self.claude_estimate_footer(ui, &paragraphs, lang);
             }
         });
     }
@@ -1251,7 +1314,10 @@ impl App {
         let p = *theme::palette(ui);
         let st = self.stats.get(&cid).cloned().unwrap_or_default();
         ui.add_space(8.0);
-        ui.horizontal(|ui| {
+        // Title and progress, then the chips: review state (flags,
+        // rejections, voices), costs (credits, drafts, Claude), delivery
+        // (ACX). They wrap onto a second line in narrow windows.
+        ui.horizontal_wrapped(|ui| {
             ui.heading(&self.draft.saved_title);
             ui.add_space(10.0);
             if st.segments > 0 {
@@ -1266,6 +1332,7 @@ impl App {
                 ui.label(
                     RichText::new(format!("{} / {} approved", st.approved, st.segments)).strong(),
                 );
+                self.check_chip(ui);
                 if st.rejected > 0 {
                     chip(ui, format!("{} rejected", st.rejected), p.rejected);
                 }
@@ -1280,17 +1347,25 @@ impl App {
                 chip(
                     ui,
                     format!(
-                        "{} credits · re-roll {:.0}%",
+                        "{}{} credits · re-roll {:.0}%",
+                        if st.credits_estimated { "≈" } else { "" },
                         st.credits_used,
                         st.reroll_rate() * 100.0
                     ),
                     p.muted,
-                );
+                )
+                .on_hover_text(if st.credits_estimated {
+                    "Some takes came back without a credit count; their cost is estimated."
+                } else {
+                    "Credits as reported by ElevenLabs."
+                });
                 if !self.tags_active() {
                     chip(ui, "model ignores audio tags", p.muted).on_hover_text(
                         "Choose Eleven v4 or v3 in Project settings to perform [tags]",
                     );
                 }
+                self.cost_chips(ui);
+                self.acx_chip(ui);
             }
         });
         ui.add_space(4.0);
@@ -1345,6 +1420,8 @@ impl App {
                     self.worker.send(Command::Cancel);
                 }
             }
+            self.auto_trim_chapter_button(ui, cid);
+            self.check_toolbar(ui, cid);
             ui.separator();
             let complete = st.segments > 0 && st.approved == st.segments;
             if ui
@@ -1480,6 +1557,7 @@ impl App {
                         if let Some(err) = self.failures.get(&seg.id) {
                             status_label.on_hover_text(format!("Last generation failed: {err}"));
                         }
+                        self.check_marker(ui, seg);
                         let unassigned = project
                             .as_ref()
                             .is_none_or(|p| p.voice_for(&seg.speaker).is_none());
@@ -1704,6 +1782,8 @@ impl App {
                         self.dialogs.split = Some((seg.id, seg.text.clone(), None));
                     }
                 });
+                self.waveform_section(ui, &seg, locked);
+                self.check_section(ui, &seg, locked, i);
 
                 ui.add_space(6.0);
                 egui::CollapsingHeader::new(RichText::new("✦ Audio tags").strong())
@@ -1799,11 +1879,14 @@ impl App {
                         }
                         let cost = if t.credits_used == 0 {
                             "cached".to_string()
-                        } else {
+                        } else if t.credits_exact {
                             format!("{} credits", t.credits_used)
+                        } else {
+                            format!("≈{} credits (estimated)", t.credits_used)
                         };
                         let text = format!("#{} · seed {} · {cost} · {}", n + 1, t.seed, t.created_at);
                         ui.label(if current { RichText::new(text).strong() } else { RichText::new(text) });
+                        dialogue::take_chip(ui, t);
                         if current {
                             chip(ui, "current", p.approved);
                         } else if ui.add_enabled(!locked, egui::Button::new("Use").small()).clicked() {
@@ -1829,9 +1912,11 @@ impl App {
         self.dialog_settings(ctx);
         self.dialog_project_settings(ctx);
         self.dialog_voices(ctx);
+        self.dialog_voice_picker(ctx);
         self.dialog_split(ctx);
         self.dialog_generate(ctx);
         self.dialog_confirmations(ctx);
+        self.dialog_retail(ctx);
         if self.dialogs.log {
             let mut open = true;
             egui::Window::new("Log")
@@ -1905,21 +1990,32 @@ impl App {
         };
         let mut save = false;
         let mut cancel = false;
-        egui::Window::new("Settings").collapsible(false).show(ctx, |ui| {
+        let mut check = false;
+        let mut check_cmd = None;
+        let max_height = dialog_body_height(ctx);
+        egui::Window::new("Settings").collapsible(false).default_width(600.0).show(ctx, |ui| {
+            ui.set_max_width(640.0);
+            // A solid scrollbar shows that there is more below.
+            ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+            // Claude, then ElevenLabs and the app, then the take check;
+            // Save stays visible below the scroll area.
+            egui::ScrollArea::vertical()
+                .max_height(max_height)
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                .show(ui, |ui| {
+            check = costs::claude_settings_section(ui, cfg, &self.costs);
+            ui.add_space(4.0);
+            ui.separator();
             egui::Grid::new("settings").num_columns(2).spacing([12.0, 8.0]).show(ui, |ui| {
-                ui.label("Anthropic API key");
-                ui.add(
-                    egui::TextEdit::singleline(&mut cfg.anthropic_api_key)
-                        .password(true)
-                        .hint_text("or ANTHROPIC_API_KEY"),
-                );
-                ui.end_row();
                 ui.label("ElevenLabs API key");
                 ui.add(
                     egui::TextEdit::singleline(&mut cfg.elevenlabs_api_key)
                         .password(true)
                         .hint_text("or ELEVENLABS_API_KEY"),
                 );
+                ui.end_row();
+                ui.label("Credit price");
+                costs::credit_price_row(ui, cfg);
                 ui.end_row();
                 ui.label("Appearance");
                 ui.horizontal(|ui| {
@@ -1928,7 +2024,8 @@ impl App {
                 });
                 ui.end_row();
                 ui.label("Library");
-                ui.label(cfg.library_dir().display().to_string());
+                let dir = cfg.library_dir().display().to_string();
+                ui.add(egui::Label::new(dir.clone()).truncate()).on_hover_text(dir);
                 ui.end_row();
             });
             if ui.button("Choose library folder…").clicked()
@@ -1941,16 +2038,32 @@ impl App {
                     .small()
                     .color(theme::palette(ui).muted),
             );
-            ui.add_space(6.0);
+            ui.add_space(4.0);
+            ui.separator();
+            check_cmd = check::settings_section(ui, &mut cfg.check, &self.check, &self.lib);
+                });
+            ui.separator();
             ui.horizontal(|ui| {
                 save = ui.add(primary_button(ui, "Save")).clicked();
                 cancel = ui.button("Cancel").clicked();
             });
         });
+        if check {
+            let path = cfg.claude_code_path.clone();
+            self.request_detection(path);
+        }
+        if let Some(c) = check_cmd {
+            self.send_check(c);
+        }
         if save {
             let cfg = self.dialogs.settings.take().unwrap();
             self.worker.send(Command::SetKeys(cfg.api_keys()));
+            self.worker
+                .send(Command::Check(crate::check::CheckCommand::Config(
+                    cfg.check.clone(),
+                )));
             theme::apply(ctx, cfg.dark_mode);
+            self.settings_saved(&cfg);
             self.cfg = cfg;
             if let Err(e) = self.cfg.save() {
                 self.note(true, format!("Saving settings: {e:#}"));
@@ -1967,15 +2080,26 @@ impl App {
         let mut save = false;
         let mut cancel = false;
         let mut delete = false;
+        let max_height = dialog_body_height(ctx);
         egui::Window::new("Project settings")
-            .default_width(500.0)
+            .collapsible(false)
+            .default_width(560.0)
             .show(ctx, |ui| {
                 let muted = theme::palette(ui).muted;
                 let section = |ui: &mut egui::Ui, title: &str| {
-                    ui.add_space(8.0);
+                    ui.add_space(10.0);
+                    ui.separator();
                     ui.label(RichText::new(title).small().strong().color(muted));
                 };
-                egui::ScrollArea::vertical().max_height(600.0).show(ui, |ui| {
+                // Generation first (model, voices, tags, dialogue), then
+                // timing (silences, trimming), Claude, and the book's
+                // publication data. Save stays visible below the scroll area,
+                // and a solid scrollbar shows that there is more.
+                ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+                egui::ScrollArea::vertical()
+                    .max_height(max_height)
+                    .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                    .show(ui, |ui| {
                     egui::Grid::new("ps").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
                         ui.label("Name");
                         ui.text_edit_singleline(&mut p.name);
@@ -2013,6 +2137,9 @@ impl App {
                         ui.end_row();
                     });
 
+                    section(ui, "DEFAULT VOICE SETTINGS");
+                    ui.horizontal_wrapped(|ui| voice_settings_ui(ui, &mut p.default_voice_settings));
+
                     section(ui, "AUDIO TAGS");
                     let t = &mut p.settings.audio_tags;
                     ui.checkbox(&mut t.enabled, "Add tags automatically after segmentation (Eleven v3/v4 only)");
@@ -2030,8 +2157,8 @@ impl App {
                             .hint_text("e.g. Military sci-fi. Keep the narrator calm and clipped; save whispers for real tension."),
                     );
 
-                    section(ui, "DEFAULT VOICE SETTINGS");
-                    ui.horizontal_wrapped(|ui| voice_settings_ui(ui, &mut p.default_voice_settings));
+                    section(ui, "MULTI-SPEAKER DIALOGUE");
+                    dialogue::settings_ui(ui, &mut p.settings.dialogue, &p.tts_model, &p.default_voice_settings);
 
                     section(ui, "SILENCE (MS)");
                     let s = &mut p.settings.silence;
@@ -2048,6 +2175,9 @@ impl App {
                             ui.end_row();
                         }
                     });
+
+                    section(ui, "SILENCE TRIMMING");
+                    waveform::trim_settings_ui(ui, &mut p.settings.trim);
 
                     section(ui, "CLAUDE");
                     let g = &mut p.settings.segmentation;
@@ -2074,6 +2204,10 @@ impl App {
                         ui.add(egui::DragValue::new(&mut g.max_retries).range(0..=5));
                         ui.end_row();
                     });
+                    ui.add_space(2.0);
+                    ui.separator();
+                    retail::publication_ui(ui, p, &self.lib.root, &mut self.retail);
+                    ui.add_space(4.0);
                 });
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -2087,7 +2221,8 @@ impl App {
                 });
             });
         if save {
-            let p = self.dialogs.project_settings.take().unwrap();
+            let mut p = self.dialogs.project_settings.take().unwrap();
+            self.store_cover(&mut p);
             let r = self.db.update_project(&p);
             self.try_db(r);
             self.reload_projects();
@@ -2100,16 +2235,19 @@ impl App {
     }
 
     fn dialog_voices(&mut self, ctx: &egui::Context) {
+        let preview = self.preview_now();
         let Some(ed) = &mut self.dialogs.voices else {
             return;
         };
         let mut save = false;
         let mut cancel = false;
         let mut fetch = false;
+        let mut cell = None;
         let mut rename: Option<(String, String)> = None;
         let voices = &self.voices;
+        let voice_ui = &self.voice_ui;
         egui::Window::new("Voices and characters")
-            .default_size([800.0, 480.0])
+            .default_size([900.0, 480.0])
             .show(ctx, |ui| {
                 let dark = ui.visuals().dark_mode;
                 let muted = theme::palette(ui).muted;
@@ -2118,17 +2256,14 @@ impl App {
                         .small()
                         .color(muted),
                 );
-                ui.horizontal(|ui| {
-                    fetch = ui.button("Load my ElevenLabs voices").clicked();
-                    ui.label(RichText::new(format!("{} loaded", voices.len())).small().color(muted));
-                });
+                fetch = voice_picker::list_status(ui, voices.len(), voice_ui);
                 egui::ScrollArea::vertical().max_height(340.0).show(ui, |ui| {
                     egui::Grid::new("voices").num_columns(6).striped(true).spacing([10.0, 6.0]).show(ui, |ui| {
-                        for h in ["Key", "Display name", "Aliases (comma separated)", "Voice id", "", ""] {
+                        for h in ["Key", "Display name", "Aliases (comma separated)", "Voice id", "Voice", ""] {
                             ui.label(RichText::new(h).small().strong().color(muted));
                         }
                         ui.end_row();
-                        for (n, row) in ed.rows.iter_mut().enumerate() {
+                        for row in ed.rows.iter_mut() {
                             let key_text = RichText::new(&row.key).strong().color(speaker_color(&row.key, dark));
                             ui.label(if row.remove { key_text.strikethrough() } else { key_text });
                             if row.key == NARRATOR {
@@ -2139,22 +2274,8 @@ impl App {
                                 ui.text_edit_singleline(&mut row.aliases);
                             }
                             ui.add_sized([190.0, 22.0], egui::TextEdit::singleline(&mut row.voice_id).hint_text("voice id"));
-                            if voices.is_empty() {
-                                ui.label("");
-                            } else {
-                                let current = voices
-                                    .iter()
-                                    .find(|v| v.voice_id == row.voice_id)
-                                    .map(|v| v.name.clone())
-                                    .unwrap_or_else(|| "pick…".into());
-                                egui::ComboBox::from_id_salt(("pick", n))
-                                    .selected_text(current)
-                                    .width(140.0)
-                                    .show_ui(ui, |ui| {
-                                        for v in voices {
-                                            ui.selectable_value(&mut row.voice_id, v.voice_id.clone(), &v.name);
-                                        }
-                                    });
+                            if let Some(a) = voice_picker::voice_cell(ui, row, voices, voice_ui, &preview) {
+                                cell = Some(a);
                             }
                             if row.key != NARRATOR {
                                 ui.checkbox(&mut row.remove, "remove");
@@ -2200,7 +2321,10 @@ impl App {
                 });
             });
         if fetch {
-            self.worker.send(Command::FetchVoices);
+            self.refresh_voices();
+        }
+        if let Some(a) = cell {
+            self.voice_cell_action(a);
         }
         if let Some((from, to)) = rename.filter(|(f, t)| !f.is_empty() && !t.is_empty())
             && let Some(pid) = self.project.as_ref().map(|p| p.id)
@@ -2327,17 +2451,20 @@ impl App {
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
+                ui.set_max_width(480.0);
                 ui.label(format!(
-                    "{} segments, {} characters. Each generation costs its full character count in credits (cached takes are free).",
+                    "{} segments, {} characters.",
                     plan.ids.len(),
-                    plan.chars
+                    crate::costs::fmt_int(plan.chars as i64)
                 ));
+                self.generate_estimate_ui(ui, plan.chars);
                 if plan.unassigned > 0 {
                     ui.colored_label(
                         theme::palette(ui).warning,
                         format!("{} segments skipped: unassigned voice.", plan.unassigned),
                     );
                 }
+                self.dialogue_generate_note(ui, &plan.ids, plan.reroll);
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     go = ui
@@ -2491,6 +2618,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.handle_events();
         let ctx = ui.ctx().clone();
+        self.costs_tick(&ctx);
         self.keyboard(&ctx);
         let p = *theme::palette(ui);
 
@@ -2512,7 +2640,18 @@ impl eframe::App for App {
                 ui.horizontal(|ui| {
                     let err = self.log.last().is_some_and(|(e, _)| *e);
                     let color = if err { p.rejected } else { p.muted };
-                    ui.label(RichText::new(&self.status).small().color(color));
+                    // Long messages (e.g. a usage limit) are cut short instead
+                    // of running under the hints; hover or the Log shows all.
+                    let reserve = if self.tab == Tab::Review { 400.0 } else { 60.0 };
+                    let width = (ui.available_width() - reserve).max(120.0);
+                    ui.scope(|ui| {
+                        ui.set_max_width(width);
+                        ui.add(
+                            egui::Label::new(RichText::new(&self.status).small().color(color))
+                                .truncate(),
+                        )
+                        .on_hover_text(&self.status);
+                    });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("Log").clicked() {
                             self.dialogs.log = !self.dialogs.log;
@@ -2548,9 +2687,18 @@ impl eframe::App for App {
                     )
                     .show(ui, |ui| self.review_toolbar(ui));
                 if !self.view.segments.is_empty() {
+                    // Tall enough for the text, actions, waveform and the take
+                    // check's summary at 1400x900; at most about half of a
+                    // small window, so the list keeps a few rows.
+                    let room = ui.available_height();
                     egui::Panel::bottom("detail")
                         .resizable(true)
-                        .default_size(270.0)
+                        .default_size(
+                            (room * 0.6)
+                                .clamp(180.0, 440.0)
+                                .min((room - 110.0).max(120.0)),
+                        )
+                        .max_size((room - 110.0).max(180.0))
                         .frame(
                             egui::Frame::new()
                                 .fill(p.card)

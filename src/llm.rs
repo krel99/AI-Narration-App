@@ -1,8 +1,11 @@
 //! Speaker attribution through the Claude Messages API (raw HTTP; there is
 //! no official Rust SDK). One request per chunk of paragraphs returns strict
-//! JSON constrained by `output_config.format`.
+//! JSON constrained by `output_config.format`. The same requests can instead
+//! go through the user's own Claude Code CLI (`claude_code.rs`), which uses
+//! their Pro/Max subscription.
 
 use std::collections::BTreeMap;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -21,20 +24,98 @@ const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 #[derive(Debug)]
 pub enum LlmError {
     /// Worth retrying after a pause (429, 5xx, overloaded, network).
-    Transient(String),
+    Transient(Via, String),
     /// The response hit max_tokens; retry with a smaller chunk.
     TooLong,
-    Fatal(String),
+    Fatal(Via, String),
+    /// The subscription's usage limit is reached (message includes the reset
+    /// time). Retrying before the reset is pointless.
+    UsageLimit(String),
+    /// Claude Code is not signed in, or its login expired.
+    Auth(String),
+    /// Claude Code cannot run at all (not installed, too old, no result).
+    Unavailable(String),
+}
+
+/// Which way a Claude call went, so error messages name it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Via {
+    Api,
+    ClaudeCode,
+}
+
+impl Via {
+    fn name(self) -> &'static str {
+        match self {
+            Via::Api => "Claude API",
+            Via::ClaudeCode => "Claude Code",
+        }
+    }
+}
+
+impl LlmError {
+    /// Every further request would fail the same way: stop the whole pass
+    /// instead of trying (and falling back) chunk by chunk.
+    pub fn stops_pass(&self) -> bool {
+        matches!(
+            self,
+            LlmError::UsageLimit(_) | LlmError::Auth(_) | LlmError::Unavailable(_)
+        )
+    }
 }
 
 impl std::fmt::Display for LlmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LlmError::Transient(m) => write!(f, "temporary Claude API error: {m}"),
+            LlmError::Transient(via, m) => write!(f, "temporary {} error: {m}", via.name()),
             LlmError::TooLong => write!(f, "response too long for one request"),
-            LlmError::Fatal(m) => write!(f, "Claude API error: {m}"),
+            LlmError::Fatal(via, m) => write!(f, "{} error: {m}", via.name()),
+            LlmError::UsageLimit(m) | LlmError::Auth(m) | LlmError::Unavailable(m) => {
+                write!(f, "{m}")
+            }
         }
     }
+}
+
+/// Tokens and cost of one model's share of one call, as recorded in the
+/// `llm_usage` table.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CallUsage {
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    /// API-equivalent list price. Claude Code reports it; for the API it is
+    /// computed from `costs::claude_cost_usd`. None for an unpriced model.
+    pub cost_usd: Option<f64>,
+}
+
+impl CallUsage {
+    /// Every prompt token, cached or not.
+    pub fn prompt_tokens(&self) -> u64 {
+        self.input_tokens + self.cache_read_tokens + self.cache_write_tokens
+    }
+}
+
+/// Totals of one call, for the progress messages.
+#[derive(Debug, Clone, Copy, Default)]
+struct Totals {
+    input: u64,
+    output: u64,
+    cost: Option<f64>,
+}
+
+fn totals(usage: &[CallUsage]) -> Totals {
+    let mut t = Totals::default();
+    for u in usage {
+        t.input += u.prompt_tokens();
+        t.output += u.output_tokens;
+        if let Some(c) = u.cost_usd {
+            t.cost = Some(t.cost.unwrap_or(0.0) + c);
+        }
+    }
+    t
 }
 
 impl std::error::Error for LlmError {}
@@ -65,6 +146,8 @@ pub struct Attribution {
     pub characters: Vec<NewCharacter>,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// API-equivalent cost of the call, when known.
+    pub cost_usd: Option<f64>,
 }
 
 const SYSTEM_PROMPT: &str = "You attribute speech in prose for a multi-voice audiobook. \
@@ -248,30 +331,110 @@ pub fn parse_output(text: &str) -> Result<ParsedOutput, String> {
     Ok((paragraphs, characters))
 }
 
+/// Where requests go.
+pub enum Transport {
+    /// The Messages API with an API key (billed per token).
+    Api { url: String, key: String },
+    /// The user's Claude Code CLI, signed in with their subscription.
+    ClaudeCode(crate::claude_code::Invocation),
+}
+
 pub struct ClaudeClient {
     http: reqwest::Client,
-    api_key: String,
-    url: String,
+    transport: Transport,
+    /// Usage of every call made so far, failed ones included (a failed call
+    /// can still cost tokens). Drained by `take_usage`.
+    ledger: Mutex<Vec<CallUsage>>,
 }
 
 impl ClaudeClient {
-    pub fn new(http: reqwest::Client, api_key: String, url: &str) -> Self {
-        Self {
-            http,
-            api_key,
-            url: url.to_string(),
+    fn via(&self) -> Via {
+        match self.transport {
+            Transport::Api { .. } => Via::Api,
+            Transport::ClaudeCode(_) => Via::ClaudeCode,
         }
     }
 
-    /// One Messages API call with a JSON-schema-constrained answer.
-    /// Returns the answer text and (input, output) token counts.
+    pub fn new(http: reqwest::Client, api_key: String, url: &str) -> Self {
+        Self::with_transport(
+            http,
+            Transport::Api {
+                url: url.to_string(),
+                key: api_key,
+            },
+        )
+    }
+
+    pub fn with_transport(http: reqwest::Client, transport: Transport) -> Self {
+        Self {
+            http,
+            transport,
+            ledger: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// `api` or `claude_code`, as stored in `llm_usage.backend`.
+    pub fn backend(&self) -> &'static str {
+        match self.transport {
+            Transport::Api { .. } => "api",
+            Transport::ClaudeCode(_) => "claude_code",
+        }
+    }
+
+    /// Usage recorded since the last call to this.
+    pub fn take_usage(&self) -> Vec<CallUsage> {
+        self.ledger
+            .lock()
+            .map(|mut l| std::mem::take(&mut *l))
+            .unwrap_or_default()
+    }
+
+    fn record(&self, usage: &[CallUsage]) {
+        if let Ok(mut l) = self.ledger.lock() {
+            l.extend_from_slice(usage);
+        }
+    }
+
+    /// One JSON-schema-constrained request through the configured transport.
     async fn call(
         &self,
         settings: &SegmentationSettings,
         system: &str,
         user: String,
         schema: Value,
-    ) -> Result<(String, u64, u64), LlmError> {
+    ) -> Result<(String, Totals), LlmError> {
+        let (result, usage) = match &self.transport {
+            Transport::Api { url, key } => {
+                self.call_api(url, key, settings, system, user, schema)
+                    .await
+            }
+            Transport::ClaudeCode(inv) => {
+                let req = crate::claude_code::StructuredRequest {
+                    model: &settings.model,
+                    effort: &settings.effort,
+                    system,
+                    schema: &schema,
+                    prompt: user,
+                };
+                let (result, usage) = inv.run(&req).await;
+                (result.map(|v| v.to_string()), usage)
+            }
+        };
+        self.record(&usage);
+        result.map(|text| (text, totals(&usage)))
+    }
+
+    /// One Messages API call. Returns the answer text, plus the usage the
+    /// response reported (also on refusals and max_tokens stops).
+    async fn call_api(
+        &self,
+        url: &str,
+        key: &str,
+        settings: &SegmentationSettings,
+        system: &str,
+        user: String,
+        schema: Value,
+    ) -> (Result<String, LlmError>, Vec<CallUsage>) {
         let body = json!({
             "model": settings.model,
             "max_tokens": 32000,
@@ -283,10 +446,10 @@ impl ClaudeClient {
             "system": system,
             "messages": [{"role": "user", "content": user}]
         });
-        let resp = self
+        let resp = match self
             .http
-            .post(&self.url)
-            .header("x-api-key", &self.api_key)
+            .post(url)
+            .header("x-api-key", key)
             .header("anthropic-version", API_VERSION)
             .header("anthropic-beta", FALLBACK_BETA)
             .header("content-type", "application/json")
@@ -294,38 +457,53 @@ impl ClaudeClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| LlmError::Transient(e.to_string()))?;
+        {
+            Ok(r) => r,
+            Err(e) => return (Err(LlmError::Transient(Via::Api, e.to_string())), vec![]),
+        };
         let status = resp.status();
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| LlmError::Transient(e.to_string()))?;
+        let text = match resp.text().await {
+            Ok(t) => t,
+            Err(e) => return (Err(LlmError::Transient(Via::Api, e.to_string())), vec![]),
+        };
         if !status.is_success() {
             let msg = serde_json::from_str::<Value>(&text)
                 .ok()
                 .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
                 .unwrap_or(text);
             let msg = format!("HTTP {}: {msg}", status.as_u16());
-            return Err(
+            let err =
                 if status.as_u16() == 429 || status.as_u16() == 529 || status.is_server_error() {
-                    LlmError::Transient(msg)
+                    LlmError::Transient(Via::Api, msg)
                 } else {
-                    LlmError::Fatal(msg)
-                },
-            );
+                    LlmError::Fatal(Via::Api, msg)
+                };
+            return (Err(err), vec![]);
         }
-        let v: Value = serde_json::from_str(&text)
-            .map_err(|e| LlmError::Fatal(format!("bad response: {e}")))?;
+        let v: Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(e) => {
+                return (
+                    Err(LlmError::Fatal(Via::Api, format!("bad response: {e}"))),
+                    vec![],
+                );
+            }
+        };
+        let usage = api_usage(&v, &settings.model);
         match v["stop_reason"].as_str() {
             Some("refusal") => {
-                return Err(LlmError::Fatal(format!(
-                    "the model declined this chunk ({})",
-                    v["stop_details"]["category"]
-                        .as_str()
-                        .unwrap_or("no category")
-                )));
+                let err = LlmError::Fatal(
+                    Via::Api,
+                    format!(
+                        "the model declined this chunk ({})",
+                        v["stop_details"]["category"]
+                            .as_str()
+                            .unwrap_or("no category")
+                    ),
+                );
+                return (Err(err), usage);
             }
-            Some("max_tokens") => return Err(LlmError::TooLong),
+            Some("max_tokens") => return (Err(LlmError::TooLong), usage),
             _ => {}
         }
         let out: String = v["content"]
@@ -335,11 +513,7 @@ impl ClaudeClient {
             .filter(|b| b["type"] == "text")
             .filter_map(|b| b["text"].as_str())
             .collect();
-        Ok((
-            out,
-            v["usage"]["input_tokens"].as_u64().unwrap_or(0),
-            v["usage"]["output_tokens"].as_u64().unwrap_or(0),
-        ))
+        (Ok(out), usage)
     }
 
     pub async fn attribute(
@@ -350,15 +524,17 @@ impl ClaudeClient {
         paragraphs: &[PromptParagraph],
     ) -> Result<Attribution, LlmError> {
         let user = build_user_prompt(lang, registry, paragraphs);
-        let (out, input_tokens, output_tokens) = self
+        let (out, t) = self
             .call(settings, SYSTEM_PROMPT, user, output_schema())
             .await?;
-        let (paragraphs, characters) = parse_output(&out).map_err(LlmError::Transient)?;
+        let (paragraphs, characters) =
+            parse_output(&out).map_err(|e| LlmError::Transient(self.via(), e))?;
         Ok(Attribution {
             paragraphs,
             characters,
-            input_tokens,
-            output_tokens,
+            input_tokens: t.input,
+            output_tokens: t.output,
+            cost_usd: t.cost,
         })
     }
 
@@ -373,14 +549,15 @@ impl ClaudeClient {
         segments: &[DirectionSegment],
     ) -> Result<Direction, LlmError> {
         let user = build_direction_prompt(lang, tags, context, segments);
-        let (out, input_tokens, output_tokens) = self
+        let (out, t) = self
             .call(settings, DIRECTION_PROMPT, user, direction_schema())
             .await?;
-        let performances = parse_direction(&out).map_err(LlmError::Transient)?;
+        let performances = parse_direction(&out).map_err(|e| LlmError::Transient(self.via(), e))?;
         Ok(Direction {
             performances,
-            input_tokens,
-            output_tokens,
+            input_tokens: t.input,
+            output_tokens: t.output,
+            cost_usd: t.cost,
         })
     }
 }
@@ -400,6 +577,39 @@ pub struct Direction {
     pub performances: BTreeMap<i64, String>,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cost_usd: Option<f64>,
+}
+
+/// Usage of a Messages API response, priced from the list-price table.
+fn api_usage(v: &Value, requested_model: &str) -> Vec<CallUsage> {
+    let u = &v["usage"];
+    if !u.is_object() {
+        return vec![];
+    }
+    let n = |k: &str| u[k].as_u64().unwrap_or(0);
+    let model = v["model"].as_str().unwrap_or(requested_model).to_string();
+    let (input, output) = (n("input_tokens"), n("output_tokens"));
+    let (cache_read, cache_write) = (
+        n("cache_read_input_tokens"),
+        n("cache_creation_input_tokens"),
+    );
+    vec![CallUsage {
+        cost_usd: crate::costs::claude_cost_usd(&model, input, output, cache_read, cache_write),
+        model,
+        input_tokens: input,
+        output_tokens: output,
+        cache_read_tokens: cache_read,
+        cache_write_tokens: cache_write,
+    }]
+}
+
+/// Characters of the fixed part of each request (system prompt + schema),
+/// for the token estimate: (attribution, audio tags).
+pub fn prompt_overhead_chars() -> (usize, usize) {
+    (
+        SYSTEM_PROMPT.len() + output_schema().to_string().len(),
+        DIRECTION_PROMPT.len() + direction_schema().to_string().len(),
+    )
 }
 
 const DIRECTION_PROMPT: &str = "You direct the voice performance of an audiobook read by ElevenLabs \
@@ -520,6 +730,24 @@ pub fn parse_direction(text: &str) -> Result<BTreeMap<i64, String>, String> {
 mod tests {
     use super::*;
     use crate::lang::by_code;
+
+    #[test]
+    fn errors_name_their_transport() {
+        let e = |via, m: &str| LlmError::Fatal(via, m.into()).to_string();
+        assert_eq!(
+            e(Via::Api, "HTTP 400: bad"),
+            "Claude API error: HTTP 400: bad"
+        );
+        assert_eq!(e(Via::ClaudeCode, "boom"), "Claude Code error: boom");
+        assert_eq!(
+            LlmError::Transient(Via::ClaudeCode, "busy".into()).to_string(),
+            "temporary Claude Code error: busy"
+        );
+        assert_eq!(
+            LlmError::Transient(Via::Api, "HTTP 529".into()).to_string(),
+            "temporary Claude API error: HTTP 529"
+        );
+    }
 
     #[test]
     fn keys_are_normalized() {

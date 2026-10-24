@@ -147,6 +147,14 @@ pub fn model_supports_tags(model: &str) -> bool {
     model.starts_with("eleven_v3") || model.starts_with("eleven_v4")
 }
 
+/// Whether the model can generate a multi-speaker paragraph through
+/// ElevenLabs' HTTP Text-to-Dialogue endpoint. Eleven v3 and v4 are
+/// documented for it; v4 Turbo is documented only for the dialogue
+/// WebSocket, so it keeps per-segment requests.
+pub fn model_supports_dialogue(model: &str) -> bool {
+    matches!(model, "eleven_v3" | "eleven_v4")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,6 +172,15 @@ mod tests {
         assert!(model_supports_tags("eleven_v3"));
         assert!(!model_supports_tags("eleven_multilingual_v2"));
         assert!(!model_supports_tags("eleven_flash_v2_5"));
+    }
+
+    #[test]
+    fn dialogue_capable_models() {
+        assert!(model_supports_dialogue("eleven_v4"));
+        assert!(model_supports_dialogue("eleven_v3"));
+        assert!(!model_supports_dialogue("eleven_v4_turbo"));
+        assert!(!model_supports_dialogue("eleven_multilingual_v2"));
+        assert!(!model_supports_dialogue("eleven_flash_v2_5"));
     }
 
     #[test]

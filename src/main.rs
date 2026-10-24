@@ -1,23 +1,34 @@
 //! Narration Studio: multi-voice audiobook narration with per-segment review.
 
+mod acx;
 mod app;
 mod audio;
+mod check;
+mod claude_code;
 mod config;
+mod costs;
 mod db;
+mod dialogue;
 mod export;
 mod hash;
 mod lang;
 mod llm;
 mod model;
 mod player;
+mod retail;
 mod segment;
 mod tags;
 mod theme;
+mod trim;
 mod tts;
+mod voices;
 mod worker;
 
 fn main() -> eframe::Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info,whisper_rs=warn"),
+    )
+    .init();
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Narration Studio")
