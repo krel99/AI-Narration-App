@@ -103,13 +103,23 @@ servers, so they need no keys, accounts or downloads.
    give back the exact source words, the suggestion is rejected.
 3. **Review tab**: fix attribution and tags while it is free. Change speakers,
    merge or split segments (*Split…* takes `|` markers), and edit a segment's
-   tags in the detail panel. **✦ Audio tags** re-runs the tagging for all
-   draft segments. Segments whose speaker has no voice show ⚠ and are
-   skipped.
+   tags in the detail panel. Merging keeps both halves' takes in the merged
+   segment's take list (nothing paid is deleted). **✦ Audio tags** re-runs
+   the tagging for all draft segments. **Re-segment drafts** re-runs the
+   attribution for paragraphs without any audio: a paragraph with a take
+   (also a draft's older takes, after a tag or speaker change) or one being
+   generated is left as it is. Segments whose speaker has no voice show ⚠
+   and are skipped.
 4. **Generate N drafts**. A confirmation shows the character count and the
    estimated credits first (see [Costs](#costs)), and how many paragraphs
    go through [multi-speaker dialogue](#multi-speaker-dialogue). Identical
-   inputs reuse cached takes at no cost.
+   inputs reuse cached takes at no cost; the confirmation counts them and
+   leaves them out of the estimate. **Cancel** stops every request that has
+   not been sent yet; requests already on their way finish and are kept.
+   A take that arrives after you approved its segment, or changed its
+   speaker, text or tags, goes into the take list without replacing
+   anything. Claude passes still running on the chapter leave alone what
+   you generate meanwhile.
 5. Review with the keyboard and approve or re-roll. Each new take is
    [checked](#take-checking) in the background; a flagged take shows ⚠.
    The detail panel shows the take's waveform, where its
@@ -150,7 +160,9 @@ ways to run it:
   The calls count against your plan's usage limits, which are shared with
   the Claude apps (claude.ai, desktop, mobile). When a limit is reached, the
   run stops with the reset time and leaves unattributed paragraphs as they
-  are; *Re-segment drafts* continues later. If your plan does not include
+  are; **Continue segmenting (N)** in the Review toolbar later attributes
+  only those, without sending the finished ones again (Cancel during
+  segmentation leaves the same button). If your plan does not include
   the project's model (Claude Code says e.g. "Claude Opus is not available
   with the Claude Pro plan"), set Project → Claude → Model to
   `claude-sonnet-5-5`. This backend is meant for your own use on your own
@@ -166,7 +178,11 @@ ways to run it:
   key: run `claude auth login` and choose your subscription.
 - **Anthropic API key — pay per use.** Requests go to the Messages API and are
   billed per token. Pick it in Settings if you prefer API billing or have no
-  Claude subscription.
+  Claude subscription. A refused key, a key without access to the model or
+  an empty credit balance stops the run once with that message (like a
+  Claude Code usage limit) instead of failing chapter window by window.
+  When a request is declined and served by the fallback model, both
+  attempts count in the Claude cost.
 
 ## Costs
 
@@ -287,6 +303,9 @@ take, never blocks approving it and never costs credits
   ("um", laughter) are ignored. An audio tag that was read aloud
   (`[whispers]` heard as "whispers") is flagged. Short dialogue tags are
   judged leniently, and non-English text more leniently than English.
+- A result belongs to the text it was checked against: a take picked again
+  after its segment was merged, split or re-tagged shows as not checked, and
+  **Check chapter** checks it against the current text.
 - Checking new takes automatically can be turned off in Settings; **Check
   chapter** and **Re-check** work either way.
 
@@ -321,7 +340,12 @@ reviewed, approved and re-rolled on its own
   is discarded and the paragraph is generated per segment instead, which
   bills its characters a second time; the status bar says so, and the
   discarded dialogue counts in the credits used. After two such paragraphs
-  in one generation, the rest of it goes per segment straight away.
+  in one generation, the rest of it goes per segment straight away. That
+  holds however many requests run at once: at most two dialogues are on
+  their way (or being checked) at a time.
+- A paragraph whose lines all have takes made one by one already (an older
+  library, dialogue turned off, a chapter imported again to fix a typo)
+  reuses those takes for nothing instead of being sent as a dialogue.
 - Takes cut from a dialogue are marked **dialogue** in the take list. Each
   carries the request id and its share of the request's credits, by
   characters (estimated at the learned rate, and marked `≈`, when
@@ -380,7 +404,8 @@ included, uses the takes as trimmed.
   `<Book title> - Retail Sample.mp3` from approved takes only, starting at
   the segment selected in Review (or the chapter start), 1 to 5 minutes
   (3 by default), ending at a paragraph end where it can, faded in over
-  0.5 s and out over 3 s, mastered and tagged like the chapters. If the
+  0.5 s and out over 3 s (a sample cut inside a long segment fades out
+  where the voice is cut), mastered and tagged like the chapters. If the
   range reaches a segment that is not approved, or a paragraph that has no
   segments yet, the sample stops before it and says so. ACX wants up to 5
   minutes from the book itself (not the credits) and recommends the
@@ -443,7 +468,7 @@ Every pipeline stage resumes from this state after a restart.
 | `src/db/retail.rs` | Export reports and the retail sample |
 | `src/db/takecheck.rs` | `take_check` table queries |
 | `src/db/dialogue.rs` | Storing a dialogue paragraph's takes together |
-| `src/audio.rs` | PCM/WAV handling, MP3-fallback decode |
+| `src/audio.rs` | PCM/WAV handling, MP3-fallback decode, band-limited resampling |
 | `src/trim.rs` | Silence trimming: detection, cut and fade, waveform peaks, loading a take's audio with its trim |
 | `src/export.rs` | Streaming assembly with silences |
 | `src/export/mastering.rs` | Loudness, tags, cover art, retail sample |
@@ -451,7 +476,7 @@ Every pipeline stage resumes from this state after a restart.
 | `src/retail.rs` | Publication metadata and tag mapping, cover checks, retail-sample planning, book-level checks |
 | `src/check.rs` | Take check: settings, results, length check, hallucination filter, combining the findings |
 | `src/check/text.rs` | Text normalisation, word alignment and the flag thresholds |
-| `src/check/resample.rs` | Anti-aliased resampling to Whisper's 16 kHz input |
+| `src/check/resample.rs` | Whisper's 16 kHz input (through the band-limited resampler) |
 | `src/check/models.rs` | Whisper model catalog, checksum verification, download |
 | `src/check/whisper.rs` | whisper-rs backend (feature `whisper`) |
 | `src/hash.rs` | Take hash |

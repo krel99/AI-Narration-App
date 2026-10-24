@@ -166,6 +166,10 @@ default that can be changed.
   are still sent as context.
 - Paragraphs that already have audio (any take, or any non-draft segment) are
   never re-segmented, so re-running segmentation cannot discard paid takes.
+  The rule is checked again in the transaction that stores the new segments
+  (`replace_untouched_paragraph`), and paragraphs with a segment being
+  generated are left alone, so a generation running at the same time cannot
+  lose its takes either (see "Review fixes after the merge").
 - Validation: segment texts must appear in order in the paragraph with only
   whitespace between them and cover it completely. Narration segments are
   always assigned to `narrator`. Segments with nothing speakable (a lone dash)
@@ -844,6 +848,88 @@ dialogue) and merged. Where they meet:
   an export do not mark its report outdated, and a discarded dialogue's
   credits appear in the run's summary and the log, not in the chapter's
   take total.
+
+### Review fixes after the merge
+
+An adversarial review of the merged app found these; each has a regression
+test.
+
+- **Paid takes are never deleted or detached by a pass.** Re-segmenting
+  counts a paragraph as untouched only when no segment has any take (a tag,
+  speaker, merge or split edit leaves a draft with its older takes), checks
+  that again in the storing transaction, and skips paragraphs with a
+  segment in the worker's `busy` set: the segments a running generation
+  will store takes for, registered under the database lock when it starts
+  and released by a guard when the paragraph's task ends. The audio-tag
+  pass re-reads every segment before writing its tags and skips one that
+  is no longer the draft without audio Claude saw (generated meanwhile, or
+  busy). Both report what they left alone.
+- **A finished take respects what happened meanwhile.** `generate_one`
+  stores the take and decides whether it becomes current in one IMMEDIATE
+  transaction (`Db::immediate`): only while the segment is not approved and
+  its speaker's voice, spoken text, settings, model and format still give
+  the requested take hash. Otherwise the take is kept in the list and the
+  status bar says why. `set_current_take` refuses approved segments, and
+  dialogue paragraphs compare the group hash the same way
+  (`DialogueGroup::make_current`). The UI disables Merge and Split while a
+  take of the segments involved is on its way.
+- **Merge keeps both halves' takes** (moved to the merged segment, with
+  their checks, trims and cost rows), so the chapter's credits and the
+  learned rate keep them, and splitting back finds the second half's audio.
+- **Cancel stops queued requests.** Per-segment jobs and dialogue
+  paragraphs check the epoch after every request slot they get (retries
+  included); what was not sent is reported as cancelled, not failed.
+  Segmentation stopped by Cancel skips the automatic tag pass and says so.
+  `generate` reports every segment it started exactly once, even when a
+  task dies, so no row keeps spinning; a Retry-After that is negative,
+  infinite or longer than 300 s is ignored instead of panicking.
+- **The discarded-dialogue limit is strict.** A semaphore with
+  `MAX_DISCARDED_PER_RUN` permits: a dialogue holds one from before it is
+  sent until it is validated, a billed discard keeps it for good, and at
+  the limit the semaphore closes. At most that many dialogues are in
+  flight at once, which is what keeps the Generate dialog's promise.
+- **Dialogue reuses per-segment takes.** A qualifying paragraph whose every
+  line has a cached first take (`Db::cached_first_take`, the rule
+  `generate_one` applies) goes per segment for nothing. The Generate
+  estimate leaves cached first takes out (a dialogue paragraph counts as
+  cached only when all its lines are).
+- **Continue segmenting.** Dialogue paragraphs are flagged
+  `attribution_pending` when a pass targets them and unflagged when stored;
+  a pass that stops (usage limit, sign-in, Cancel) leaves exactly the
+  remaining ones flagged, and `SegmentChapter { resume: true }` sends only
+  those.
+- **API errors that fail every request stop the pass.** 401
+  (`authentication_error`) and 403 (`permission_error`) map to
+  `LlmError::Auth`; 402 (`billing_error`) and a 400 about the credit
+  balance to `UsageLimit`. With server-side fallback, `usage.iterations` is
+  read when present: one usage row per model, so a declined attempt is
+  counted at its own rates.
+- **Take checks are tied to their text.** `take_check.text_key` records the
+  segment's text and tags the take was compared with. A result for another
+  text is not shown, not counted as flagged or fine, and is redone by Check
+  chapter (and by the checker even when dismissed or length-only).
+- **Word-error flags are monotonic in line length.** Lines of `long_words`
+  or more use `long_wer`, but never a limit below what the longest shorter
+  line needs (`wer_limit`), and `short_min_errors` applies to every line, so
+  a fixed number of differences never flags a longer line while sparing a
+  shorter one (two misspelt names no longer flag 15–16-word lines only).
+- **Audio.** Takes at another rate are resampled for export with the
+  windowed-sinc polyphase filter the take check used (now
+  `audio::resample_poly`), not linear interpolation, so nothing aliases
+  into the delivered files; the work rate stays the project's format. A
+  retail sample cut inside a segment ramps the cut over 30 ms and ends its
+  3 s fade-out at the cut instead of at the end of the file.
+- **UI.** The Retail & ACX window counts as a dialog for Review's keys
+  (A or R cannot act on a hidden segment), is never wider than the window,
+  shows Result right after the chapter title and scrolls the grid sideways
+  when needed. The retail sample dialog sits above it (`Order::Foreground`)
+  and is raised when asked for again. The cover check caches several files,
+  so Project settings and the Retail window do not re-read covers every
+  frame. Retail staleness is reloaded only while that window is open (or on
+  a project change and after exports), Claude usage and the credit rate
+  only on a chapter change and on pass, generation and account events. The
+  take-check progress is a still bar instead of a spinner, so hours of
+  checking do not repaint the window every frame.
 
 ### To verify against a real account
 
