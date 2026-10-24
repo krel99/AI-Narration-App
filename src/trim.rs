@@ -60,31 +60,61 @@ fn ms_to_sample(pcm: &Pcm, ms: u32) -> usize {
     ((ms as u64 * pcm.rate as u64 / 1000) as usize).min(pcm.samples.len())
 }
 
+/// The detector's input: the mean square of every 10 ms frame of a take.
+/// It is small (100 values per second), so the waveform keeps it next to the
+/// peaks and re-runs detection with new settings without reading the WAV.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Frames {
+    rate: u32,
+    /// Samples in the take.
+    len: usize,
+    /// Samples per frame (the last frame may be shorter).
+    frame: usize,
+    /// Mean square per frame.
+    power: Vec<f64>,
+}
+
+impl Frames {
+    pub fn of(pcm: &Pcm) -> Self {
+        let frame = ((pcm.rate as u64 * FRAME_MS as u64 / 1000) as usize).max(1);
+        let power = pcm
+            .samples
+            .chunks(frame)
+            .map(|c| c.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>() / c.len() as f64)
+            .collect();
+        Self {
+            rate: pcm.rate,
+            len: pcm.samples.len(),
+            frame,
+            power,
+        }
+    }
+}
+
 /// Find the range to keep: from the first to the last 10 ms frame above the
 /// threshold, widened by the head/tail margins and clamped to the take.
 /// Returns `None` for an empty or all-silent take (nothing is ever cut to
 /// nothing). The range is never empty or inverted.
 pub fn detect(pcm: &Pcm, s: &TrimSettings) -> Option<(u32, u32)> {
-    if pcm.rate == 0 || pcm.samples.is_empty() {
+    detect_frames(&Frames::of(pcm), s)
+}
+
+/// [`detect`] on precomputed frames.
+pub fn detect_frames(f: &Frames, s: &TrimSettings) -> Option<(u32, u32)> {
+    if f.rate == 0 || f.len == 0 {
         return None;
     }
-    let frame = ((pcm.rate as u64 * FRAME_MS as u64 / 1000) as usize).max(1);
     // Compare mean squares, so no square root or log per frame.
     let full_scale = 32768.0f64;
     let threshold = 10f64.powf(s.threshold_db as f64 / 10.0) * full_scale * full_scale;
-    let loud = |chunk: &[i16]| {
-        let sum: f64 = chunk.iter().map(|&x| (x as f64) * (x as f64)).sum();
-        sum / chunk.len() as f64 > threshold
-    };
-    let frames: Vec<&[i16]> = pcm.samples.chunks(frame).collect();
-    let first = frames.iter().position(|c| loud(c))?;
-    let last = frames.iter().rposition(|c| loud(c))?;
-    let start_sample = first * frame;
-    let end_sample = ((last + 1) * frame).min(pcm.samples.len());
-    let rate = pcm.rate as u64;
+    let first = f.power.iter().position(|&p| p > threshold)?;
+    let last = f.power.iter().rposition(|&p| p > threshold)?;
+    let start_sample = first * f.frame;
+    let end_sample = ((last + 1) * f.frame).min(f.len);
+    let rate = f.rate as u64;
     let start_ms = (start_sample as u64 * 1000 / rate) as u32;
     let end_ms = (end_sample as u64 * 1000).div_ceil(rate) as u32;
-    let dur = duration_ms(pcm);
+    let dur = (f.len as u64 * 1000).div_ceil(rate) as u32;
     let start = start_ms.saturating_sub(s.keep_head_ms);
     let end = end_ms.saturating_add(s.keep_tail_ms).min(dur);
     (end > start).then_some((start, end))
@@ -318,6 +348,62 @@ pub(crate) mod tests {
         // Both become head margin + tone + tail margin.
         assert_eq!(la, lb);
         assert_eq!(la as u32, (40 + 300 + 80) * RATE / 1000);
+    }
+
+    #[test]
+    fn detection_on_cached_frames_matches_detect() {
+        let takes = [
+            pcm(&[silence(300), tone(500), hiss(400)]),
+            pcm(&[tone(250)]),
+            pcm(&[silence(20), tone(100), silence(30)]),
+            pcm(&[tone(5)]),
+            pcm(&[silence(500)]),
+            pcm(&[]),
+            Pcm {
+                rate: 22050,
+                samples: [vec![0; 3001], vec![9000; 777], vec![0; 4410]].concat(),
+            },
+        ];
+        let settings = [
+            TrimSettings::default(),
+            TrimSettings {
+                threshold_db: -80.0,
+                keep_head_ms: 0,
+                keep_tail_ms: 5,
+                ..Default::default()
+            },
+            TrimSettings {
+                threshold_db: -20.0,
+                keep_head_ms: 1000,
+                keep_tail_ms: 0,
+                ..Default::default()
+            },
+        ];
+        for p in &takes {
+            let frames = Frames::of(p);
+            for s in &settings {
+                assert_eq!(detect_frames(&frames, s), detect(p, s));
+            }
+        }
+        // 22.05 kHz: 220-sample frames. The burst (samples 3001..3778) lies in
+        // frames 13..=17, samples 2860..3960 = 129.7 ms .. 179.6 ms.
+        let tight = TrimSettings {
+            keep_head_ms: 0,
+            keep_tail_ms: 0,
+            ..Default::default()
+        };
+        assert_eq!(detect(&takes[6], &tight), Some((129, 180)));
+    }
+
+    #[test]
+    fn old_project_settings_load_with_trimming_off() {
+        let p: crate::model::ProjectSettings =
+            serde_json::from_str(r#"{"concurrency": 3}"#).unwrap();
+        assert_eq!(p.trim, TrimSettings::default());
+        assert!(!p.trim.enabled);
+        let t: TrimSettings = serde_json::from_str(r#"{"enabled": true}"#).unwrap();
+        assert!(t.enabled);
+        assert_eq!((t.threshold_db, t.keep_head_ms, t.fade_ms), (-50.0, 40, 10));
     }
 
     #[test]

@@ -283,14 +283,14 @@ impl Db {
             )?;
         }
         // Libraries created before silence trimming lack the trim columns.
-        let has_trim: bool = conn
-            .prepare("SELECT 1 FROM pragma_table_info('take') WHERE name = 'trim_start_ms'")?
-            .exists([])?;
-        if !has_trim {
-            conn.execute_batch(
-                "ALTER TABLE take ADD COLUMN trim_start_ms INTEGER;
-                 ALTER TABLE take ADD COLUMN trim_end_ms INTEGER;",
-            )?;
+        // Checked one by one, so an interrupted migration still completes.
+        for col in ["trim_start_ms", "trim_end_ms"] {
+            let has: bool = conn
+                .prepare("SELECT 1 FROM pragma_table_info('take') WHERE name = ?1")?
+                .exists([col])?;
+            if !has {
+                conn.execute_batch(&format!("ALTER TABLE take ADD COLUMN {col} INTEGER"))?;
+            }
         }
         Ok(Self { conn })
     }
@@ -1237,5 +1237,39 @@ mod tests {
         drop(db);
         // Opening again is a no-op migration.
         assert_eq!(Db::open(&path).unwrap().take(old.id).unwrap().trim_ms, None);
+    }
+
+    #[test]
+    fn interrupted_trim_migration_completes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("half.sqlite");
+        // Only the first trim column made it in before the app stopped.
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(&SCHEMA.replace("    trim_end_ms  INTEGER,\n", ""))
+            .unwrap();
+        let mut db = Db::open(&path).unwrap();
+        let pid = db.create_project("Book", "en").unwrap();
+        let cid = db.import_chapter(pid, "One", "Text.").unwrap();
+        let p = db.paragraphs(cid).unwrap()[0].clone();
+        db.replace_paragraph_segments(
+            p.id,
+            &[(SegmentKind::Narration, NARRATOR.into(), "Text.".into())],
+        )
+        .unwrap();
+        let sid = db.chapter_segments(cid).unwrap()[0].id;
+        let take = db
+            .insert_take(&NewTake {
+                segment_id: sid,
+                seed: 1,
+                request_id: None,
+                audio_path: "a.wav",
+                hash: "h",
+                credits_used: 0,
+                credits_exact: true,
+            })
+            .unwrap();
+        db.set_take_trim(take, Some((5, 50))).unwrap();
+        assert_eq!(db.take(take).unwrap().trim_ms, Some((5, 50)));
     }
 }

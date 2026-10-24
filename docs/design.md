@@ -283,12 +283,25 @@ so "0 ms within a paragraph" did not give even gaps.
   skipped, including ones approved while it runs. The detail panel's
   **Auto-trim** works on one take even when automatic trimming is off. Neither
   spends credits.
-- **Waveform**: min/max peaks (2048 buckets) are computed once per audio file
-  and cached, then drawn one column per pixel. The cut-off parts are shaded.
-  Dragging moves the nearest handle and saves on release. At least 20 ms is
-  kept, and dragging back to the full range stores "untrimmed". While the take
-  plays, a playhead follows rodio's per-source position. Approved segments
-  show the waveform read-only.
+- **Waveform**: a background thread reads each audio file once and computes
+  min/max peaks (2048 buckets) plus the detector's 10 ms frame energies
+  (`trim::Frames`); the UI thread never reads a WAV to draw it and shows a
+  placeholder until the thread is done. The detail panel's Auto-trim runs
+  `trim::detect_frames` on those cached frames, so it gives the same range
+  as the worker without reading the file again. Peaks are drawn one column
+  per pixel and the cut-off parts are shaded. A press on or beyond a handle
+  grabs that handle (between them, the nearer one); the trim is saved on
+  release. A drag that ends without its release reaching the waveform (the
+  segment was approved or the take changed meanwhile) is dropped unsaved. At
+  least 20 ms is kept, and dragging back to the full range stores
+  "untrimmed". While the take plays, a playhead follows rodio's per-source
+  position. Approved segments show the waveform read-only.
+- **Locking**: automatic trimming re-checks, just before storing, that the
+  segment was not approved while its take was analysed; Auto-trim chapter
+  does the same and also checks the take is still current. The fade length is
+  a project setting applied at load time, so changing it also changes the
+  cut points of approved trimmed takes (by at most the fade length, inside the
+  kept margins).
 - **Breaths** inside a take are never touched. At either end they are cut only
   when they are quieter than the threshold. Raising it (e.g. to -40 dBFS) cuts
   more, at the risk of clipping soft word onsets.

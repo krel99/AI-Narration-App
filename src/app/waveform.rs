@@ -5,8 +5,10 @@
 //! A trim is metadata on the take (see `crate::trim`): editing it never
 //! touches the WAV and costs nothing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::rc::Rc;
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::Duration;
 
 use eframe::egui::{
@@ -29,30 +31,108 @@ const MIN_KEEP_MS: u32 = 20;
 const CACHE_LIMIT: usize = 256;
 
 /// Waveform state kept on the App.
-#[derive(Default)]
 pub(super) struct WaveState {
-    /// Peaks per audio file. A take's WAV never changes, so they are
-    /// computed once (takes that share a cached file share the entry).
+    /// Waveforms per audio file. A take's WAV never changes, so each file
+    /// is read once (takes that share a cached file share the entry).
     cache: HashMap<String, Rc<Wave>>,
+    /// Audio files being read on a background thread: the UI thread never
+    /// reads a WAV to draw it.
+    loading: HashSet<String>,
+    loaded_tx: Sender<(String, Wave)>,
+    loaded_rx: Receiver<(String, Wave)>,
     drag: Option<Drag>,
     /// The take queued by the last single-take play; `None` after a
     /// paragraph play, which plays each segment's current take.
     pub(super) playing_take: Option<Id>,
 }
 
+impl Default for WaveState {
+    fn default() -> Self {
+        let (loaded_tx, loaded_rx) = channel();
+        Self {
+            cache: HashMap::new(),
+            loading: HashSet::new(),
+            loaded_tx,
+            loaded_rx,
+            drag: None,
+            playing_take: None,
+        }
+    }
+}
+
 struct Wave {
     peaks: Vec<(i16, i16)>,
     duration_ms: u32,
+    /// The detector's input, so Auto-trim does not read the file again.
+    frames: Option<trim::Frames>,
     error: Option<String>,
 }
 
-#[derive(Clone, Copy)]
+impl Wave {
+    /// Read a take's WAV and prepare it for drawing (blocking).
+    fn load(path: &Path) -> Self {
+        match audio::read_wav(path) {
+            Ok(pcm) => Wave {
+                peaks: trim::peaks(&pcm, PEAK_BUCKETS),
+                duration_ms: trim::duration_ms(&pcm),
+                frames: Some(trim::Frames::of(&pcm)),
+                error: None,
+            },
+            Err(e) => Wave {
+                peaks: Vec::new(),
+                duration_ms: 0,
+                frames: None,
+                error: Some(format!("{e:#}")),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Drag {
     take_id: Id,
     /// Dragging the end handle (otherwise the start handle).
     end: bool,
     start_ms: u32,
     end_ms: u32,
+}
+
+impl Drag {
+    /// Move the dragged handle to `ms`, keeping at least `MIN_KEEP_MS`
+    /// between the handles and both inside the take.
+    fn moved(self, ms: u32, dur: u32) -> Self {
+        let ms = ms.min(dur);
+        if self.end {
+            Self {
+                end_ms: ms.clamp((self.start_ms + MIN_KEEP_MS).min(dur), dur),
+                ..self
+            }
+        } else {
+            Self {
+                start_ms: ms.min(self.end_ms.saturating_sub(MIN_KEEP_MS)),
+                ..self
+            }
+        }
+    }
+
+    /// The trim to store on release; the whole take is stored as untrimmed.
+    fn trim(&self, dur: u32) -> Option<(u32, u32)> {
+        let whole = self.start_ms == 0 && self.end_ms >= dur;
+        (!whole).then_some((self.start_ms, self.end_ms))
+    }
+}
+
+/// Which handle a press at `x` grabs: the end handle when the press is at
+/// or right of it, the start handle when at or left of it, otherwise the
+/// nearer one. Handles that touch can still be pulled apart either way.
+fn grabs_end(x: f32, xs: f32, xe: f32) -> bool {
+    if x >= xe {
+        true
+    } else if x <= xs {
+        false
+    } else {
+        (x - xe).abs() < (x - xs).abs()
+    }
 }
 
 impl App {
@@ -63,30 +143,35 @@ impl App {
         trim::load_take(&self.lib, take, settings)
     }
 
-    fn wave_for(&mut self, take: &Take) -> Rc<Wave> {
+    /// The waveform of a take's audio file: from the cache, or `None` while a
+    /// background thread reads it (it asks for a repaint when done).
+    fn wave_for(&mut self, ctx: &egui::Context, take: &Take) -> Option<Rc<Wave>> {
+        while let Ok((key, wave)) = self.wave.loaded_rx.try_recv() {
+            self.wave.loading.remove(&key);
+            if self.wave.cache.len() >= CACHE_LIMIT {
+                self.wave.cache.clear();
+            }
+            self.wave.cache.insert(key, Rc::new(wave));
+        }
         if let Some(w) = self.wave.cache.get(&take.audio_path) {
-            return w.clone();
+            return Some(w.clone());
         }
-        let wave = match audio::read_wav(&self.lib.audio_path(&take.audio_path)) {
-            Ok(pcm) => Wave {
-                peaks: trim::peaks(&pcm, PEAK_BUCKETS),
-                duration_ms: trim::duration_ms(&pcm),
-                error: None,
-            },
-            Err(e) => Wave {
-                peaks: Vec::new(),
-                duration_ms: 0,
-                error: Some(format!("{e:#}")),
-            },
-        };
-        if self.wave.cache.len() >= CACHE_LIMIT {
-            self.wave.cache.clear();
+        if self.wave.loading.insert(take.audio_path.clone()) {
+            let key = take.audio_path.clone();
+            let path = self.lib.audio_path(&take.audio_path);
+            let (tx, ctx) = (self.wave.loaded_tx.clone(), ctx.clone());
+            let spawned = std::thread::Builder::new()
+                .name("waveform".into())
+                .spawn(move || {
+                    let _ = tx.send((key, Wave::load(&path)));
+                    ctx.request_repaint();
+                });
+            if let Err(e) = spawned {
+                self.wave.loading.remove(&take.audio_path);
+                log::warn!("waveform thread: {e}");
+            }
         }
-        let wave = Rc::new(wave);
-        self.wave
-            .cache
-            .insert(take.audio_path.clone(), wave.clone());
-        wave
+        None
     }
 
     /// Save a take's trim and show it right away (the take list is the
@@ -111,17 +196,12 @@ impl App {
             return;
         };
         let p = *theme::palette(ui);
-        let wave = self.wave_for(&take);
-        ui.add_space(6.0);
-        if let Some(e) = &wave.error {
-            ui.colored_label(p.rejected, format!("Waveform unavailable: {e}"));
-            return;
-        }
-        let dur = wave.duration_ms.max(1);
         let editable = !locked;
-        if self.wave.drag.is_some_and(|d| d.take_id != take.id) {
+        // A drag belongs to one editable take; anything else ends it unsaved.
+        if self.wave.drag.is_some_and(|d| d.take_id != take.id) || !editable {
             self.wave.drag = None;
         }
+        ui.add_space(6.0);
 
         // Stay clear of the panel's (floating) scroll bar at the right edge,
         // or grabbing the end handle would grab the scroll bar.
@@ -130,57 +210,89 @@ impl App {
             s.bar_inner_margin + s.bar_width + s.bar_outer_margin
         };
         let width = (ui.available_width() - bar).max(120.0);
+        let Some(wave) = self.wave_for(ui.ctx(), &take) else {
+            // Same footprint as the waveform, so nothing jumps when it arrives.
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(width, WAVE_H), Sense::hover());
+            ui.painter()
+                .rect_filled(rect, 6.0, ui.visuals().faint_bg_color);
+            ui.painter().text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                "Reading the take…",
+                FontId::proportional(11.5),
+                p.muted,
+            );
+            ui.horizontal_wrapped(|ui| {
+                ui.add_enabled(false, egui::Button::new("✂ Auto-trim").small());
+                ui.add_enabled(false, egui::Button::new("Reset trim").small());
+            });
+            return;
+        };
+        if let Some(e) = &wave.error {
+            ui.colored_label(p.rejected, format!("Waveform unavailable: {e}"));
+            return;
+        }
+        let dur = wave.duration_ms.max(1);
         let sense = if editable {
             Sense::click_and_drag()
         } else {
             Sense::hover()
         };
-        let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, WAVE_H), sense);
+        let (rect, _) = ui.allocate_exact_size(Vec2::new(width, WAVE_H), Sense::hover());
+        // A stable id, so a drag survives layout changes above the waveform.
+        let resp = ui.interact(
+            rect,
+            ui.make_persistent_id(("trim_waveform", take.id)),
+            sense,
+        );
         let x_of = |ms: u32| rect.left() + rect.width() * (ms.min(dur) as f32 / dur as f32);
         let ms_of = |x: f32| {
             (((x - rect.left()) / rect.width()).clamp(0.0, 1.0) * dur as f32).round() as u32
         };
 
-        // Dragging a handle: the nearest one moves, committed on release.
-        let (stored_start, stored_end) = take.trim_ms.unwrap_or((0, dur));
+        // Dragging a handle: the one on the pressed side moves, committed on
+        // release.
+        let (stored_start, stored_end) = take
+            .trim_ms
+            .map_or((0, dur), |(s, e)| (s.min(dur), e.min(dur)));
         if editable {
             if resp.drag_started()
-                && let Some(pos) = resp.interact_pointer_pos()
+                && let Some(pos) = ui
+                    .input(|i| i.pointer.press_origin())
+                    .or(resp.interact_pointer_pos())
             {
-                let end = (pos.x - x_of(stored_end)).abs() < (pos.x - x_of(stored_start)).abs();
                 self.wave.drag = Some(Drag {
                     take_id: take.id,
-                    end,
+                    end: grabs_end(pos.x, x_of(stored_start), x_of(stored_end)),
                     start_ms: stored_start,
-                    end_ms: stored_end.min(dur),
+                    end_ms: stored_end,
                 });
             }
-            if let Some(d) = &mut self.wave.drag {
-                if resp.dragged()
+            if let Some(mut d) = self.wave.drag {
+                if (resp.dragged() || resp.drag_stopped())
                     && let Some(pos) = resp.interact_pointer_pos()
                 {
-                    let ms = ms_of(pos.x);
-                    if d.end {
-                        d.end_ms = ms.clamp((d.start_ms + MIN_KEEP_MS).min(dur), dur);
-                    } else {
-                        d.start_ms = ms.min(d.end_ms.saturating_sub(MIN_KEEP_MS));
-                    }
+                    d = d.moved(ms_of(pos.x), dur);
                 }
                 if resp.drag_stopped() {
-                    let d = *d;
                     self.wave.drag = None;
                     resp.surrender_focus();
-                    let whole = d.start_ms == 0 && d.end_ms >= dur;
-                    let new = (!whole).then_some((d.start_ms, d.end_ms));
+                    let new = d.trim(dur);
                     if new != take.trim_ms {
                         self.store_trim(ui.ctx(), take.id, new);
                     }
+                } else if resp.dragged() {
+                    self.wave.drag = Some(d);
+                } else {
+                    // The pointer was released without this waveform seeing
+                    // it: drop the drag rather than show a range never saved.
+                    self.wave.drag = None;
                 }
             }
         }
         let (start, end) = match self.wave.drag {
             Some(d) => (d.start_ms, d.end_ms),
-            None => (stored_start, stored_end.min(dur)),
+            None => (stored_start, stored_end),
         };
         let (xs, xe) = (x_of(start), x_of(end));
 
@@ -355,16 +467,22 @@ impl App {
                 .as_ref()
                 .map(|p| p.settings.trim.clone())
                 .unwrap_or_default();
-            match trim::detect_take(&self.lib, &take, &settings) {
-                Ok(Some(range)) => self.store_trim(ui.ctx(), take.id, Some(range)),
-                Ok(None) => self.note(
+            // Same detector as the worker, on the frames read with the
+            // waveform: no file read on the UI thread.
+            match wave
+                .frames
+                .as_ref()
+                .map(|f| trim::detect_frames(f, &settings))
+            {
+                Some(Some(range)) => self.store_trim(ui.ctx(), take.id, Some(range)),
+                Some(None) => self.note(
                     false,
                     format!(
                         "Nothing in this take is above {} dB; left as it is.",
                         settings.threshold_db
                     ),
                 ),
-                Err(e) => self.note(true, format!("Auto-trim: {e:#}")),
+                None => self.note(true, "Auto-trim: the take could not be read.".into()),
             }
         }
         if reset {
@@ -420,10 +538,25 @@ pub(super) fn trim_settings_ui(ui: &mut egui::Ui, t: &mut TrimSettings) {
             )
             .on_hover_text("10 ms frames quieter than this count as silence");
             ui.end_row();
-            for (label, v, max) in [
-                ("Keep before speech", &mut t.keep_head_ms, 2000),
-                ("Keep after speech", &mut t.keep_tail_ms, 3000),
-                ("Fade in/out", &mut t.fade_ms, 200),
+            for (label, v, max, hint) in [
+                (
+                    "Keep before speech",
+                    &mut t.keep_head_ms,
+                    2000,
+                    "Silence left before the first sound (used by detection)",
+                ),
+                (
+                    "Keep after speech",
+                    &mut t.keep_tail_ms,
+                    3000,
+                    "Silence left after the last sound (used by detection)",
+                ),
+                (
+                    "Fade in/out",
+                    &mut t.fade_ms,
+                    200,
+                    "Applied at the cut points whenever a trimmed take is played or exported, approved takes included",
+                ),
             ] {
                 ui.label(label);
                 ui.add(
@@ -431,8 +564,60 @@ pub(super) fn trim_settings_ui(ui: &mut egui::Ui, t: &mut TrimSettings) {
                         .range(0..=max)
                         .speed(5)
                         .suffix(" ms"),
-                );
+                )
+                .on_hover_text(hint);
                 ui.end_row();
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn drag(end: bool, start_ms: u32, end_ms: u32) -> Drag {
+        Drag {
+            take_id: 1,
+            end,
+            start_ms,
+            end_ms,
+        }
+    }
+
+    #[test]
+    fn handles_keep_their_order_and_a_minimum_length() {
+        let dur = 3000;
+        // The start handle cannot pass the end handle (minus 20 ms).
+        let d = drag(false, 0, 1000).moved(2500, dur);
+        assert_eq!((d.start_ms, d.end_ms), (980, 1000));
+        // The end handle cannot pass the start handle, nor leave the take.
+        let d = drag(true, 500, 3000).moved(100, dur);
+        assert_eq!((d.start_ms, d.end_ms), (500, 520));
+        let d = drag(true, 500, 1000).moved(9999, dur);
+        assert_eq!(d.end_ms, 3000);
+        // A take shorter than the minimum keeps all of it.
+        let d = drag(true, 0, 10).moved(0, 10);
+        assert_eq!((d.start_ms, d.end_ms), (0, 10));
+        let d = drag(false, 0, 10).moved(8, 10);
+        assert_eq!((d.start_ms, d.end_ms), (0, 10));
+    }
+
+    #[test]
+    fn releasing_on_the_whole_take_stores_untrimmed() {
+        assert_eq!(drag(false, 0, 3000).trim(3000), None);
+        assert_eq!(drag(true, 0, 2999).trim(3000), Some((0, 2999)));
+        assert_eq!(drag(false, 1, 3000).trim(3000), Some((1, 3000)));
+    }
+
+    #[test]
+    fn a_press_grabs_the_handle_on_its_side() {
+        // Between the handles: the nearer one.
+        assert!(!grabs_end(110.0, 100.0, 300.0));
+        assert!(grabs_end(290.0, 100.0, 300.0));
+        // Outside them: the one on that side, even when they touch.
+        assert!(grabs_end(305.0, 300.0, 300.5));
+        assert!(!grabs_end(295.0, 300.0, 300.5));
+        assert!(grabs_end(400.0, 100.0, 300.0));
+        assert!(!grabs_end(50.0, 100.0, 300.0));
+    }
 }

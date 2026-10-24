@@ -26,8 +26,21 @@ pub(super) async fn trim_new_take(ctx: &Ctx, project: &Project, take_id: Id) {
     }
     match detect(ctx, &project.settings.trim, take_id).await {
         Ok(Some(range)) => {
-            if let Err(e) = ctx.db(|db| db.set_take_trim(take_id, Some(range))) {
-                log::warn!("storing the trim of take {take_id}: {e:#}");
+            // The take is already current, so its segment may have been
+            // approved (locked) while the audio was analysed: then it stays
+            // exactly as it was approved.
+            let stored = ctx.db(|db| {
+                let segment_id = db.take(take_id)?.segment_id;
+                if db.segment(segment_id)?.status == SegmentStatus::Approved {
+                    return Ok(false);
+                }
+                db.set_take_trim(take_id, Some(range))?;
+                Ok(true)
+            });
+            match stored {
+                Ok(true) => {}
+                Ok(false) => log::info!("take {take_id}: approved before its trim was stored"),
+                Err(e) => log::warn!("storing the trim of take {take_id}: {e:#}"),
             }
         }
         Ok(None) => log::info!("take {take_id}: nothing above the trim threshold; left untrimmed"),
@@ -314,5 +327,55 @@ mod tests {
                 .unwrap();
             assert_eq!(t.trim_ms, None);
         }
+    }
+
+    #[test]
+    fn a_take_approved_during_detection_is_not_trimmed() {
+        let (url, _requests) = serve(|n, _, _| {
+            (
+                200,
+                vec![("request-id".into(), format!("r{n}"))],
+                take_audio(),
+            )
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let lib = Library::new(dir.path().to_path_buf());
+        let (ctx, _events) = test_ctx(&lib, "http://unused", &url);
+        let (project, ids) = ctx
+            .db(|db| {
+                let pid = db.create_project("Book", "en")?;
+                let mut p = db.project(pid)?;
+                p.voice_map.insert(NARRATOR.into(), "vn".into());
+                p.voice_map.insert("vortram".into(), "vv".into());
+                p.settings.output_format = format!("pcm_{RATE}");
+                db.update_project(&p)?;
+                let cid = import(db, pid);
+                let ids: Vec<Id> = db.chapter_segments(cid)?.iter().map(|s| s.id).collect();
+                Ok((p, ids))
+            })
+            .unwrap();
+        rt().block_on(generate(&ctx, ids.clone(), false)).unwrap();
+        let take_of = |id: Id| {
+            ctx.db(|db| {
+                db.segment(id)?
+                    .current_take_id
+                    .ok_or_else(|| anyhow::anyhow!("no take"))
+            })
+            .unwrap()
+        };
+        // The user approves segment 0 between the take being stored and
+        // trim_new_take storing its trim.
+        ctx.db(|db| db.set_segment_status(ids[0], SegmentStatus::Approved))
+            .unwrap();
+        let mut enabled = project;
+        enabled.settings.trim.enabled = true;
+        rt().block_on(trim_new_take(&ctx, &enabled, take_of(ids[0])));
+        rt().block_on(trim_new_take(&ctx, &enabled, take_of(ids[1])));
+        let trim = |id: Id| {
+            let take_id = take_of(id);
+            ctx.db(|db| db.take(take_id)).unwrap().trim_ms
+        };
+        assert_eq!(trim(ids[0]), None, "approved: left as it was approved");
+        assert_eq!(trim(ids[1]), Some(DETECTED));
     }
 }

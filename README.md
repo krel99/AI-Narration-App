@@ -105,7 +105,8 @@ silence, never the middle, with a short fade at each cut
   the silence kept before (40 ms) and after (80 ms) the speech, and the fade
   (10 ms). While it is on, the Review toolbar has **✂ Auto-trim chapter**. It
   re-detects the trim of every unapproved segment's current take and replaces
-  earlier trims.
+  earlier trims. The fade applies whenever a trimmed take is played or
+  exported, so changing it also affects approved trimmed takes.
 - Trimming is free and non-destructive. The trim is stored on the take in
   the database. The WAV file and the take hash stay as they are. Playback,
   paragraph playback and every export use the trimmed audio.
