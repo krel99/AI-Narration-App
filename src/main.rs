@@ -5,6 +5,7 @@ mod audio;
 mod check;
 mod config;
 mod db;
+mod dialogue;
 mod export;
 mod hash;
 mod lang;

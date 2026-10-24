@@ -418,9 +418,111 @@ Czech, the size and hash of `small-q8_0`, how Whisper renders performed tags
 such as `[laughs]`, and therefore the thresholds. The pipeline was exercised
 end to end with random-weight models of the real shapes.
 
+### Multi-speaker dialogue (added after the first build)
+
+Requested on top of the plan: "For paragraphs that go back and forth
+between speakers, ElevenLabs' multi-speaker dialogue endpoint produces more
+natural turn-taking than separate calls. The result would be cut back into
+segments so per-segment review still works." The design follows the
+verified research (`plan/research/eleven-dialogue.verify.md`).
+
+- **Endpoint.** `POST /v1/text-to-dialogue/with-timestamps?output_format=…`
+  (non-streaming): one JSON answer with `audio_base64`, the character
+  `alignment` and `voice_segments` (start/end time, character range and
+  `dialogue_input_index` per stretch of audio). Body: `inputs` (one per
+  segment, in order: the spoken text with tags, and the voice), `model_id`,
+  `language_code`, `settings`, `seed`, `previous_text` / `future_text` and
+  `previous_request_ids`. The request id and the `character-cost` (or
+  `x-character-count`) header are read as for text-to-speech. 240 s
+  timeout, the SDKs' default.
+- **Which paragraphs** (`dialogue::qualifies`, used by the worker and by the
+  Generate confirmation alike): the setting is on (default), the model is
+  `eleven_v4` or `eleven_v3` (v4 Turbo is documented only for the dialogue
+  WebSocket), it is a first generation (never a re-roll), the request covers
+  every segment of the paragraph and all are drafts without a current take,
+  every speaker has a voice, there are 2–10 distinct voices (10 is the API's
+  limit), and the spoken characters, tags included, fit the budget (1,800 by
+  default, at most the advised 2,000). Also kept per segment: a segment with
+  its own voice settings or a project speed or style other than the default
+  (dialogue has one `settings` object with only stability and similarity),
+  and an `[interrupting]` tag, which is reported to collapse several inputs
+  onto one timestamp.
+- **Settings.** Stability from the project's default voice settings,
+  snapped to 0 / 0.5 / 1 for Eleven v3 (other values reportedly fail);
+  `similarity` from `similarity_boost`, sent to v4 only (only stability is
+  documented for v3 dialogue). Seed 1, as for first takes.
+- **Context.** `previous_text` / `future_text` are the end and the start of
+  the neighbouring paragraphs' plain text: at most 100 characters, counted
+  in UTF-16 units so the limit holds however the server counts, cut at
+  words. `previous_request_ids` holds the request ids of the directly
+  preceding paragraphs that were themselves generated as dialogue (at most
+  3, closest last; the API describes them as ids of dialogue generations).
+  A 400/422 with any of these fields is retried once without them.
+  Conversely, per-segment re-rolls no longer stitch onto a dialogue take's
+  request id.
+- **Validation** (`dialogue::cut`), before anything is stored: every
+  `dialogue_input_index` is in range and each input has a segment; per input
+  the span is min(start)–max(end) over its segments and must have a length
+  and at least 0.04 s per spoken character (no tags, no spaces); spans run
+  in order (20 ms of overlap tolerated); the last ends inside the
+  audio (+0.15 s); every input has at least three 10 ms frames of sound.
+  Character ranges are keyed on the input index, never the voice id (a
+  voice-id mismatch is only logged): they must run contiguously from 0 over
+  all of `alignment.characters`, and each input's slice must be its text.
+  The research could check the index arithmetic only on ASCII, so the slice
+  is compared exactly first and then after Unicode NFKC normalisation and
+  whitespace folding, in the server's own index space: a server that sends
+  "č" decomposed or "…" as three dots does not force a paid fallback, but
+  different words still fail. Without an alignment the ranges must match
+  the inputs' code-point counts.
+- **Cutting.** Real voice segments are contiguous (the pause belongs to one
+  of the two lines), so the cut is searched for: around the boundary (±0.3 s,
+  never past the middle of either line, widened to the character times'
+  end and start of speech when those agree with the voice segments) the
+  10 ms frames quieter than the speech level minus 30 dB (−65…−40 dBFS; one
+  10 dB relaxation) form pauses of at least 20 ms. The pause touching the
+  boundary (the longest of those), otherwise the nearest, is cut in the
+  middle, moved to the quietest sample within 2 ms. No pause means
+  validation fails. The first take starts at 0 and the last ends with the
+  audio, so the takes back to back are exactly the dialogue; with 0 ms
+  within a paragraph, export and paragraph playback keep its timing.
+- **Fallback.** A failed validation, an unreadable answer or a refused
+  request (4xx except 401) discards the dialogue and returns the paragraph's
+  jobs to the per-segment loop, with a status message naming the paragraph
+  and whether the dialogue was billed. A 401, or a 429/5xx still failing
+  after the text-to-speech retry policy (6 rate-limit and 3 temporary
+  retries), fails the segments instead: per-segment calls would meet the
+  same problem and spend more.
+- **Takes.** One WAV and one take row per segment, stored in one
+  transaction. Hash: a group hash over all inputs' text and voice, the
+  settings, model, seed and output format (`take.dialogue_group`, a new
+  nullable column with an idempotent migration), and per take a hash of the
+  group and the input index, which never equals a text-to-speech hash.
+  Every take carries the dialogue's request id. The credits (header, or the
+  characters as an inexact estimate) are split over the takes in proportion
+  to their characters, largest remainder first, so they sum exactly.
+- **Cache.** If every take of an identical paragraph exists with its file,
+  they are reused without a request (the segment's own row, or a new free
+  row). If only part of it is left, the paragraph is generated under a
+  fresh random seed, so no existing file is overwritten and one hash keeps
+  meaning one audio file (the take check shares results by hash).
+- **Trimming and checking.** New dialogue takes are queued for the take
+  check like any other. With automatic trimming on, only the paragraph's
+  outer edges are trimmed (the first take's start, the last take's end);
+  the pauses between speakers are left as the dialogue made them.
+
+Not verified here (api.elevenlabs.io was unreachable): real responses, how
+precise v4's voice-segment timings are, how the server counts non-ASCII
+characters, whether `character-cost` is sent on dialogue, and the cut
+thresholds, which were tuned on synthetic audio.
+
 ### To verify against a real account
 
 - ElevenLabs response header names for the request id and the character cost.
 - Whether request stitching applies to `eleven_v3` (the setting can be turned
   off per project).
 - Which PCM rates the plan allows.
+- Text-to-Dialogue: that cuts land in the pauses on real v4 and v3 output
+  (and on the MP3 fallback, whose decoder delay shifts the timings
+  slightly), how often the fallback triggers, the `character-cost` header,
+  and how non-ASCII text is counted in `voice_segments`.

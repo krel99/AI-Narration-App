@@ -10,6 +10,8 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use crate::model::*;
 use crate::segment::{self, ParsedParagraph};
 
+mod dialogue;
+pub use dialogue::{DialogueGroup, DialoguePart};
 mod takecheck;
 
 const SCHEMA: &str = r#"
@@ -68,6 +70,7 @@ CREATE TABLE IF NOT EXISTS take (
     credits_exact INTEGER NOT NULL DEFAULT 1,
     trim_start_ms INTEGER,
     trim_end_ms  INTEGER,
+    dialogue_group TEXT,
     created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
 CREATE TABLE IF NOT EXISTS take_check (
@@ -230,7 +233,7 @@ fn row_segment(r: &Row) -> rusqlite::Result<Segment> {
     })
 }
 
-const TAKE_COLS: &str = "id, segment_id, seed, request_id, audio_path, hash, credits_used, created_at, credits_exact, trim_start_ms, trim_end_ms";
+const TAKE_COLS: &str = "id, segment_id, seed, request_id, audio_path, hash, credits_used, created_at, credits_exact, trim_start_ms, trim_end_ms, dialogue_group";
 
 fn row_take(r: &Row) -> rusqlite::Result<Take> {
     Ok(Take {
@@ -247,6 +250,7 @@ fn row_take(r: &Row) -> rusqlite::Result<Take> {
             (Some(a), Some(b)) => Some((a.max(0) as u32, b.max(0) as u32)),
             _ => None,
         },
+        dialogue_group: r.get(11)?,
     })
 }
 
@@ -302,6 +306,13 @@ impl Db {
             if !has {
                 conn.execute_batch(&format!("ALTER TABLE take ADD COLUMN {col} INTEGER"))?;
             }
+        }
+        // Libraries created before multi-speaker dialogue lack the group column.
+        let has_dialogue_group: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('take') WHERE name = 'dialogue_group'")?
+            .exists([])?;
+        if !has_dialogue_group {
+            conn.execute_batch("ALTER TABLE take ADD COLUMN dialogue_group TEXT")?;
         }
         Ok(Self { conn })
     }

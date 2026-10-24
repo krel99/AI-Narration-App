@@ -25,6 +25,7 @@ use crate::tags;
 use crate::tts::{ElevenLabsClient, TtsError, TtsRequest, VoiceInfo};
 
 mod autotrim;
+mod dialogue;
 mod takecheck;
 
 /// Seed of a segment's first take. Fixed, so identical lines with the same
@@ -845,17 +846,26 @@ async fn generate(ctx: &Ctx, segment_ids: Vec<Id>, reroll: bool) -> Result<()> {
         .flat_map(|(_, j)| j.iter().map(|j| j.segment_id))
         .collect();
     ctx.out.emit(Event::GenerationStarted { segment_ids: ids });
+    // Multi-speaker paragraphs that go through Text-to-Dialogue.
+    let through_dialogue = dialogue::plan_request(ctx, &segment_ids, reroll);
     let semaphore = Arc::new(Semaphore::new(concurrency));
     // (generated, cached, failed, credits)
     let stats = Arc::new(Mutex::new((0usize, 0usize, 0usize, 0i64)));
 
     let mut handles = Vec::new();
-    for (_, jobs) in groups {
+    for (paragraph_id, jobs) in groups {
         let ctx = ctx.clone();
         let tts = tts.clone();
         let semaphore = semaphore.clone();
         let stats = stats.clone();
+        let as_dialogue = through_dialogue.contains(&paragraph_id);
         handles.push(tokio::spawn(async move {
+            // What dialogue does not (or cannot) generate goes per segment.
+            let jobs = if as_dialogue {
+                dialogue::generate_paragraph(&ctx, &semaphore, started, &stats, jobs).await
+            } else {
+                jobs
+            };
             for job in jobs {
                 if ctx.cancelled(started) {
                     ctx.out.emit(Event::GenerationFailed {
@@ -940,10 +950,15 @@ async fn generate_one(
             if project.voice_for(&s.speaker) != Some(voice.as_str()) {
                 continue;
             }
-            if let Some(t) = s.current_take_id
-                && let Some(rid) = db.take(t)?.request_id
-            {
-                prev_ids.push(rid);
+            if let Some(t) = s.current_take_id {
+                let take = db.take(t)?;
+                // A dialogue take carries the dialogue request's id, which is
+                // not a text-to-speech generation to stitch onto.
+                if take.dialogue_group.is_none()
+                    && let Some(rid) = take.request_id
+                {
+                    prev_ids.push(rid);
+                }
             }
         }
         prev_ids.reverse();
@@ -1207,7 +1222,15 @@ mod tests {
     const TEXT: &str = "\"It is,\" started Vortram, \"truly magnificent!\"\n\nThe end.";
 
     /// Import TEXT, split it with the parser and give the quotes to Vortram.
+    /// These tests exercise per-segment generation, so the project's
+    /// multi-speaker dialogue (on by default) is turned off; it has its own
+    /// tests in worker/dialogue/tests.rs.
     pub(super) fn import(db: &mut Db, project_id: Id) -> Id {
+        let mut p = db.project(project_id).unwrap();
+        if p.settings.dialogue.enabled {
+            p.settings.dialogue.enabled = false;
+            db.update_project(&p).unwrap();
+        }
         let cid = db.import_chapter(project_id, "One", TEXT).unwrap();
         for p in db.paragraphs(cid).unwrap() {
             let segs = segment::parse_paragraph(&p.text, lang::by_code("en"));
@@ -1488,6 +1511,7 @@ mod tests {
                 p.voice_map.insert("vale".into(), "vv".into());
                 p.settings.audio_tags.density = "rich".into();
                 p.settings.audio_tags.direction = "Keep Voss calm.".into();
+                p.settings.dialogue.enabled = false;
                 db.update_project(&p)?;
                 let cid = db.import_chapter(pid, "One", VALE)?;
                 for par in db.paragraphs(cid)? {

@@ -20,6 +20,7 @@ use crate::tts::VoiceInfo;
 use crate::worker::{self, Command, Event, WorkerHandle};
 
 mod check;
+mod dialogue;
 mod waveform;
 
 const ROW_H: f32 = 46.0;
@@ -1828,6 +1829,7 @@ impl App {
                         };
                         let text = format!("#{} · seed {} · {cost} · {}", n + 1, t.seed, t.created_at);
                         ui.label(if current { RichText::new(text).strong() } else { RichText::new(text) });
+                        dialogue::take_chip(ui, t);
                         if current {
                             chip(ui, "current", p.approved);
                         } else if ui.add_enabled(!locked, egui::Button::new("Use").small()).clicked() {
@@ -2062,6 +2064,9 @@ impl App {
                             .desired_width(f32::INFINITY)
                             .hint_text("e.g. Military sci-fi. Keep the narrator calm and clipped; save whispers for real tension."),
                     );
+
+                    section(ui, "MULTI-SPEAKER DIALOGUE");
+                    dialogue::settings_ui(ui, &mut p.settings.dialogue, &p.tts_model, &p.default_voice_settings);
 
                     section(ui, "DEFAULT VOICE SETTINGS");
                     ui.horizontal_wrapped(|ui| voice_settings_ui(ui, &mut p.default_voice_settings));
@@ -2374,6 +2379,7 @@ impl App {
                         format!("{} segments skipped: unassigned voice.", plan.unassigned),
                     );
                 }
+                self.dialogue_generate_note(ui, &plan.ids, plan.reroll);
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     go = ui

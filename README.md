@@ -79,8 +79,9 @@ Claude and ElevenLabs servers, so they need no API keys.
    tags in the detail panel. **✦ Audio tags** re-runs the tagging for all
    draft segments. Segments whose speaker has no voice show ⚠ and are
    skipped.
-4. **Generate N drafts**. A confirmation shows the character count first.
-   Identical inputs reuse cached takes at no cost.
+4. **Generate N drafts**. A confirmation shows the character count first,
+   and how many paragraphs go through multi-speaker dialogue. Identical
+   inputs reuse cached takes at no cost.
 5. Review with the keyboard and approve or re-roll. Earlier takes stay
    available in the take picker.
 6. **Export chapter** once every segment is approved, or use **Draft export**
@@ -159,6 +160,41 @@ take, never blocks approving it and never costs credits
 - Checking new takes automatically can be turned off in Settings; **Check
   chapter** and **Re-check** work either way.
 
+### Multi-speaker dialogue
+
+A paragraph that goes back and forth between speakers is generated as one
+ElevenLabs Text-to-Dialogue request instead of one request per segment,
+which gives more natural turn-taking. The result is cut back into one take
+per segment in the pauses between the speakers, so every segment is still
+reviewed, approved and re-rolled on its own
+([screenshot](docs/screenshots/dialogue.png)).
+
+- On by default, for Eleven v4 and v3 (**Project → Multi-speaker
+  dialogue**). Eleven v4 Turbo and the older models generate per segment.
+- A paragraph qualifies on its **first generation** when the request
+  covers all of its segments, all are drafts without audio, they use 2 to
+  10 different voices and their spoken text (tags included) is at most
+  1,800 characters (adjustable up to ElevenLabs' advised 2,000). Re-rolls,
+  single segments, a segment with its own voice settings, a project speed
+  or style other than the default (dialogue takes only stability and
+  similarity) and an `[interrupting]` tag (it is known to break the
+  dialogue's timings) keep per-segment requests.
+- The **Generate** confirmation says how many paragraphs go through
+  dialogue. The neighbouring paragraphs' text is sent as context, audio tags
+  are performed, and identical paragraphs reuse their takes for free.
+- Before cutting, the response is checked: every line has its own stretch of
+  audio, in order, long enough for its text and with sound in it, and the
+  character ranges match the lines exactly. Each cut goes in the middle of
+  the pause between two lines, never inside speech; played back to back,
+  the takes are the dialogue exactly. If any check fails, the dialogue audio
+  is discarded and the paragraph is generated per segment instead, which
+  bills its characters a second time; the status bar says so.
+- Takes cut from a dialogue are marked **dialogue** in the take list. Each
+  carries the request id and its share of the request's credits, by
+  characters. Re-rolling a segment later generates it on its own.
+- With automatic silence trimming on, only the paragraph's outer edges are
+  trimmed: the pauses between speakers are the dialogue's own timing.
+
 ## Data
 
 All state lives in one library directory (default
@@ -181,8 +217,12 @@ Every pipeline stage resumes from this state after a restart.
 | `src/tags.rs` | Audio-tag parsing and the check that tags never change the words |
 | `src/llm.rs` | Claude attribution and audio-tag direction requests (structured JSON output) |
 | `src/tts.rs` | ElevenLabs text-to-speech and voice list |
+| `src/dialogue.rs` | Multi-speaker dialogue: which paragraphs qualify, inputs and settings, hashes, credit split, context text |
+| `src/dialogue/cut.rs` | Validating a dialogue response and finding the cut points in the pauses |
+| `src/dialogue/client.rs` | ElevenLabs Text-to-Dialogue request and response |
 | `src/worker.rs` | Command/event channels, segmentation pass, TTS worker pool, export jobs |
 | `src/worker/autotrim.rs` | Trim jobs: automatic trimming of new takes, Auto-trim chapter |
+| `src/worker/dialogue.rs` | Generating a paragraph as one dialogue, cutting it into takes, falling back per segment |
 | `src/db.rs` | SQLite schema and queries |
 | `src/audio.rs` | PCM/WAV handling, MP3-fallback decode |
 | `src/export.rs` | Streaming assembly with silences; ffmpeg loudnorm and encode |
@@ -194,9 +234,11 @@ Every pipeline stage resumes from this state after a restart.
 | `src/check/whisper.rs` | whisper-rs backend (feature `whisper`) |
 | `src/worker/takecheck.rs` | The low-priority checker thread, take-check commands, model downloads |
 | `src/db/takecheck.rs` | `take_check` table queries |
+| `src/db/dialogue.rs` | Storing a dialogue paragraph's takes together |
 | `src/hash.rs` | Take hash |
 | `src/player.rs` | rodio playback queue |
 | `src/app.rs` | egui UI (Text and Review tabs, dialogs) |
 | `src/app/waveform.rs` | Take waveform with trim handles, Auto-trim buttons, trim settings |
 | `src/app/check.rs` | Take-check marker, toolbar chip, detail section with the highlighted differences, settings |
+| `src/app/dialogue.rs` | Dialogue setting, the Generate confirmation's note, the take list's marker |
 | `src/theme.rs` | Light (default) and dark themes, semantic colours |

@@ -2578,11 +2578,13 @@ name = "narration-studio"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "directories",
  "eframe",
  "env_logger",
  "hex",
  "hound",
+ "icu_normalizer",
  "libc",
  "log",
  "rand",
