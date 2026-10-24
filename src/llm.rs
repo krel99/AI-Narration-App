@@ -24,10 +24,10 @@ const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 #[derive(Debug)]
 pub enum LlmError {
     /// Worth retrying after a pause (429, 5xx, overloaded, network).
-    Transient(String),
+    Transient(Via, String),
     /// The response hit max_tokens; retry with a smaller chunk.
     TooLong,
-    Fatal(String),
+    Fatal(Via, String),
     /// The subscription's usage limit is reached (message includes the reset
     /// time). Retrying before the reset is pointless.
     UsageLimit(String),
@@ -35,6 +35,22 @@ pub enum LlmError {
     Auth(String),
     /// Claude Code cannot run at all (not installed, too old, no result).
     Unavailable(String),
+}
+
+/// Which way a Claude call went, so error messages name it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Via {
+    Api,
+    ClaudeCode,
+}
+
+impl Via {
+    fn name(self) -> &'static str {
+        match self {
+            Via::Api => "Claude API",
+            Via::ClaudeCode => "Claude Code",
+        }
+    }
 }
 
 impl LlmError {
@@ -51,9 +67,9 @@ impl LlmError {
 impl std::fmt::Display for LlmError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LlmError::Transient(m) => write!(f, "temporary Claude API error: {m}"),
+            LlmError::Transient(via, m) => write!(f, "temporary {} error: {m}", via.name()),
             LlmError::TooLong => write!(f, "response too long for one request"),
-            LlmError::Fatal(m) => write!(f, "Claude API error: {m}"),
+            LlmError::Fatal(via, m) => write!(f, "{} error: {m}", via.name()),
             LlmError::UsageLimit(m) | LlmError::Auth(m) | LlmError::Unavailable(m) => {
                 write!(f, "{m}")
             }
@@ -332,6 +348,13 @@ pub struct ClaudeClient {
 }
 
 impl ClaudeClient {
+    fn via(&self) -> Via {
+        match self.transport {
+            Transport::Api { .. } => Via::Api,
+            Transport::ClaudeCode(_) => Via::ClaudeCode,
+        }
+    }
+
     pub fn new(http: reqwest::Client, api_key: String, url: &str) -> Self {
         Self::with_transport(
             http,
@@ -436,12 +459,12 @@ impl ClaudeClient {
             .await
         {
             Ok(r) => r,
-            Err(e) => return (Err(LlmError::Transient(e.to_string())), vec![]),
+            Err(e) => return (Err(LlmError::Transient(Via::Api, e.to_string())), vec![]),
         };
         let status = resp.status();
         let text = match resp.text().await {
             Ok(t) => t,
-            Err(e) => return (Err(LlmError::Transient(e.to_string())), vec![]),
+            Err(e) => return (Err(LlmError::Transient(Via::Api, e.to_string())), vec![]),
         };
         if !status.is_success() {
             let msg = serde_json::from_str::<Value>(&text)
@@ -451,25 +474,33 @@ impl ClaudeClient {
             let msg = format!("HTTP {}: {msg}", status.as_u16());
             let err =
                 if status.as_u16() == 429 || status.as_u16() == 529 || status.is_server_error() {
-                    LlmError::Transient(msg)
+                    LlmError::Transient(Via::Api, msg)
                 } else {
-                    LlmError::Fatal(msg)
+                    LlmError::Fatal(Via::Api, msg)
                 };
             return (Err(err), vec![]);
         }
         let v: Value = match serde_json::from_str(&text) {
             Ok(v) => v,
-            Err(e) => return (Err(LlmError::Fatal(format!("bad response: {e}"))), vec![]),
+            Err(e) => {
+                return (
+                    Err(LlmError::Fatal(Via::Api, format!("bad response: {e}"))),
+                    vec![],
+                );
+            }
         };
         let usage = api_usage(&v, &settings.model);
         match v["stop_reason"].as_str() {
             Some("refusal") => {
-                let err = LlmError::Fatal(format!(
-                    "the model declined this chunk ({})",
-                    v["stop_details"]["category"]
-                        .as_str()
-                        .unwrap_or("no category")
-                ));
+                let err = LlmError::Fatal(
+                    Via::Api,
+                    format!(
+                        "the model declined this chunk ({})",
+                        v["stop_details"]["category"]
+                            .as_str()
+                            .unwrap_or("no category")
+                    ),
+                );
                 return (Err(err), usage);
             }
             Some("max_tokens") => return (Err(LlmError::TooLong), usage),
@@ -496,7 +527,8 @@ impl ClaudeClient {
         let (out, t) = self
             .call(settings, SYSTEM_PROMPT, user, output_schema())
             .await?;
-        let (paragraphs, characters) = parse_output(&out).map_err(LlmError::Transient)?;
+        let (paragraphs, characters) =
+            parse_output(&out).map_err(|e| LlmError::Transient(self.via(), e))?;
         Ok(Attribution {
             paragraphs,
             characters,
@@ -520,7 +552,7 @@ impl ClaudeClient {
         let (out, t) = self
             .call(settings, DIRECTION_PROMPT, user, direction_schema())
             .await?;
-        let performances = parse_direction(&out).map_err(LlmError::Transient)?;
+        let performances = parse_direction(&out).map_err(|e| LlmError::Transient(self.via(), e))?;
         Ok(Direction {
             performances,
             input_tokens: t.input,
@@ -698,6 +730,24 @@ pub fn parse_direction(text: &str) -> Result<BTreeMap<i64, String>, String> {
 mod tests {
     use super::*;
     use crate::lang::by_code;
+
+    #[test]
+    fn errors_name_their_transport() {
+        let e = |via, m: &str| LlmError::Fatal(via, m.into()).to_string();
+        assert_eq!(
+            e(Via::Api, "HTTP 400: bad"),
+            "Claude API error: HTTP 400: bad"
+        );
+        assert_eq!(e(Via::ClaudeCode, "boom"), "Claude Code error: boom");
+        assert_eq!(
+            LlmError::Transient(Via::ClaudeCode, "busy".into()).to_string(),
+            "temporary Claude Code error: busy"
+        );
+        assert_eq!(
+            LlmError::Transient(Via::Api, "HTTP 529".into()).to_string(),
+            "temporary Claude API error: HTTP 529"
+        );
+    }
 
     #[test]
     fn keys_are_normalized() {

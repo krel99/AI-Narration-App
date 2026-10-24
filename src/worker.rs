@@ -607,8 +607,8 @@ async fn segment_chapter(ctx: &Ctx, chapter_id: Id) -> Result<()> {
                     single = true;
                     continue;
                 }
-                Err(LlmError::Transient(e)) => {
-                    log::warn!("Claude: {e}");
+                Err(e @ LlmError::Transient(..)) => {
+                    log::warn!("{e}");
                     tokio::time::sleep(backoff(tries.get(&first).copied().unwrap_or(0))).await;
                 }
                 Err(e) if e.stops_pass() => {
@@ -767,8 +767,8 @@ async fn direct_chapter(ctx: &Ctx, chapter_id: Id, untagged_only: bool) -> Resul
                 .await;
             claude::record_usage(ctx, &claude, project.id, chapter_id, claude::PASS_TAGS);
             match r {
-                Err(LlmError::Transient(e)) if attempt < settings.max_retries => {
-                    log::warn!("Claude: {e}");
+                Err(e @ LlmError::Transient(..)) if attempt < settings.max_retries => {
+                    log::warn!("{e}");
                     tokio::time::sleep(backoff(attempt)).await;
                     attempt += 1;
                 }

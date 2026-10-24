@@ -17,7 +17,7 @@ use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-use crate::llm::{CallUsage, LlmError};
+use crate::llm::{CallUsage, LlmError, Via};
 
 /// Fixes structured-output runs that exited non-zero after a dropped
 /// connection; older versions work but may report false failures.
@@ -356,11 +356,15 @@ impl Invocation {
         match out {
             Err(_) => (
                 Err(LlmError::Fatal(
-                    "Claude Code did not finish within 20 minutes".into(),
+                    Via::ClaudeCode,
+                    "no answer within 20 minutes".into(),
                 )),
                 vec![],
             ),
-            Ok(Err(e)) => (Err(LlmError::Transient(e.to_string())), vec![]),
+            Ok(Err(e)) => (
+                Err(LlmError::Transient(Via::ClaudeCode, e.to_string())),
+                vec![],
+            ),
             Ok(Ok(o)) => parse_result(
                 &String::from_utf8_lossy(&o.stdout),
                 &String::from_utf8_lossy(&o.stderr),
@@ -586,14 +590,17 @@ fn classify(v: &Value) -> LlmError {
         return LlmError::TooLong;
     }
     if v["stop_reason"] == "refusal" {
-        return LlmError::Fatal(format!("the model declined this chunk ({detail})"));
+        return LlmError::Fatal(
+            Via::ClaudeCode,
+            format!("the model declined this chunk ({detail})"),
+        );
     }
     match subtype {
         "error_max_structured_output_retries" | "error_max_turns" => {
-            return LlmError::Transient(format!("Claude Code ({subtype}): {detail}"));
+            return LlmError::Transient(Via::ClaudeCode, format!("{subtype}: {detail}"));
         }
         "error_during_execution" | "error_max_budget_usd" => {
-            return LlmError::Fatal(format!("Claude Code ({subtype}): {detail}"));
+            return LlmError::Fatal(Via::ClaudeCode, format!("{subtype}: {detail}"));
         }
         _ => {}
     }
@@ -601,12 +608,12 @@ fn classify(v: &Value) -> LlmError {
         || result.to_lowercase().contains("overloaded")
         || matches!(status, Some(429 | 500..=599))
     {
-        return LlmError::Transient(detail);
+        return LlmError::Transient(Via::ClaudeCode, detail);
     }
     if v["is_error"] == false && v["subtype"] == "success" {
-        return LlmError::Transient("Claude Code returned no structured output".into());
+        return LlmError::Transient(Via::ClaudeCode, "no structured output in the answer".into());
     }
-    LlmError::Fatal(format!("Claude Code: {detail}"))
+    LlmError::Fatal(Via::ClaudeCode, detail)
 }
 
 // ---- detection ---------------------------------------------------------------
@@ -984,7 +991,7 @@ exit "$(cat "$D/exit" 2>/dev/null || echo 0)"
         let mut v: Value = serde_json::from_str(&success(s, 0.01)).unwrap();
         v.as_object_mut().unwrap().remove("structured_output");
         let (r, _) = parse_result(&v.to_string(), "", Some(0), "x");
-        assert!(matches!(r, Err(LlmError::Transient(_))), "{r:?}");
+        assert!(matches!(r, Err(LlmError::Transient(..))), "{r:?}");
     }
 
     fn error_result(fields: Value) -> String {
@@ -1075,20 +1082,27 @@ exit "$(cat "$D/exit" 2>/dev/null || echo 0)"
         let (r, _) = classify_out(error_result(json!({
             "result": "API Error: Server is temporarily limiting requests (not your usage limit)"
         })));
-        assert!(matches!(r, Err(LlmError::Transient(_))), "{r:?}");
+        assert!(matches!(r, Err(LlmError::Transient(..))), "{r:?}");
         let (r, _) = classify_out(error_result(json!({
             "subtype": "error_max_structured_output_retries", "errors": ["schema mismatch"]
         })));
-        assert!(matches!(r, Err(LlmError::Transient(ref m)) if m.contains("schema mismatch")));
+        assert!(matches!(r, Err(LlmError::Transient(_, ref m)) if m.contains("schema mismatch")));
         let (r, _) = classify_out(error_result(json!({
             "subtype": "error_max_budget_usd", "terminal_reason": "budget_exhausted",
             "errors": ["Reached maximum budget ($0.00001)"]
         })));
-        assert!(matches!(r, Err(LlmError::Fatal(_))));
+        assert!(matches!(r, Err(LlmError::Fatal(..))));
+        // Messages name Claude Code, not the API.
+        let msg = r.unwrap_err().to_string();
+        assert!(
+            msg.starts_with("Claude Code error: error_max_budget_usd: ")
+                && !msg.contains("API error"),
+            "{msg}"
+        );
         let (r, _) = classify_out(error_result(json!({
             "stop_reason": "refusal", "result": "declined"
         })));
-        assert!(matches!(r, Err(LlmError::Fatal(ref m)) if m.contains("declined")));
+        assert!(matches!(r, Err(LlmError::Fatal(_, ref m)) if m.contains("declined")));
 
         // No result object at all.
         let (r, _) = parse_result("", "error: unknown option '--safe-mode'\n", Some(1), "m");
