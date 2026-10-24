@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::acx::{Check, FileReport, Verdict};
-use crate::model::{Chapter, Id, SilenceSettings};
+use crate::model::{Chapter, Id, Segment, SegmentStatus, SilenceSettings};
 
 /// Book metadata and delivery options (`ProjectSettings.publication`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -444,6 +444,9 @@ pub struct SampleSource {
     pub approved: bool,
     /// Length of the current take.
     pub duration_ms: u64,
+    /// A placeholder for a paragraph that has no segments yet (its text
+    /// has no audio, so a sample must not skip over it).
+    pub unsegmented: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -458,6 +461,15 @@ pub enum SampleStop {
     ChapterEnd,
     /// Stopped before a segment that is not approved.
     Unapproved(Id),
+    /// Stopped before a paragraph (1-based number) that has no segments.
+    Unsegmented(usize),
+}
+
+impl SampleStop {
+    /// Stopped early because the next text has no approved audio.
+    pub fn blocked(self) -> bool {
+        matches!(self, SampleStop::Unapproved(_) | SampleStop::Unsegmented(_))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -485,6 +497,7 @@ impl SamplePlan {
             SampleStop::Cut => "cut inside a long segment",
             SampleStop::ChapterEnd => "the rest of the chapter",
             SampleStop::Unapproved(_) => "stops before a segment that is not approved",
+            SampleStop::Unsegmented(_) => "stops before a paragraph that has no segments",
         };
         format!("{len}, {n} segments, {why}")
     }
@@ -518,6 +531,12 @@ pub fn plan_sample(
     let Some(first) = src.get(start) else {
         return Err("This chapter has no segments.".into());
     };
+    if first.unsegmented {
+        return Err(format!(
+            "Paragraph {} has no segments yet; segment and approve it first.",
+            first.paragraph + 1
+        ));
+    }
     if !first.approved {
         return Err(
             "The start segment is not approved; the sample uses approved takes only.".into(),
@@ -535,6 +554,9 @@ pub fn plan_sample(
             break SampleStop::ChapterEnd;
         }
         let s = &src[i];
+        if s.unsegmented {
+            break SampleStop::Unsegmented(s.paragraph + 1);
+        }
         if !s.approved {
             break SampleStop::Unapproved(s.segment_id);
         }
@@ -565,7 +587,7 @@ pub fn plan_sample(
             (Some((end, t)), _) => plan(
                 end,
                 t,
-                if matches!(stop, SampleStop::Unapproved(_)) {
+                if stop.blocked() {
                     stop
                 } else {
                     SampleStop::ParagraphEnd
@@ -574,7 +596,7 @@ pub fn plan_sample(
             (None, Some((end, t))) => plan(
                 end,
                 t,
-                if matches!(stop, SampleStop::Unapproved(_)) {
+                if stop.blocked() {
                     stop
                 } else {
                     SampleStop::SegmentEnd
@@ -584,6 +606,30 @@ pub fn plan_sample(
             (None, None) => plan(start + 1, budget, SampleStop::Cut),
         },
     })
+}
+
+// ---- outdated reports -------------------------------------------------------------
+
+/// Fingerprint of what a chapter export is made of: every segment in
+/// reading order with its current take and whether it is approved. A
+/// stored report whose key no longer matches is "outdated" (a new take,
+/// an older take picked again, an approval changed, segments re-split).
+pub fn takes_key(segments: impl IntoIterator<Item = (Id, Option<Id>, bool)>) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    for (id, take, approved) in segments {
+        h.update(format!("{id}:{}:{}\n", take.unwrap_or(0), approved as u8));
+    }
+    hex::encode(h.finalize())[..16].to_string()
+}
+
+/// [`takes_key`] of a chapter's segments as `Db::chapter_segments` lists them.
+pub fn segments_key(segments: &[Segment]) -> String {
+    takes_key(
+        segments
+            .iter()
+            .map(|s| (s.id, s.current_take_id, s.status == SegmentStatus::Approved)),
+    )
 }
 
 // ---- book-level checks ------------------------------------------------------------
@@ -1218,6 +1264,7 @@ mod tests {
                 scene_break_before: paragraph == 3,
                 approved,
                 duration_ms: ms,
+                unsegmented: false,
             })
             .collect()
     }
@@ -1270,6 +1317,49 @@ mod tests {
         let long = src(&[(0, true, 200_000), (1, true, 200_000)]);
         let p = plan_sample(&long, 0, 900_000, &silence).unwrap();
         assert!(p.total_ms() <= SAMPLE_MAX_MS);
+    }
+
+    #[test]
+    fn sample_stops_before_a_paragraph_without_segments() {
+        let silence = SilenceSettings::default();
+        let mut s = src(&[(0, true, 10_000), (1, true, 10_000), (2, true, 10_000)]);
+        // Paragraph 2 (index 1) lost its segments, e.g. after a text edit.
+        s[1] = SampleSource {
+            segment_id: 0,
+            paragraph: 1,
+            scene_break_before: false,
+            approved: false,
+            duration_ms: 0,
+            unsegmented: true,
+        };
+        let p = plan_sample(&s, 0, 180_000, &silence).unwrap();
+        assert_eq!(
+            (p.end, p.stop, p.speech_ms),
+            (1, SampleStop::Unsegmented(2), 10_000)
+        );
+        assert!(p.stop.blocked());
+        assert!(p.describe().contains("no segments"));
+        // Starting on it is refused, starting after it is fine.
+        let err = plan_sample(&s, 1, 180_000, &silence).unwrap_err();
+        assert!(err.contains("Paragraph 2 has no segments"), "{err}");
+        let p = plan_sample(&s, 2, 180_000, &silence).unwrap();
+        assert_eq!((p.start, p.end, p.stop), (2, 3, SampleStop::ChapterEnd));
+    }
+
+    #[test]
+    fn takes_key_follows_takes_and_approvals() {
+        let base = [(1, Some(10), true), (2, Some(20), true)];
+        let k = takes_key(base);
+        assert_eq!(k.len(), 16);
+        assert_eq!(k, takes_key(base));
+        assert_ne!(k, takes_key([(1, Some(10), true), (2, Some(21), true)]));
+        assert_ne!(k, takes_key([(1, Some(10), true), (2, Some(20), false)]));
+        assert_ne!(k, takes_key([(2, Some(20), true), (1, Some(10), true)]));
+        assert_ne!(k, takes_key([(1, Some(10), true)]));
+        assert_ne!(
+            takes_key([(1, None, false)]),
+            takes_key([(1, Some(10), false)])
+        );
     }
 
     fn chapter(title: &str, text: &str) -> Chapter {

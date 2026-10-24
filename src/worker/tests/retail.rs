@@ -62,6 +62,41 @@ fn chapter_export_is_checked_and_reported() {
     assert!(md.contains("**Cover**: none"));
     assert!(md.contains("No retail sample exported yet."));
 
+    // The report remembers what the export was made of.
+    let segs = ctx.db(|db| db.chapter_segments(cid)).unwrap();
+    assert_eq!(report.takes_key, Some(crate::retail::segments_key(&segs)));
+    let pid = book.project.id;
+    assert!(ctx.db(|db| db.stale_reports(pid)).unwrap().is_empty());
+
+    // A draft export afterwards is checked and announced, but the report
+    // keeps describing the final file next to it.
+    rt.block_on(run(
+        &ctx,
+        Command::ExportChapter {
+            chapter_id: cid,
+            draft: true,
+        },
+    ))
+    .unwrap();
+    let summary = events(&rx)
+        .into_iter()
+        .find_map(|e| match e {
+            Event::AcxChecked { summary, .. } => Some(summary),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        summary.contains("the report keeps the final export"),
+        "{summary}"
+    );
+    let report = ctx.db(|db| db.export_report(cid)).unwrap().unwrap();
+    assert_eq!(
+        (report.file.as_str(), report.draft),
+        ("01 - Opening.mp3", false)
+    );
+    let md = std::fs::read_to_string(dir.join(crate::retail::REPORT_FILE)).unwrap();
+    assert!(!md.contains("(draft).mp3"), "{md}");
+
     // The retail sample: stored separately, added to the report.
     rt.block_on(run(
         &ctx,
@@ -108,6 +143,8 @@ fn chapter_export_is_checked_and_reported() {
     let segs = ctx.db(|db| db.chapter_segments(cid)).unwrap();
     ctx.db(|db| db.set_segment_status(segs[2].id, SegmentStatus::Generated))
         .unwrap();
+    // Unapproving a segment makes the chapter's report outdated.
+    assert!(ctx.db(|db| db.stale_reports(pid)).unwrap().contains(&cid));
     let err = rt
         .block_on(run(
             &ctx,

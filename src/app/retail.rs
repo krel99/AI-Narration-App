@@ -70,7 +70,7 @@ fn checks_tooltip(r: &FileReport, stale: bool) -> String {
         r.checked_at.replace('T', " ").replace('Z', " UTC")
     ));
     if stale {
-        s.push_str(" Takes changed since: export again to re-check.");
+        s.push_str(" Takes or approvals changed since: export again to re-check.");
     }
     s.push_str("\nClick for every chapter.");
     s
@@ -98,6 +98,18 @@ impl App {
         }
     }
 
+    /// The chapter's segments, takes or approvals changed since its report.
+    /// The open chapter is compared with the segments on screen, so the chip
+    /// follows an approval right away; other chapters use the stored check.
+    fn report_stale(&self, chapter_id: Id, r: &FileReport) -> bool {
+        match &r.takes_key {
+            Some(key) if self.view.chapter_id == Some(chapter_id) => {
+                *key != retail::segments_key(&self.view.segments)
+            }
+            _ => self.retail.state.stale.contains(&chapter_id),
+        }
+    }
+
     pub(super) fn retail_dialog_open(&self) -> bool {
         self.retail.sample.is_some()
     }
@@ -120,7 +132,7 @@ impl App {
             return;
         };
         let p = *theme::palette(ui);
-        let stale = self.retail.state.stale.contains(&cid);
+        let stale = self.report_stale(cid, r);
         let mut text = r.chip_text();
         if r.draft {
             text.push_str(" · draft");
@@ -349,7 +361,7 @@ impl App {
                         .collect();
                     ui.label(RichText::new(format).color(verdict_color(&p, fv)))
                         .on_hover_text(format_notes.join("\n"));
-                    let stale = self.retail.state.stale.contains(&c.id);
+                    let stale = self.report_stale(c.id, r);
                     let v = r.verdict();
                     ui.horizontal(|ui| {
                         ui.label(
@@ -364,7 +376,7 @@ impl App {
                         if stale {
                             ui.label(RichText::new("outdated").small().color(p.warning))
                                 .on_hover_text(
-                                    "Takes changed after this export; export again to re-check.",
+                                    "Takes or approvals changed after this export; export again to re-check.",
                                 );
                         }
                     });
@@ -378,8 +390,12 @@ impl App {
             Ok(d) => d,
             Err(e) => return self.note(true, format!("{e:#}")),
         };
-        if let Err(e) = std::process::Command::new("xdg-open").arg(&dir).spawn() {
-            self.note(true, format!("Could not open {} ({e}).", dir.display()));
+        match std::process::Command::new("xdg-open").arg(&dir).spawn() {
+            // Reap it off the UI thread, or every click leaves a zombie.
+            Ok(mut child) => {
+                std::thread::spawn(move || child.wait());
+            }
+            Err(e) => self.note(true, format!("Could not open {} ({e}).", dir.display())),
         }
     }
 
@@ -462,22 +478,34 @@ impl App {
                             .and_then(|id| src.iter().position(|s| s.segment_id == id))
                             .unwrap_or(0);
                         retail::plan_sample(src, start, max_ms, &project.settings.silence)
-                            .map(|pl| (pl, src.clone()))
+                            .map(|pl| {
+                                // Review numbers segments only, not placeholders.
+                                let n = |id| {
+                                    src.iter()
+                                        .filter(|s| !s.unsegmented)
+                                        .position(|s| s.segment_id == id)
+                                        .map_or(0, |i| i + 1)
+                                };
+                                let why = match pl.stop {
+                                    SampleStop::Unapproved(id) => Some(format!(
+                                        "⚠ Segment {} is not approved yet: the sample stops before it (approved takes only).",
+                                        n(id)
+                                    )),
+                                    SampleStop::Unsegmented(k) => Some(format!(
+                                        "⚠ Paragraph {k} has no segments yet: the sample stops before it (approved takes only)."
+                                    )),
+                                    _ => None,
+                                };
+                                (pl, why)
+                            })
                     }
                 };
                 match &plan {
-                    Ok((pl, src)) => {
+                    Ok((pl, why)) => {
                         ui.label(RichText::new(format!("≈ {}", pl.describe())).strong());
-                        if let SampleStop::Unapproved(id) = pl.stop {
-                            let n = src.iter().position(|s| s.segment_id == id).map_or(0, |i| i + 1);
+                        if let Some(why) = why {
                             ui.add(
-                                egui::Label::new(
-                                    RichText::new(format!(
-                                        "⚠ Segment {n} is not approved yet: the sample stops before it (approved takes only)."
-                                    ))
-                                    .color(p.warning),
-                                )
-                                .wrap(),
+                                egui::Label::new(RichText::new(why).color(p.warning)).wrap(),
                             );
                         }
                         if pl.total_ms() < retail::SAMPLE_MIN_MS {

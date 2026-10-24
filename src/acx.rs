@@ -765,6 +765,9 @@ pub struct FileReport {
     pub checks: Vec<Check>,
     /// UTC, `2026-10-24T12:00:00Z`.
     pub checked_at: String,
+    /// `retail::takes_key` of the chapter when it was exported (chapters
+    /// only; reports stored before the key existed have none).
+    pub takes_key: Option<String>,
 }
 
 impl FileReport {
@@ -865,7 +868,7 @@ pub struct ReportRow<'a> {
     pub number: usize,
     pub title: &'a str,
     pub report: Option<&'a FileReport>,
-    /// Takes changed after the measurement.
+    /// Takes or approvals changed after the measurement.
     pub stale: bool,
 }
 
@@ -917,7 +920,7 @@ pub fn report_markdown(
             result.push_str(" (draft)");
         }
         if row.stale {
-            result.push_str(" (takes changed since)");
+            result.push_str(" (takes or approvals changed since)");
         }
         s.push_str(&format!(
             "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
@@ -1218,6 +1221,7 @@ mod tests {
             levels: good_levels(),
             checks: evaluate(FileKind::Chapter, &good_levels(), Ok(&c), Some(true), 1),
             checked_at: "2026-10-24T12:00:00Z".into(),
+            takes_key: None,
         };
         assert_eq!(r.chip_text(), "ACX ✓");
         assert!(r.summary("One").starts_with("One: ACX ✓ RMS -20.3 dB"));
@@ -1271,6 +1275,7 @@ mod tests {
             levels: good_levels(),
             checks: evaluate(FileKind::Chapter, &good_levels(), Ok(&c), Some(true), 1),
             checked_at: String::new(),
+            takes_key: None,
         };
         let quiet = FileReport {
             file: "02 - Two | B.mp3".into(),
@@ -1278,6 +1283,7 @@ mod tests {
             levels: bad,
             checks: evaluate(FileKind::Chapter, &bad, Ok(&c), Some(true), 1),
             checked_at: String::new(),
+            takes_key: None,
         };
         let rows = [
             ReportRow {
@@ -1311,7 +1317,7 @@ mod tests {
         assert!(md.contains("| 1 | One | 01 - One.mp3 | 0:10:00 | -20.3 dB | -4.2 dB | -73.4 dB | 1.05 s | 2.10 s | MP3 192 kbps 44.1 kHz mono CBR | pass |"), "{md}");
         assert!(md.contains("02 - Two \\| B.mp3"));
         assert!(md.contains("-24.1 dB ⚠"));
-        assert!(md.contains("warning (draft) (takes changed since)"));
+        assert!(md.contains("warning (draft) (takes or approvals changed since)"));
         assert!(md.contains("| 3 | Three | not exported |"));
         assert!(md.contains("- 2 Two: RMS -24.1 dB (warning: quieter than ACX's -23 to -18 dB)"));
         assert!(md.contains("- Cover: 1600×1600 JPEG (warning: ACX wants at least 2400×2400)"));

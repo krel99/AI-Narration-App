@@ -421,7 +421,11 @@ chapter) and a short retail sample clip."
   above -3.5 dB peak it is encoded once more with a corrected gain (and a
   lower ceiling if the peak overshot). LAME 192k lowers RMS by about 0.26 dB,
   which the measurement on the encoded file absorbs. The gain is clamped to
-  ±30 dB; a silent file gets none.
+  ±30 dB; a silent file gets none. alimiter's `latency` option only exists
+  from FFmpeg 5.1 and older builds reject unknown options (every export
+  would fail on Ubuntu 22.04's 4.4), so it is passed only when `ffmpeg -h
+  filter=alimiter` lists it; without it the audio is 5 ms (the attack)
+  later. `amix normalize` needs FFmpeg 4.4, the documented minimum.
 - **Room tone.** Assembly inserts digital zeros, whose floor measures -inf
   and which ACX Check calls "dead silence". `Publication.room_tone` (on by
   default) mixes `anoisesrc=color=pink:amplitude=0.0012:seed=7`
@@ -452,12 +456,21 @@ chapter) and a short retail sample clip."
   Length: fail above 120 min, warning above 119; size: fail above 170 MB.
   Samples: no head/tail check, fail above 5 min, warning under 1 min. A
   report "passes" only when every line passes.
-- **Storage.** `export_report` (one row per chapter, the latest export,
-  draft or not, `ON DELETE CASCADE`) and `retail_sample` (one per project,
-  the source chapter `ON DELETE SET NULL`), created with `CREATE TABLE IF NOT
-  EXISTS` from `db/retail.rs`. -inf levels are stored as NULL. Each row keeps
-  its checks as JSON. A report is "outdated" when a take of the chapter was
-  created after `checked_at` (picking an older take is not detected).
+- **Storage.** `export_report` (one row per chapter, `ON DELETE CASCADE`)
+  and `retail_sample` (one per project, the source chapter `ON DELETE SET
+  NULL`), created with `CREATE TABLE IF NOT EXISTS` from `db/retail.rs`
+  (plus an idempotent `ADD COLUMN takes_key`). -inf levels are stored as
+  NULL. Each row keeps its checks as JSON. A final export replaces the row;
+  a draft export replaces only a draft (an upsert with `WHERE excluded.draft
+  = 0 OR export_report.draft = 1`), so `ACX report.md` keeps describing the
+  delivery file and the status line says so. Each row also keeps
+  `takes_key`, a hash of the chapter's segments in order with their current
+  take and approval at export time (`retail::takes_key`); the report is
+  "outdated" when that no longer matches (a new take, an older take picked
+  again, an approval changed, segments re-split). The open chapter's chip
+  compares against the segments on screen, so it follows an approval at
+  once. Rows without a key fall back to "a take was created after
+  `checked_at`".
 - **Tags** (`retail.rs`). ID3v2.3 (`-id3v2_version 3 -write_id3v1 1`):
   title, album, artist, album_artist, composer (narrator), genre, date
   (TYER), track n/N (position among the project's chapters), publisher
@@ -483,8 +496,10 @@ chapter) and a short retail sample clip."
   chapter, 0.5 s room tone before and 1 s after, up to the chosen length
   (1–5 min), ending at the last paragraph end that fits, else the last
   segment, else cut inside a single long segment. It stops before the first
-  segment that is not approved (or whose take cannot be read). Fades 0.5 s
-  in and 3 s out on the voice. The worker plans again from the database.
+  segment that is not approved (or whose take cannot be read), and before a
+  paragraph that has no segments (a placeholder source, so its text is never
+  skipped over). Fades 0.5 s in and 3 s out on the voice. The worker plans
+  again from the database.
 - **Report.** `ACX report.md` (one table, the book-level checks, the
   sample, every problem in words, the rules and the policy note) is
   rewritten after every chapter and sample export. The profile is called

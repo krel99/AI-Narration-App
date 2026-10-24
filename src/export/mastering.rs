@@ -86,12 +86,39 @@ fn db_to_linear(db: f64) -> f64 {
     10f64.powf(db / 20.0)
 }
 
+/// Whether an `ffmpeg -h filter=<name>` listing has `option` (option lines
+/// start with the option's name).
+pub(super) fn filter_has_option(help: &str, option: &str) -> bool {
+    help.lines()
+        .any(|l| l.split_whitespace().next() == Some(option))
+}
+
+/// alimiter's `latency` (lookahead compensation) arrived in FFmpeg 5.1.
+/// Older builds (Ubuntu 22.04 ships 4.4) reject unknown filter options,
+/// which would fail every export, so it is only passed when this ffmpeg
+/// lists it; without it the audio is merely 5 ms (the attack) later.
+fn limiter_latency_supported() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-h", "filter=alimiter"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .is_ok_and(|o| filter_has_option(&String::from_utf8_lossy(&o.stdout), "latency"))
+    })
+}
+
 impl Encode<'_> {
     pub(super) fn filter_graph(&self, gain_db: f64, limit_db: f64) -> String {
+        self.filter_graph_with(gain_db, limit_db, limiter_latency_supported())
+    }
+
+    pub(super) fn filter_graph_with(&self, gain_db: f64, limit_db: f64, latency: bool) -> String {
         let mut g = format!(
-            "[0:a]volume={gain_db:.2}dB,alimiter=limit={:.4}:level=false:latency=true:attack=5:release=50,\
+            "[0:a]volume={gain_db:.2}dB,alimiter=limit={:.4}:level=false:{}attack=5:release=50,\
              aresample={rate},aformat=sample_fmts=fltp:channel_layouts=mono",
             db_to_linear(limit_db).clamp(0.0625, 1.0),
+            if latency { "latency=true:" } else { "" },
             rate = super::OUTPUT_RATE
         );
         // Fades shape the voice only; the room tone under it stays even, or
@@ -409,43 +436,72 @@ pub(super) fn encode_book(
 // ---- retail sample ------------------------------------------------------------------
 
 /// The chapter's segments for the sample planner, with the length of each
-/// approved segment's current take (read from the WAV header).
+/// approved segment's current take (read from the WAV header). A paragraph
+/// without segments gets a placeholder, so the sample stops there instead of
+/// skipping its text.
 pub fn sample_sources(db: &Db, lib: &Library, chapter_id: Id) -> Result<Vec<SampleSource>> {
     let paragraphs = db.paragraphs(chapter_id)?;
-    let index: std::collections::HashMap<Id, usize> = paragraphs
-        .iter()
-        .enumerate()
-        .map(|(i, p)| (p.id, i))
-        .collect();
-    let mut out = Vec::new();
+    let mut by_paragraph: std::collections::HashMap<Id, Vec<Segment>> =
+        std::collections::HashMap::new();
     for s in db.chapter_segments(chapter_id)? {
-        let paragraph = index.get(&s.paragraph_id).copied().unwrap_or(0);
-        let mut approved = s.status == SegmentStatus::Approved && s.current_take_id.is_some();
-        let mut duration_ms = 0;
-        if approved {
-            let take = db.take(s.current_take_id.unwrap_or_default())?;
-            match hound::WavReader::open(lib.audio_path(&take.audio_path)) {
-                Ok(r) => {
-                    let spec = r.spec();
-                    duration_ms = r.duration() as u64 * 1000 / spec.sample_rate.max(1) as u64;
-                }
-                Err(e) => {
-                    log::warn!("take {}: {e}", take.id);
-                    approved = false;
-                }
-            }
+        by_paragraph.entry(s.paragraph_id).or_default().push(s);
+    }
+    let mut out = Vec::new();
+    for (paragraph, para) in paragraphs.iter().enumerate() {
+        let Some(segments) = by_paragraph.remove(&para.id) else {
+            out.push(SampleSource {
+                segment_id: 0,
+                paragraph,
+                scene_break_before: para.scene_break_before,
+                approved: false,
+                duration_ms: 0,
+                unsegmented: true,
+            });
+            continue;
+        };
+        for s in segments {
+            out.push(sample_source(
+                db,
+                lib,
+                &s,
+                paragraph,
+                para.scene_break_before,
+            )?);
         }
-        out.push(SampleSource {
-            segment_id: s.id,
-            paragraph,
-            scene_break_before: paragraphs
-                .get(paragraph)
-                .is_some_and(|p| p.scene_break_before),
-            approved,
-            duration_ms,
-        });
     }
     Ok(out)
+}
+
+fn sample_source(
+    db: &Db,
+    lib: &Library,
+    s: &Segment,
+    paragraph: usize,
+    scene_break_before: bool,
+) -> Result<SampleSource> {
+    let mut approved = s.status == SegmentStatus::Approved && s.current_take_id.is_some();
+    let mut duration_ms = 0;
+    if approved {
+        let take = db.take(s.current_take_id.unwrap_or_default())?;
+        match hound::WavReader::open(lib.audio_path(&take.audio_path)) {
+            Ok(r) => {
+                let spec = r.spec();
+                duration_ms = r.duration() as u64 * 1000 / spec.sample_rate.max(1) as u64;
+            }
+            Err(e) => {
+                log::warn!("take {}: {e}", take.id);
+                approved = false;
+            }
+        }
+    }
+    Ok(SampleSource {
+        segment_id: s.id,
+        paragraph,
+        scene_break_before,
+        approved,
+        duration_ms,
+        unsegmented: false,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -533,14 +589,20 @@ pub fn export_sample(
     })();
     let _ = std::fs::remove_file(&wav);
     let mastered = result?;
-    if let SampleStop::Unapproved(id) = plan.stop {
-        let n = src
-            .iter()
-            .position(|s| s.segment_id == id)
-            .map_or(0, |i| i + 1);
-        notes.push(format!(
-            "The sample stops before segment {n}, which is not approved yet (samples use approved takes only)."
-        ));
+    match plan.stop {
+        SampleStop::Unapproved(id) => {
+            let n = segments
+                .iter()
+                .position(|s| s.id == id)
+                .map_or(0, |i| i + 1);
+            notes.push(format!(
+                "The sample stops before segment {n}, which is not approved yet (samples use approved takes only)."
+            ));
+        }
+        SampleStop::Unsegmented(n) => notes.push(format!(
+            "The sample stops before paragraph {n}, which has no segments yet (samples use approved takes only)."
+        )),
+        _ => {}
     }
     Ok(SampleExport {
         plan,
@@ -760,6 +822,70 @@ mod tests {
         assert!(l.peak_db <= -3.0, "{l:?}");
     }
 
+    /// A paragraph without segments (its text has no audio) stops the
+    /// sample instead of being skipped over.
+    #[test]
+    fn sample_sources_keep_unsegmented_paragraphs_in_place() {
+        let book = approved_book(lighthouse());
+        let mut db = book.lib.open().unwrap();
+        let src = sample_sources(&db, &book.lib, book.chapter.id).unwrap();
+        assert_eq!(src.len(), 4);
+        assert!(src.iter().all(|s| s.approved && !s.unsegmented));
+        assert_eq!(
+            src.iter().map(|s| s.paragraph).collect::<Vec<_>>(),
+            [0, 0, 1, 2]
+        );
+        assert!(src[3].scene_break_before && !src[2].scene_break_before);
+        assert!(src.iter().all(|s| (1490..=1510).contains(&s.duration_ms)));
+
+        let para = db.paragraphs(book.chapter.id).unwrap()[1].clone();
+        for seg in db.paragraph_segments(para.id).unwrap() {
+            db.set_segment_status(seg.id, SegmentStatus::Generated)
+                .unwrap();
+        }
+        db.replace_paragraph_segments(para.id, &[]).unwrap();
+        let src = sample_sources(&db, &book.lib, book.chapter.id).unwrap();
+        assert_eq!(src.len(), 4);
+        assert!(src[2].unsegmented && !src[2].approved);
+        assert_eq!(src[2].paragraph, 1);
+        let plan = retail::plan_sample(&src, 0, 180_000, &book.project.settings.silence).unwrap();
+        assert_eq!((plan.end, plan.stop), (2, SampleStop::Unsegmented(2)));
+    }
+
+    #[test]
+    fn limiter_latency_is_detected_from_the_filter_help() {
+        // `ffmpeg -h filter=alimiter`, 6.1 (abridged) and 4.4 (no latency).
+        let v61 = "Filter alimiter\n  Audio lookahead limiter.\nalimiter AVOptions:\n   \
+                   attack            <double>     ..F.A....T. set attack (from 0.1 to 80) (default 5)\n   \
+                   level             <boolean>    ..F.A....T. auto level (default true)\n   \
+                   latency           <boolean>    ..F.A....T. compensate delay (default false)\n";
+        let v44 = "Filter alimiter\n  Audio lookahead limiter.\nalimiter AVOptions:\n   \
+                   attack            <double>     ..F.A...... set attack (from 0.1 to 80) (default 5)\n   \
+                   level             <boolean>    ..F.A...... auto level (default true)\n\n\
+                   This filter has support for timeline through the 'enable' option.\n";
+        assert!(filter_has_option(v61, "latency"));
+        assert!(!filter_has_option(v44, "latency"));
+        assert!(filter_has_option(v44, "level"));
+        // A description mentioning the word is not an option line.
+        assert!(!filter_has_option("  compensate latency here\n", "latency"));
+        assert!(!filter_has_option("", "latency"));
+        // This machine's ffmpeg answers the same way the graph is built.
+        if fixture::have_ffmpeg() {
+            let enc = Encode {
+                wav: Path::new("/x/in.wav"),
+                ffmetadata: None,
+                cover: None,
+                room_tone: false,
+                fade: None,
+                outputs: vec![],
+            };
+            assert_eq!(
+                enc.filter_graph(0.0, -4.0).contains("latency=true"),
+                limiter_latency_supported()
+            );
+        }
+    }
+
     #[test]
     fn filter_graph_and_arguments() {
         let wav = Path::new("/x/in.wav");
@@ -784,11 +910,20 @@ mod tests {
                 },
             ],
         };
-        let g = enc.filter_graph(3.5, -4.0);
+        let g = enc.filter_graph_with(3.5, -4.0, true);
         assert!(
-            g.starts_with("[0:a]volume=3.50dB,alimiter=limit=0.6310:level=false:latency=true"),
+            g.starts_with(
+                "[0:a]volume=3.50dB,alimiter=limit=0.6310:level=false:latency=true:attack=5"
+            ),
             "{g}"
         );
+        // FFmpeg before 5.1 has no `latency` and would reject the whole graph.
+        let old = enc.filter_graph_with(3.5, -4.0, false);
+        assert!(
+            old.starts_with("[0:a]volume=3.50dB,alimiter=limit=0.6310:level=false:attack=5"),
+            "{old}"
+        );
+        assert!(!old.contains("latency"));
         assert!(g.contains("anoisesrc=color=pink:amplitude=0.0012:r=44100:seed=7"));
         assert!(g.contains("amix=inputs=2:duration=first:normalize=0"));
         assert!(g.ends_with(",asplit=2[a0][a1]"));

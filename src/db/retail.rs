@@ -10,8 +10,19 @@ use super::Db;
 use crate::acx::{Check, FileReport, Levels};
 use crate::model::Id;
 
-/// New tables only, so `CREATE TABLE IF NOT EXISTS` is the whole migration.
-pub(super) const SCHEMA: &str = r#"
+/// New tables, plus the `takes_key` column for tables made before it.
+pub(super) fn init(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute_batch(SCHEMA)?;
+    let has_key: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('export_report') WHERE name = 'takes_key'")?
+        .exists([])?;
+    if !has_key {
+        conn.execute_batch("ALTER TABLE export_report ADD COLUMN takes_key TEXT")?;
+    }
+    Ok(())
+}
+
+const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS export_report (
     chapter_id     INTEGER PRIMARY KEY REFERENCES chapter(id) ON DELETE CASCADE,
     file           TEXT NOT NULL,
@@ -24,7 +35,8 @@ CREATE TABLE IF NOT EXISTS export_report (
     duration_ms    INTEGER NOT NULL,
     checks         TEXT NOT NULL DEFAULT '[]',
     passed         INTEGER NOT NULL,
-    checked_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+    checked_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    takes_key      TEXT
 );
 CREATE TABLE IF NOT EXISTS retail_sample (
     project_id     INTEGER PRIMARY KEY REFERENCES project(id) ON DELETE CASCADE,
@@ -53,7 +65,7 @@ fn checks(json: &str) -> Vec<Check> {
     serde_json::from_str(json).unwrap_or_default()
 }
 
-const REPORT_COLS: &str = "chapter_id, file, draft, rms_db, peak_db, noise_floor_db, head_ms, tail_ms, duration_ms, checks, checked_at";
+const REPORT_COLS: &str = "chapter_id, file, draft, rms_db, peak_db, noise_floor_db, head_ms, tail_ms, duration_ms, checks, checked_at, takes_key";
 
 fn row_report(r: &Row) -> rusqlite::Result<(Id, FileReport)> {
     let json: String = r.get(9)?;
@@ -72,18 +84,32 @@ fn row_report(r: &Row) -> rusqlite::Result<(Id, FileReport)> {
             },
             checks: checks(&json),
             checked_at: r.get(10)?,
+            takes_key: r.get(11)?,
         },
     ))
 }
 
 impl Db {
-    /// Replace the chapter's report with the check of its latest export.
-    pub fn save_export_report(&self, chapter_id: Id, r: &FileReport) -> Result<()> {
+    /// Store the check of the chapter's latest export. A final export
+    /// replaces any report; a draft only replaces a draft (or nothing), so
+    /// the report keeps describing the delivery file next to it. Returns
+    /// whether it was stored.
+    pub fn save_export_report(&self, chapter_id: Id, r: &FileReport) -> Result<bool> {
         let l = &r.levels;
-        self.conn.execute(
-            "INSERT OR REPLACE INTO export_report (chapter_id, file, draft, rms_db, peak_db,
-                    noise_floor_db, head_ms, tail_ms, duration_ms, checks, passed)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        let n = self.conn.execute(
+            "INSERT INTO export_report (chapter_id, file, draft, rms_db, peak_db,
+                    noise_floor_db, head_ms, tail_ms, duration_ms, checks, passed, takes_key,
+                    checked_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                    strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+             ON CONFLICT(chapter_id) DO UPDATE SET
+                file = excluded.file, draft = excluded.draft, rms_db = excluded.rms_db,
+                peak_db = excluded.peak_db, noise_floor_db = excluded.noise_floor_db,
+                head_ms = excluded.head_ms, tail_ms = excluded.tail_ms,
+                duration_ms = excluded.duration_ms, checks = excluded.checks,
+                passed = excluded.passed, takes_key = excluded.takes_key,
+                checked_at = excluded.checked_at
+             WHERE excluded.draft = 0 OR export_report.draft = 1",
             params![
                 chapter_id,
                 r.file,
@@ -96,9 +122,10 @@ impl Db {
                 l.duration_ms as i64,
                 serde_json::to_string(&r.checks)?,
                 (r.verdict() == crate::acx::Verdict::Pass) as i64,
+                r.takes_key,
             ],
         )?;
-        Ok(())
+        Ok(n > 0)
     }
 
     #[cfg(test)]
@@ -173,6 +200,7 @@ impl Db {
                             },
                             checks: checks(&json),
                             checked_at: r.get(7)?,
+                            takes_key: None,
                         },
                         r.get(0)?,
                     ))
@@ -181,18 +209,66 @@ impl Db {
             .optional()?)
     }
 
-    /// Chapters with takes created after their report was measured.
+    /// `retail::takes_key` of every chapter of the project that has
+    /// segments, in one query (the same order as `Db::chapter_segments`).
+    pub fn takes_keys(&self, project_id: Id) -> Result<HashMap<Id, String>> {
+        let mut st = self.conn.prepare(
+            "SELECT p.chapter_id, s.id, s.current_take_id, s.status = 'approved'
+             FROM segment s JOIN paragraph p ON p.id = s.paragraph_id
+             JOIN chapter c ON c.id = p.chapter_id
+             WHERE c.project_id = ?1
+             ORDER BY p.chapter_id, p.ord, s.ord",
+        )?;
+        let mut by_chapter: HashMap<Id, Vec<(Id, Option<Id>, bool)>> = HashMap::new();
+        for row in st.query_map([project_id], |r| {
+            Ok((r.get::<_, Id>(0)?, (r.get(1)?, r.get(2)?, r.get(3)?)))
+        })? {
+            let (chapter_id, seg) = row?;
+            by_chapter.entry(chapter_id).or_default().push(seg);
+        }
+        Ok(by_chapter
+            .into_iter()
+            .map(|(id, segs)| (id, crate::retail::takes_key(segs)))
+            .collect())
+    }
+
+    /// Chapters whose segments, current takes or approvals no longer match
+    /// their report (`retail::takes_key`). Reports stored before the key
+    /// existed fall back to "a take was created after the measurement".
     pub fn stale_reports(&self, project_id: Id) -> Result<std::collections::HashSet<Id>> {
+        let mut stale = std::collections::HashSet::new();
+        let mut st = self.conn.prepare(
+            "SELECT r.chapter_id, r.takes_key FROM export_report r
+             JOIN chapter c ON c.id = r.chapter_id
+             WHERE c.project_id = ?1 AND r.takes_key IS NOT NULL",
+        )?;
+        let stored: Vec<(Id, String)> = st
+            .query_map([project_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        if !stored.is_empty() {
+            let current = self.takes_keys(project_id)?;
+            for (chapter_id, key) in stored {
+                let now = current
+                    .get(&chapter_id)
+                    .cloned()
+                    .unwrap_or_else(|| crate::retail::takes_key([]));
+                if key != now {
+                    stale.insert(chapter_id);
+                }
+            }
+        }
         let mut st = self.conn.prepare(
             "SELECT r.chapter_id FROM export_report r
              JOIN chapter c ON c.id = r.chapter_id
-             WHERE c.project_id = ?1 AND EXISTS (
+             WHERE c.project_id = ?1 AND r.takes_key IS NULL AND EXISTS (
                 SELECT 1 FROM take t JOIN segment s ON s.id = t.segment_id
                 JOIN paragraph p ON p.id = s.paragraph_id
                 WHERE p.chapter_id = r.chapter_id AND t.created_at > r.checked_at)",
         )?;
-        let rows = st.query_map([project_id], |r| r.get(0))?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        for id in st.query_map([project_id], |r| r.get(0))? {
+            stale.insert(id?);
+        }
+        Ok(stale)
     }
 }
 
@@ -201,6 +277,7 @@ mod tests {
     use super::*;
     use crate::acx::{Container, FileKind, Verdict, evaluate};
     use crate::db::NewTake;
+    use crate::model::SegmentStatus;
 
     fn report(rms: f64, floor: f64) -> FileReport {
         let levels = Levels {
@@ -223,6 +300,7 @@ mod tests {
             levels,
             checks: evaluate(FileKind::Chapter, &levels, Ok(&c), Some(true), 1_500_000),
             checked_at: String::new(),
+            takes_key: None,
         }
     }
 
@@ -247,13 +325,34 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert!(all.contains_key(&cid));
 
-        // A newer export replaces the report.
+        // A draft export does not replace the final export's report (the
+        // report describes the delivery file)...
         let mut d = report(-24.5, -72.0);
         d.draft = true;
-        db.save_export_report(cid, &d).unwrap();
+        assert!(!db.save_export_report(cid, &d).unwrap());
         let back = db.export_report(cid).unwrap().unwrap();
-        assert!(back.draft);
-        assert_eq!(back.levels.rms_db, -24.5);
+        assert!(!back.draft);
+        assert_eq!(back.levels.rms_db, -20.3);
+        // ...but a draft stands in while there is no final export, a newer
+        // draft replaces it, and a final export replaces any draft.
+        let other_cid = db.import_chapter(pid, "Two", "More.").unwrap();
+        assert!(db.save_export_report(other_cid, &d).unwrap());
+        let mut d2 = report(-21.0, -72.0);
+        d2.draft = true;
+        assert!(db.save_export_report(other_cid, &d2).unwrap());
+        assert_eq!(
+            db.export_report(other_cid).unwrap().unwrap().levels.rms_db,
+            -21.0
+        );
+        let mut f = report(-19.5, -72.0);
+        f.takes_key = Some("abc".into());
+        assert!(db.save_export_report(other_cid, &f).unwrap());
+        let back = db.export_report(other_cid).unwrap().unwrap();
+        assert!(!back.draft);
+        assert_eq!(back.takes_key.as_deref(), Some("abc"));
+        assert!(db.save_export_report(cid, &report(-19.0, -70.0)).unwrap());
+        assert_eq!(db.export_report(cid).unwrap().unwrap().levels.rms_db, -19.0);
+        db.delete_chapter(other_cid).unwrap();
 
         // Deleting the chapter drops its report.
         db.delete_chapter(cid).unwrap();
@@ -312,6 +411,70 @@ mod tests {
         assert_eq!(db.sample_report(pid).unwrap().unwrap().1, None);
     }
 
+    /// With a takes key, "outdated" follows what the export is made of:
+    /// approvals and the current take, not only new takes.
+    #[test]
+    fn approvals_and_take_switches_make_a_report_outdated() {
+        let mut db = Db::open_in_memory().unwrap();
+        let pid = db.create_project("Book", "en").unwrap();
+        let cid = db.import_chapter(pid, "One", "Text.").unwrap();
+        let p = db.paragraphs(cid).unwrap()[0].clone();
+        db.replace_paragraph_segments(
+            p.id,
+            &[(
+                crate::model::SegmentKind::Narration,
+                "narrator".into(),
+                "Text.".into(),
+            )],
+        )
+        .unwrap();
+        let seg = db.chapter_segments(cid).unwrap()[0].id;
+        let take = |db: &Db, h: &str| {
+            db.insert_take(&NewTake {
+                segment_id: seg,
+                seed: 1,
+                request_id: None,
+                audio_path: "a.wav",
+                hash: h,
+                credits_used: 1,
+                credits_exact: true,
+            })
+            .unwrap()
+        };
+        let t1 = take(&db, "h1");
+        let t2 = take(&db, "h2");
+        db.set_current_take(seg, t2).unwrap();
+        db.set_segment_status(seg, SegmentStatus::Approved).unwrap();
+        let key = |db: &Db| crate::retail::segments_key(&db.chapter_segments(cid).unwrap());
+        // The one-query keys agree with the per-chapter ones.
+        assert_eq!(db.takes_keys(pid).unwrap().get(&cid), Some(&key(&db)));
+        let mut r = report(-20.0, -73.0);
+        r.takes_key = Some(key(&db));
+        db.save_export_report(cid, &r).unwrap();
+        assert!(db.stale_reports(pid).unwrap().is_empty());
+
+        // Unapproving changes the key; approving again restores it.
+        db.set_segment_status(seg, SegmentStatus::Generated)
+            .unwrap();
+        assert!(db.stale_reports(pid).unwrap().contains(&cid));
+        db.set_segment_status(seg, SegmentStatus::Approved).unwrap();
+        assert!(db.stale_reports(pid).unwrap().is_empty());
+        // Picking the older take again (no new take is created).
+        db.set_current_take(seg, t1).unwrap();
+        assert!(db.stale_reports(pid).unwrap().contains(&cid));
+        db.set_current_take(seg, t2).unwrap();
+        assert!(db.stale_reports(pid).unwrap().is_empty());
+        // A take created later but not made current changes nothing.
+        db.conn
+            .execute(
+                "UPDATE export_report SET checked_at = '2000-01-01T00:00:00Z'",
+                [],
+            )
+            .unwrap();
+        take(&db, "h3");
+        assert!(db.stale_reports(pid).unwrap().is_empty());
+    }
+
     #[test]
     fn old_libraries_gain_the_report_tables() {
         let dir = tempfile::tempdir().unwrap();
@@ -329,5 +492,45 @@ mod tests {
         let pid = db.create_project("Book", "en").unwrap();
         assert!(db.export_reports(pid).unwrap().is_empty());
         assert!(db.sample_report(pid).unwrap().is_none());
+    }
+
+    #[test]
+    fn report_tables_without_the_takes_key_gain_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("library.sqlite");
+        let cid;
+        {
+            // export_report as the first retail build created it.
+            let mut db = Db::open(&path).unwrap();
+            let pid = db.create_project("Book", "en").unwrap();
+            cid = db.import_chapter(pid, "One", "Text.").unwrap();
+            db.conn
+                .execute_batch(&format!(
+                    "DROP TABLE export_report;
+                     CREATE TABLE export_report (
+                        chapter_id INTEGER PRIMARY KEY REFERENCES chapter(id) ON DELETE CASCADE,
+                        file TEXT NOT NULL, draft INTEGER NOT NULL DEFAULT 0, rms_db REAL,
+                        peak_db REAL, noise_floor_db REAL, head_ms INTEGER NOT NULL DEFAULT 0,
+                        tail_ms INTEGER NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL,
+                        checks TEXT NOT NULL DEFAULT '[]', passed INTEGER NOT NULL,
+                        checked_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')));
+                     INSERT INTO export_report (chapter_id, file, duration_ms, passed)
+                        VALUES ({cid}, 'old.mp3', 1000, 1);"
+                ))
+                .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let old = db.export_report(cid).unwrap().unwrap();
+        assert_eq!((old.file.as_str(), old.takes_key), ("old.mp3", None));
+        let mut r = report(-20.0, -73.0);
+        r.takes_key = Some("k".into());
+        db.save_export_report(cid, &r).unwrap();
+        assert_eq!(
+            db.export_report(cid).unwrap().unwrap().takes_key.as_deref(),
+            Some("k")
+        );
+        // Opening again is a no-op.
+        drop(db);
+        Db::open(&path).unwrap();
     }
 }

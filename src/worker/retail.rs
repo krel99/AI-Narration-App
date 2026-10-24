@@ -32,6 +32,7 @@ pub(super) fn check_file(m: &Mastered, kind: FileKind, draft: bool) -> Result<Fi
         levels,
         checks,
         checked_at: String::new(),
+        takes_key: None,
     })
 }
 
@@ -48,10 +49,17 @@ fn write_report(db: &Db, lib: &Library, project: &Project) {
     }
 }
 
-fn emit_check(ctx: &Ctx, what: &str, check: Result<FileReport, String>) {
+fn emit_check(ctx: &Ctx, what: &str, check: Result<FileReport, String>, stored: bool) {
     match check {
         Ok(r) => ctx.out.emit(Event::AcxChecked {
-            summary: r.summary(what),
+            summary: if stored {
+                r.summary(what)
+            } else {
+                format!(
+                    "{} (Draft: the report keeps the final export's check.)",
+                    r.summary(what)
+                )
+            },
             verdict: r.verdict(),
         }),
         Err(e) => ctx
@@ -62,10 +70,12 @@ fn emit_check(ctx: &Ctx, what: &str, check: Result<FileReport, String>) {
 
 pub(super) async fn export_chapter(ctx: &Ctx, chapter_id: Id, draft: bool) -> Result<()> {
     let lib = ctx.lib.clone();
-    let (res, title, check) = tokio::task::spawn_blocking(move || -> Result<_> {
+    let (res, title, check, stored) = tokio::task::spawn_blocking(move || -> Result<_> {
         let db = lib.open()?;
         let chapter = db.chapter(chapter_id)?;
         let project = db.project(chapter.project_id)?;
+        // What the export is made of, to tell later whether it is outdated.
+        let takes_key = retail::segments_key(&db.chapter_segments(chapter_id)?);
         let res = export::export_chapter(&db, &lib, &project, &chapter, draft)?;
         if !draft {
             db.set_chapter_status(chapter_id, ChapterStatus::Exported)?;
@@ -75,12 +85,17 @@ pub(super) async fn export_chapter(ctx: &Ctx, chapter_id: Id, draft: bool) -> Re
             .as_ref()
             .map_or(Err("not measured".to_string()), |m| {
                 check_file(m, FileKind::Chapter, draft)
+            })
+            .map(|r| FileReport {
+                takes_key: Some(takes_key),
+                ..r
             });
+        let mut stored = true;
         if let Ok(r) = &check {
-            db.save_export_report(chapter_id, r)?;
+            stored = db.save_export_report(chapter_id, r)?;
         }
         write_report(&db, &lib, &project);
-        Ok((res, chapter.title, check))
+        Ok((res, chapter.title, check, stored))
     })
     .await??;
     for n in &res.notes {
@@ -91,7 +106,7 @@ pub(super) async fn export_chapter(ctx: &Ctx, chapter_id: Id, draft: bool) -> Re
         gaps: res.gaps.len(),
         duration_ms: res.duration_ms,
     });
-    emit_check(ctx, &title, check);
+    emit_check(ctx, &title, check, stored);
     Ok(())
 }
 
@@ -149,6 +164,6 @@ pub(super) async fn export_sample(
         gaps: 0,
         duration_ms: out.plan.total_ms(),
     });
-    emit_check(ctx, "Retail sample", check);
+    emit_check(ctx, "Retail sample", check, true);
     Ok(())
 }

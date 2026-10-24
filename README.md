@@ -23,8 +23,8 @@ Requirements:
 
 - Rust 1.95 or newer (eframe 0.37 requires it)
 - Build dependencies: `pkg-config`, `libasound2-dev` (ALSA headers for audio playback)
-- Runtime: `ffmpeg` with `libmp3lame`, and `ffprobe`, on `PATH` (export and
-  its ACX checks only), and a desktop session (X11 or Wayland)
+- Runtime: `ffmpeg` 4.4 or newer with `libmp3lame`, and `ffprobe`, on `PATH`
+  (export and its ACX checks only), and a desktop session (X11 or Wayland)
 
 ```sh
 sudo apt install pkg-config libasound2-dev ffmpeg   # Debian/Ubuntu
@@ -205,21 +205,25 @@ and cover art in every file, an ACX report and a retail sample
   and 170 MB, and 0.5–5 s of room tone at the start and 1–5 s at the end.
   Each check is *pass*, *warning* (close, or worth a look) or *fail*, with
   the bands of the ACX Check plugin. The Review toolbar shows the open
-  chapter's result (*ACX ✓*, *ACX ⚠ …*, *ACX ✗ RMS -24.1*; *draft* and
-  *outdated* when it came from a draft export or takes changed since);
+  chapter's result (*ACX ✓*, *ACX ⚠ …*, *ACX ✗ RMS -24.1*; *draft* when
+  it came from a draft export, *outdated* when segments, takes or approvals
+  changed since);
   hover for every check, click for the **Retail & ACX** window (also in the
   ⋯ menu), which lists all chapters, the book-level checks (cover, mono or
   stereo throughout, retail sample, opening and closing credits) and opens
   the export folder. `ACX report.md` in the export folder has the same
-  table and is rewritten after every export.
+  table and is rewritten after every export. A draft export is checked
+  too, but it only stands in until the chapter's first real export; after
+  that the report keeps describing the delivery file.
 - **Retail sample.** *Export retail sample…* in that window builds
   `<Book title> - Retail Sample.mp3` from approved takes only, starting at
   the segment selected in Review (or the chapter start), 1 to 5 minutes
   (3 by default), ending at a paragraph end where it can, faded in over
   0.5 s and out over 3 s, mastered and tagged like the chapters. If the
-  range reaches a segment that is not approved, the sample stops before it
-  and says so. ACX wants up to 5 minutes from the book itself (not the
-  credits) and recommends the opening.
+  range reaches a segment that is not approved, or a paragraph that has no
+  segments yet, the sample stops before it and says so. ACX wants up to 5
+  minutes from the book itself (not the credits) and recommends the
+  opening.
 - **What this is not.** The checks cover the technical audio spec
   ("ACX/Findaway technical spec"), not acceptance. ACX does not accept
   unauthorized AI or text-to-speech narration; Findaway Voices by Spotify

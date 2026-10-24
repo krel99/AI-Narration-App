@@ -294,7 +294,7 @@ impl Db {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
-        conn.execute_batch(retail::SCHEMA)?;
+        retail::init(&conn)?;
         // Libraries created before audio tags lack the performance column.
         let has_performance: bool = conn
             .prepare("SELECT 1 FROM pragma_table_info('segment') WHERE name = 'performance'")?
