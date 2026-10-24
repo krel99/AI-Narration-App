@@ -185,6 +185,143 @@ fn usage_limit_stops_the_pass_without_falling_back() {
             .try_iter()
             .any(|e| matches!(e, Event::SegmentationFinished { .. }))
     );
+
+    // After the reset, running it again (Re-segment drafts) attributes the
+    // paragraphs that were left over.
+    fake.set("out.json", &success(story_segments(), 0.01));
+    fake.set("exit", "0");
+    rt().block_on(segment_chapter(&ctx, cid)).unwrap();
+    assert_eq!(fake.calls(), 3, "one call per dialogue window");
+    let segs = ctx.db(|db| db.chapter_segments(cid)).unwrap();
+    let got: Vec<(&str, &str)> = segs
+        .iter()
+        .map(|s| (s.speaker.as_str(), s.text.as_str()))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (NARRATOR, "The night was cold."),
+            ("guard", "\"Who goes there?\""),
+            (NARRATOR, "asked the guard."),
+            ("vortram", "\"Only me,\""),
+            (NARRATOR, "said the old man."),
+        ]
+    );
+}
+
+/// The attribution of STORY's two dialogue paragraphs.
+fn story_segments() -> serde_json::Value {
+    json!({
+        "segments": [
+            {"paragraph": 2, "kind": "dialogue", "speaker": "guard", "text": "\"Who goes there?\""},
+            {"paragraph": 2, "kind": "narration", "speaker": "narrator", "text": "asked the guard."},
+            {"paragraph": 3, "kind": "dialogue", "speaker": "vortram", "text": "\"Only me,\""},
+            {"paragraph": 3, "kind": "narration", "speaker": "narrator", "text": "said the old man."}
+        ],
+        "characters": []
+    })
+}
+
+#[test]
+fn usage_limit_stops_the_audio_tag_pass() {
+    let fake = FakeClaude::new();
+    fake.set(
+        "out.json",
+        &json!({
+            "type": "result", "subtype": "success", "is_error": true,
+            "terminal_reason": "api_error", "api_error_status": 429,
+            "api_error": "usage_limit_reached", "modelUsage": {},
+            "result": "You've hit your weekly limit · resets Mon 12:00am"
+        })
+        .to_string(),
+    );
+    fake.set("exit", "1");
+    let dir = tempfile::tempdir().unwrap();
+    let lib = Library::new(dir.path().to_path_buf());
+    let (ctx, events) = test_ctx(&lib, "http://unused", "http://unused");
+    use_claude_code(&ctx, fake.bin());
+    let cid = ctx
+        .db(|db| {
+            let pid = db.create_project("Book", "en")?;
+            let mut p = db.project(pid)?;
+            // Three tag windows, one paragraph each.
+            p.settings.segmentation.chunk_paragraphs = 1;
+            db.update_project(&p)?;
+            let cid = db.import_chapter(pid, "One", STORY)?;
+            for p in db.paragraphs(cid)? {
+                let segs = segment::parse_paragraph(&p.text, lang::by_code("en"));
+                store_segments(db, &p, &segs)?;
+            }
+            Ok(cid)
+        })
+        .unwrap();
+
+    // Through the command, as the UI sends it: the error must be the last
+    // event, or the "tags added to 0 segments" note would hide it.
+    rt().block_on(async {
+        if let Err(e) = run(&ctx, Command::DirectChapter { chapter_id: cid }).await {
+            ctx.out.emit(Event::Error(format!("{e:#}")));
+        }
+    });
+    assert_eq!(fake.calls(), 1, "the other windows are not tried");
+    let segs = ctx.db(|db| db.chapter_segments(cid)).unwrap();
+    assert!(segs.iter().all(|s| s.performance.is_none()));
+    let events: Vec<Event> = events.try_iter().collect();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::DirectionFinished { tagged: 0, .. }))
+    );
+    assert!(
+        matches!(events.last(), Some(Event::Error(m)) if m.contains("resets Mon 12:00am")),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn paid_take_stays_current_when_cost_bookkeeping_fails() {
+    let (eleven, _reqs) = serve(|n, _, _| {
+        (
+            200,
+            vec![
+                ("request-id".into(), format!("r{n}")),
+                ("character-cost".into(), "12".into()),
+            ],
+            vec![0u8; 480],
+        )
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let lib = Library::new(dir.path().to_path_buf());
+    let (ctx, events) = test_ctx(&lib, "http://unused", &eleven);
+    let (cid, ids) = ctx
+        .db(|db| {
+            let pid = db.create_project("Book", "en")?;
+            let mut p = db.project(pid)?;
+            p.voice_map.insert(NARRATOR.into(), "vn".into());
+            p.voice_map.insert("vortram".into(), "vv".into());
+            p.settings.output_format = "pcm_24000".into();
+            p.settings.audio_tags.enabled = false;
+            db.update_project(&p)?;
+            let cid = import(db, pid);
+            let ids: Vec<Id> = db.chapter_segments(cid)?.iter().map(|s| s.id).collect();
+            db.break_take_cost()?;
+            Ok((cid, ids))
+        })
+        .unwrap();
+    rt().block_on(generate(&ctx, ids.clone(), false)).unwrap();
+    let segs = ctx.db(|db| db.chapter_segments(cid)).unwrap();
+    assert_eq!(segs.len(), ids.len());
+    for s in &segs {
+        let take = ctx.db(|db| db.take(s.current_take_id.unwrap())).unwrap();
+        assert_eq!((take.credits_used, take.credits_exact), (12, true));
+    }
+    let finished = events.try_iter().find_map(|e| match e {
+        Event::GenerationFinished {
+            failed, credits, ..
+        } => Some((failed, credits)),
+        _ => None,
+    });
+    assert_eq!(finished, Some((0, 12 * ids.len() as i64)));
 }
 
 #[test]

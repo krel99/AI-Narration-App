@@ -102,12 +102,22 @@ fn is_executable(p: &Path) -> bool {
     }
 }
 
+/// A configured path, with a leading `~` meaning the home directory (as
+/// typed in Settings; no shell expands it).
+fn expand_home(p: &Path) -> PathBuf {
+    match (p.strip_prefix("~"), std::env::var_os("HOME")) {
+        (Ok(rest), Some(home)) => PathBuf::from(home).join(rest),
+        _ => p.to_path_buf(),
+    }
+}
+
 /// The `claude` binary: the configured path, else `claude` on PATH, else
 /// the native installer's `~/.local/bin/claude` (a desktop launcher's PATH
 /// often lacks it).
 pub fn find_binary(configured: Option<&Path>) -> Option<PathBuf> {
     if let Some(p) = configured.filter(|p| !p.as_os_str().is_empty()) {
-        return is_executable(p).then(|| p.to_path_buf());
+        let p = expand_home(p);
+        return is_executable(&p).then_some(p);
     }
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
@@ -195,6 +205,16 @@ fn not_installed(bin: &Path) -> String {
     )
 }
 
+/// Why the CLI could not be started. ENOENT for a binary that exists means
+/// its interpreter (e.g. `node` for an npm install) is missing.
+fn spawn_error(bin: &Path, e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::NotFound && !bin.exists() {
+        not_installed(bin)
+    } else {
+        format!("could not run Claude Code ({}): {e}", bin.display())
+    }
+}
+
 impl Invocation {
     pub fn new(bin: PathBuf, cwd: PathBuf) -> Self {
         Self {
@@ -216,9 +236,9 @@ impl Invocation {
         for (k, v) in SET_ENV {
             cmd.env(k, v);
         }
-        if self.cwd.is_dir() {
-            cmd.current_dir(&self.cwd);
-        }
+        // Always the app-owned directory (see `ensure_cwd`), never the one
+        // the app was started from.
+        cmd.current_dir(&self.cwd);
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -226,17 +246,29 @@ impl Invocation {
         cmd
     }
 
+    /// Creates the working directory when it is missing. Claude Code must not
+    /// fall back to the app's own working directory, where a project's
+    /// `.claude/` settings or `.mcp.json` could apply.
+    fn ensure_cwd(&self) -> Result<(), String> {
+        if !self.cwd.is_dir() {
+            std::fs::create_dir_all(&self.cwd).map_err(|e| {
+                format!(
+                    "cannot create Claude Code's working directory {}: {e}",
+                    self.cwd.display()
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     /// Runs a short probe (`--version`, `auth status`): (exit code, stdout, stderr).
     async fn probe(&self, args: &[&str]) -> Result<(Option<i32>, String, String), String> {
+        self.ensure_cwd()?;
         let mut cmd = self.command();
         cmd.args(args).stdin(Stdio::null());
-        let child = spawn(&mut cmd).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                not_installed(&self.bin)
-            } else {
-                format!("could not run {}: {e}", self.bin.display())
-            }
-        })?;
+        let child = spawn(&mut cmd)
+            .await
+            .map_err(|e| spawn_error(&self.bin, &e))?;
         let out = tokio::time::timeout(PROBE_TIMEOUT, child.wait_with_output())
             .await
             .map_err(|_| format!("`claude {}` did not answer", args.join(" ")))?
@@ -295,19 +327,16 @@ impl Invocation {
         if req.prompt.len() > MAX_STDIN {
             return (Err(LlmError::TooLong), vec![]);
         }
+        if let Err(e) = self.ensure_cwd() {
+            return (Err(LlmError::Unavailable(e)), vec![]);
+        }
         let mut cmd = self.command();
         cmd.args(run_args(req));
         let mut child = match spawn(&mut cmd).await {
             Ok(c) => c,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return (Err(LlmError::Unavailable(not_installed(&self.bin))), vec![]);
-            }
             Err(e) => {
                 return (
-                    Err(LlmError::Unavailable(format!(
-                        "could not run Claude Code ({}): {e}",
-                        self.bin.display()
-                    ))),
+                    Err(LlmError::Unavailable(spawn_error(&self.bin, &e))),
                     vec![],
                 );
             }
@@ -480,9 +509,10 @@ fn no_result(stderr: &str, exit_code: Option<i32>) -> LlmError {
     ))
 }
 
-/// Error classification, in this order: usage limit, output too long,
-/// auth, plan lacks the model, API credit, context too long, refusal, error
-/// subtypes, temporary throttling, anything else.
+/// Error classification, in this order: usage limit, output too long, plan
+/// lacks the model (its text mentions /login, so it goes before auth), auth,
+/// API credit, context too long, refusal, error subtypes, temporary
+/// throttling, anything else.
 fn classify(v: &Value) -> LlmError {
     let result = v["result"].as_str().unwrap_or("").trim();
     let api_error = v["api_error"].as_str().unwrap_or("");
@@ -502,9 +532,15 @@ fn classify(v: &Value) -> LlmError {
         format!("{subtype} without an answer")
     };
 
+    // The CLI may print a typographic apostrophe; older versions said
+    // "Claude AI usage limit reached|<reset>". The temporary throttle says
+    // "(not your usage limit)" and must not match.
+    let plain = result.replace('\u{2019}', "'");
+    let hit_limit = plain.starts_with("You've hit your")
+        || (status == Some(429) && plain.starts_with("You've hit"));
     if api_error == "usage_limit_reached"
-        || result.starts_with("You've hit your")
-        || (status == Some(429) && result.starts_with("You've hit"))
+        || hit_limit
+        || result.to_lowercase().contains("usage limit reached")
     {
         let text = if result.is_empty() {
             "usage limit reached"
@@ -517,6 +553,13 @@ fn classify(v: &Value) -> LlmError {
     }
     if api_error == "max_output_tokens" || result.contains("output token maximum") {
         return LlmError::TooLong;
+    }
+    // Before the auth checks: this message ends "run /logout and /login for
+    // the plan to take effect", but signing in again does not help.
+    if result.contains("is not available with the Claude") {
+        return LlmError::Unavailable(format!(
+            "{result} Choose Sonnet (claude-sonnet-5-5) under Project → Claude → Model."
+        ));
     }
     if result.starts_with("Invalid API key") {
         return LlmError::Auth(
@@ -532,11 +575,6 @@ fn classify(v: &Value) -> LlmError {
     {
         return LlmError::Auth(format!(
             "Claude Code is not signed in ({detail}). Run `claude auth login` in a terminal, then try again."
-        ));
-    }
-    if result.contains("is not available with the Claude") {
-        return LlmError::Unavailable(format!(
-            "{result} Choose Sonnet (claude-sonnet-5-5) under Project → Claude → Model."
         ));
     }
     if result.contains("Credit balance is too low") {
@@ -1014,10 +1052,24 @@ exit "$(cat "$D/exit" 2>/dev/null || echo 0)"
             "result": "Failed to authenticate: OAuth session expired and could not be refreshed"
         })));
         assert!(matches!(r, Err(LlmError::Auth(_))));
+        // The documented text mentions /login, but signing in again does
+        // not help: it must suggest Sonnet, not `claude auth login`.
         let (r, _) = classify_out(error_result(json!({
-            "result": "Claude Opus is not available with the Claude Pro plan."
+            "result": "Claude Opus is not available with the Claude Pro plan. If you have updated your subscription plan recently, run /logout and /login for the plan to take effect."
         })));
-        assert!(matches!(r, Err(LlmError::Unavailable(ref m)) if m.contains("Sonnet")));
+        assert!(
+            matches!(r, Err(LlmError::Unavailable(ref m)) if m.contains("Sonnet") && !m.contains("not signed in")),
+            "{r:?}"
+        );
+        // Usage-limit wording variants: a typographic apostrophe, and the
+        // older "usage limit reached|<reset>" form.
+        for text in [
+            "You\u{2019}ve hit your weekly limit · resets Mon 12:00am",
+            "Claude AI usage limit reached|1793664000",
+        ] {
+            let (r, _) = classify_out(error_result(json!({"result": text})));
+            assert!(matches!(r, Err(LlmError::UsageLimit(_))), "{text}: {r:?}");
+        }
         let (r, _) = classify_out(error_result(json!({"result": "Prompt is too long"})));
         assert!(matches!(r, Err(LlmError::TooLong)));
         let (r, _) = classify_out(error_result(json!({
@@ -1202,6 +1254,50 @@ exit "$(cat "$D/exit" 2>/dev/null || echo 0)"
         let gone = Invocation::new(fake.dir.path().join("missing"), fake.cwd());
         let (r, _) = rt().block_on(gone.run(&request(&schema)));
         assert!(matches!(r, Err(LlmError::Unavailable(ref m)) if m.contains("not installed")));
+    }
+
+    #[test]
+    fn runs_only_in_the_app_owned_directory() {
+        let schema = json!({"type": "object"});
+        let fake = FakeClaude::new();
+        fake.set("out.json", &success(json!({"segments": []}), 0.01));
+
+        // A missing working directory is created, not replaced by the
+        // directory the app was started from.
+        let fresh = fake.dir.path().join("lib/claude-cwd");
+        let inv = Invocation::new(fake.bin(), fresh.clone());
+        assert!(rt().block_on(inv.run(&request(&schema))).0.is_ok());
+        assert_eq!(
+            fake.read("cwd.0").trim(),
+            fresh.canonicalize().unwrap().display().to_string()
+        );
+
+        // One that cannot be created stops the run before Claude Code starts.
+        let blocker = fake.dir.path().join("a-file");
+        std::fs::write(&blocker, "").unwrap();
+        let inv = Invocation::new(fake.bin(), blocker.join("claude-cwd"));
+        let (r, _) = rt().block_on(inv.run(&request(&schema)));
+        assert!(
+            matches!(r, Err(LlmError::Unavailable(ref m)) if m.contains("working directory")),
+            "{r:?}"
+        );
+        assert!(rt().block_on(inv.version()).is_err());
+        assert_eq!(fake.calls(), 1, "no second run");
+    }
+
+    #[test]
+    fn configured_paths_expand_the_home_directory() {
+        if let Some(home) = std::env::var_os("HOME") {
+            assert_eq!(
+                expand_home(Path::new("~/.local/bin/claude")),
+                PathBuf::from(home).join(".local/bin/claude")
+            );
+        }
+        assert_eq!(
+            expand_home(Path::new("/opt/claude")),
+            PathBuf::from("/opt/claude")
+        );
+        assert_eq!(expand_home(Path::new("~x/y")), PathBuf::from("~x/y"));
     }
 
     #[test]

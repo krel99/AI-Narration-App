@@ -680,6 +680,9 @@ async fn direct_chapter(ctx: &Ctx, chapter_id: Id, untagged_only: bool) -> Resul
         .collect();
     let (mut done, mut tagged, mut rejected) = (0usize, 0usize, 0usize);
     let (mut input_tokens, mut output_tokens) = (0u64, 0u64);
+    // Why the pass stopped early: reported after DirectionFinished, so the
+    // error (e.g. a usage limit with its reset time) is the last message.
+    let mut failed: Option<String> = None;
     ctx.out.emit(Event::DirectionProgress {
         chapter_id,
         done,
@@ -775,11 +778,7 @@ async fn direct_chapter(ctx: &Ctx, chapter_id: Id, untagged_only: bool) -> Resul
                 continue;
             }
             Err(e) => {
-                ctx.out.emit(Event::Error(format!(
-                    "Audio tags for P{}–P{}: {e}",
-                    lo + 1,
-                    hi
-                )));
+                failed = Some(format!("Audio tags for P{}–P{}: {e}", lo + 1, hi));
                 break;
             }
         }
@@ -797,7 +796,10 @@ async fn direct_chapter(ctx: &Ctx, chapter_id: Id, untagged_only: bool) -> Resul
         input_tokens,
         output_tokens,
     });
-    Ok(())
+    match failed {
+        Some(why) => Err(anyhow!(why)),
+        None => Ok(()),
+    }
 }
 
 // ---- generation ---------------------------------------------------------
@@ -1102,9 +1104,13 @@ async fn generate_one(
             credits_used: credits,
             credits_exact,
         })?;
+        db.set_current_take(seg.id, take_id)?;
         // What this take cost per character teaches the credit estimates.
-        db.record_take_cost(take_id, &project.tts_model, chars as i64)?;
-        db.set_current_take(seg.id, take_id)
+        // Bookkeeping only: the paid take stays current even if this fails.
+        if let Err(e) = db.record_take_cost(take_id, &project.tts_model, chars as i64) {
+            log::warn!("recording the cost of take {take_id}: {e:#}");
+        }
+        Ok(())
     })?;
     Ok((false, credits))
 }

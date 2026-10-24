@@ -36,6 +36,10 @@ pub(super) struct CostState {
     detecting: bool,
     /// Claude usage of the open chapter, per pass and backend.
     usage: Vec<PassUsage>,
+    /// Credit rate of the open project's model. The estimates are drawn
+    /// every frame; the rate only changes with new takes or list rates, so
+    /// it is read from the database on reload, not per frame.
+    rate: Option<(String, CreditRate)>,
 }
 
 impl App {
@@ -96,6 +100,7 @@ impl App {
         self.costs.account = Some(info.subscription);
         if info.model_rates > 0 {
             log::info!("ElevenLabs list rates for {} models", info.model_rates);
+            self.refresh_credit_rate();
         }
     }
 
@@ -139,6 +144,22 @@ impl App {
             }),
             None => vec![],
         };
+        self.refresh_credit_rate();
+    }
+
+    fn refresh_credit_rate(&mut self) {
+        self.costs.rate = self
+            .project
+            .as_ref()
+            .map(|p| (p.tts_model.clone(), self.db.credit_rate(&p.tts_model)));
+    }
+
+    /// The cached rate, or a fresh read when the model changed since.
+    fn credit_rate(&self, model: &str) -> CreditRate {
+        match &self.costs.rate {
+            Some((m, r)) if m == model => *r,
+            _ => self.db.credit_rate(model),
+        }
     }
 
     fn remaining_credits(&self) -> Option<i64> {
@@ -226,7 +247,7 @@ impl App {
             return;
         };
         let p = *theme::palette(ui);
-        let rate = self.db.credit_rate(&project.tts_model);
+        let rate = self.credit_rate(&project.tts_model);
         let credits = rate.credits(chars);
         let mut line = self.credits_text(credits);
         let remaining = self.remaining_credits();
@@ -278,7 +299,7 @@ impl App {
                 chars += s.spoken_text(&project.tts_model).chars().count();
             }
         }
-        (n > 0).then(|| (n, chars, self.db.credit_rate(&project.tts_model)))
+        (n > 0).then(|| (n, chars, self.credit_rate(&project.tts_model)))
     }
 
     /// Review toolbar chips: "Drafts ≈ N credits" and the chapter's Claude usage.

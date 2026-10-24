@@ -298,16 +298,23 @@ paying for the API as well, and show estimated costs.
 - **Results.** stdout is one object, or an array whose last `type: result`
   element counts (a Stop hook causes that). Success needs `is_error: false`,
   `subtype: success` and `structured_output`. Errors are classified in order:
-  usage limit (`api_error: usage_limit_reached` or "You've hit your …"), output
-  cap (`api_error: max_output_tokens`, not `stop_reason`) → split the chunk,
+  usage limit (`api_error: usage_limit_reached`, "You've hit your …" with
+  either apostrophe, or "usage limit reached"; not the throttle's "(not your
+  usage limit)"), output cap (`api_error: max_output_tokens`, not
+  `stop_reason`) → split the chunk, plan without the model ("Claude Opus is
+  not available with the Claude Pro plan … run /logout and /login": checked
+  before auth because of that `/login`, and answered with "choose Sonnet"),
   auth (not logged in, expired, 401; a leaked "Invalid API key" gets its own
-  message), plan without the model, API credit, prompt too long, refusal,
-  error subtypes, temporary throttling. No result object: stderr if any
-  (an unknown option means the CLI is too old), else "exited without a result
-  (possibly a usage limit)". Usage limit, auth and "unavailable" errors stop
-  the whole pass instead of falling back chunk by chunk: unattributed
-  paragraphs stay unsegmented, as after Cancel, and the automatic tag pass is
-  skipped.
+  message), API credit, prompt too long, refusal, error subtypes, temporary
+  throttling. No result object: stderr if any (an unknown option means the
+  CLI is too old), else "exited without a result (possibly a usage limit)".
+  Usage limit, auth and "unavailable" errors stop the whole pass instead of
+  falling back chunk by chunk: unattributed paragraphs stay unsegmented, as
+  after Cancel, and the automatic tag pass is skipped. Both passes report the
+  error after their "finished" event, so it is the message left in the
+  status bar. Runs always use `<library>/claude-cwd/` (created when missing;
+  if it cannot be, the run fails rather than using the app's own working
+  directory).
 - **Usage tracking.** Every call's usage goes to `llm_usage` (pass, backend,
   model, input/output/cache tokens, cost), failed calls included, since a
   failed call can still spend tokens. Claude Code usage comes from

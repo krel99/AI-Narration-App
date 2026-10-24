@@ -2540,7 +2540,18 @@ impl eframe::App for App {
                 ui.horizontal(|ui| {
                     let err = self.log.last().is_some_and(|(e, _)| *e);
                     let color = if err { p.rejected } else { p.muted };
-                    ui.label(RichText::new(&self.status).small().color(color));
+                    // Long messages (e.g. a usage limit) are cut short instead
+                    // of running under the hints; hover or the Log shows all.
+                    let reserve = if self.tab == Tab::Review { 400.0 } else { 60.0 };
+                    let width = (ui.available_width() - reserve).max(120.0);
+                    ui.scope(|ui| {
+                        ui.set_max_width(width);
+                        ui.add(
+                            egui::Label::new(RichText::new(&self.status).small().color(color))
+                                .truncate(),
+                        )
+                        .on_hover_text(&self.status);
+                    });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("Log").clicked() {
                             self.dialogs.log = !self.dialogs.log;

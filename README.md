@@ -72,8 +72,11 @@ ways to run it:
   The calls count against your plan's usage limits, which are shared with
   the Claude apps (claude.ai, desktop, mobile). When a limit is reached, the
   run stops with the reset time and leaves unattributed paragraphs as they
-  are; *Re-segment drafts* continues later. This backend is meant for your
-  own use on your own computer.
+  are; *Re-segment drafts* continues later. If your plan does not include
+  the project's model (Claude Code says e.g. "Claude Opus is not available
+  with the Claude Pro plan"), set Project → Claude → Model to
+  `claude-sonnet-5-5`. This backend is meant for your own use on your own
+  computer.
 
   Every run is isolated from your Claude Code setup: no tools, MCP servers,
   hooks, skills or settings files, no session history, and an empty working

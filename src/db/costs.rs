@@ -170,6 +170,13 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Makes every take_cost write fail (for testing that bookkeeping
+    /// failures never cost a paid take).
+    pub fn break_take_cost(&self) -> Result<()> {
+        self.conn.execute_batch("DROP TABLE take_cost")?;
+        Ok(())
+    }
+
     /// The take_cost row of a take: (model, chars).
     pub fn take_cost(&self, take_id: Id) -> Result<Option<(String, i64)>> {
         Ok(self
