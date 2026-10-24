@@ -1,6 +1,7 @@
 //! Lossless audio handling. Everything is mono 16-bit PCM in memory and WAV on
 //! disk; the only lossy encode happens once, in the ffmpeg export pass.
 
+use std::f64::consts::PI;
 use std::io::Cursor;
 use std::path::Path;
 
@@ -104,32 +105,98 @@ pub fn read_wav(path: &Path) -> Result<Pcm> {
     })
 }
 
-/// Linear-interpolation resampler. Only used when takes of one chapter were
-/// generated at different rates (e.g. after changing the output format).
-pub fn resample_linear(pcm: &Pcm, to_rate: u32) -> Pcm {
+/// Band-limited resampler, for takes of one chapter generated at different
+/// rates (after changing the output format). Nothing above the lower
+/// Nyquist folds back into the audible band (the sibilance of a 44.1 kHz
+/// take resampled to 24 kHz), and upsampling adds no images.
+pub fn resample(pcm: &Pcm, to_rate: u32) -> Pcm {
     if pcm.rate == to_rate || pcm.samples.is_empty() {
         return Pcm {
             rate: to_rate,
             samples: pcm.samples.clone(),
         };
     }
-    let ratio = pcm.rate as f64 / to_rate as f64;
-    let out_len = (pcm.samples.len() as f64 / ratio).round() as usize;
-    let last = pcm.samples.len() - 1;
-    let samples = (0..out_len)
-        .map(|i| {
-            let pos = i as f64 * ratio;
-            let i0 = (pos.floor() as usize).min(last);
-            let i1 = (i0 + 1).min(last);
-            let frac = pos - i0 as f64;
-            let v = pcm.samples[i0] as f64 * (1.0 - frac) + pcm.samples[i1] as f64 * frac;
-            v.round() as i16
-        })
+    let input: Vec<f32> = pcm.samples.iter().map(|&s| s as f32).collect();
+    let samples = resample_poly(&input, pcm.rate, to_rate)
+        .into_iter()
+        .map(|v| v.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16)
         .collect();
     Pcm {
         rate: to_rate,
         samples,
     }
+}
+
+/// Polyphase resampling with a Blackman-windowed sinc low-pass (16 zero
+/// crossings, cutoff 0.9 × the lower Nyquist), weights precomputed per
+/// phase. Zero-phase: output sample i sits at input position i × in / out.
+pub fn resample_poly(input: &[f32], in_rate: u32, out_rate: u32) -> Vec<f32> {
+    if in_rate == out_rate || input.is_empty() || in_rate == 0 || out_rate == 0 {
+        return input.to_vec();
+    }
+    fn gcd(a: u64, b: u64) -> u64 {
+        if b == 0 { a } else { gcd(b, a % b) }
+    }
+    let g = gcd(in_rate as u64, out_rate as u64);
+    // Output sample i sits at input position i * m / l.
+    let (m, l) = (in_rate as u64 / g, out_rate as u64 / g);
+    let cutoff = (0.9 / (m as f64 / l as f64)).min(0.9);
+    let hw = (16.0 / cutoff).ceil() as i64;
+    let taps = (2 * hw) as usize;
+    let blackman = |x: f64| {
+        let t = (x + 1.0) * 0.5;
+        0.42 - 0.5 * (2.0 * PI * t).cos() + 0.08 * (4.0 * PI * t).cos()
+    };
+    let sinc = |x: f64| {
+        if x.abs() < 1e-12 {
+            1.0
+        } else {
+            (PI * x).sin() / (PI * x)
+        }
+    };
+    let mut table = vec![0f32; l as usize * taps];
+    for p in 0..l as usize {
+        let frac = p as f64 / l as f64;
+        let row = &mut table[p * taps..(p + 1) * taps];
+        let mut sum = 0.0;
+        let mut vals = vec![0f64; taps];
+        for (j, v) in vals.iter_mut().enumerate() {
+            let d = frac - (j as i64 - hw + 1) as f64;
+            let x = d / hw as f64;
+            *v = if x.abs() >= 1.0 {
+                0.0
+            } else {
+                cutoff * sinc(cutoff * d) * blackman(x)
+            };
+            sum += *v;
+        }
+        for (w, v) in row.iter_mut().zip(vals) {
+            *w = (v / sum) as f32;
+        }
+    }
+    let n = input.len() as i64;
+    let out_len = (input.len() as u64 * l / m) as usize;
+    let mut out = Vec::with_capacity(out_len);
+    for i in 0..out_len as u64 {
+        let center = (i * m / l) as i64;
+        let row = &table[((i * m) % l) as usize * taps..][..taps];
+        let k0 = center - hw + 1;
+        let mut acc = 0f32;
+        if k0 >= 0 && k0 + taps as i64 <= n {
+            for (a, b) in input[k0 as usize..k0 as usize + taps].iter().zip(row) {
+                acc += a * b;
+            }
+        } else {
+            for (j, w) in row.iter().enumerate() {
+                let k = k0 + j as i64;
+                if (0..n).contains(&k) {
+                    acc += input[k as usize] * w;
+                }
+            }
+        }
+        out.push(acc);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -161,15 +228,75 @@ mod tests {
         };
         pcm.append_silence(250);
         assert_eq!(pcm.samples.len(), 250);
-        let up = resample_linear(
-            &Pcm {
-                rate: 2000,
-                samples: vec![0, 100, 200, 300],
-            },
-            1000,
+        let same = Pcm {
+            rate: 1000,
+            samples: vec![0, 100, 200],
+        };
+        assert_eq!(resample(&same, 1000), same);
+    }
+
+    /// Level in dB of the `hz` component of `pcm` (relative to full scale).
+    fn level_db(pcm: &Pcm, hz: f64) -> f64 {
+        let w = 2.0 * std::f64::consts::PI * hz / pcm.rate as f64;
+        // Skip the edges, where the filter sees zeros.
+        let x = &pcm.samples[pcm.samples.len() / 10..pcm.samples.len() * 9 / 10];
+        let (mut re, mut im) = (0.0, 0.0);
+        for (i, &s) in x.iter().enumerate() {
+            re += s as f64 * (w * i as f64).cos();
+            im += s as f64 * (w * i as f64).sin();
+        }
+        let amp = 2.0 * (re * re + im * im).sqrt() / x.len() as f64;
+        20.0 * (amp / 32768.0).max(1e-12).log10()
+    }
+
+    fn tone(rate: u32, parts: &[(f64, f64)]) -> Pcm {
+        Pcm {
+            rate,
+            samples: (0..rate as usize / 2)
+                .map(|i| {
+                    let t = i as f64 / rate as f64;
+                    parts
+                        .iter()
+                        .map(|(hz, amp)| {
+                            amp * 32767.0 * (2.0 * std::f64::consts::PI * hz * t).sin()
+                        })
+                        .sum::<f64>() as i16
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn resampling_does_not_alias() {
+        // A 44.1 kHz take in a 24 kHz chapter: speech stays, the 14 kHz
+        // sibilance band is filtered instead of folding back to 10 kHz.
+        let take = tone(44_100, &[(1000.0, 0.25), (14_000.0, 0.25)]);
+        let down = resample(&take, 24_000);
+        assert_eq!(down.rate, 24_000);
+        assert!((down.samples.len() as i64 - 12_000).abs() <= 1);
+        assert!((level_db(&down, 1000.0) - level_db(&take, 1000.0)).abs() < 0.5);
+        assert!(
+            level_db(&down, 10_000.0) < -80.0,
+            "{}",
+            level_db(&down, 10_000.0)
         );
-        assert_eq!(up.samples, vec![0, 200]);
-        assert_eq!(resample_linear(&up, 1000), up);
+        // A 24 kHz take in a 44.1 kHz chapter: no image at 15 kHz.
+        let take = tone(24_000, &[(9000.0, 0.5)]);
+        let up = resample(&take, 44_100);
+        assert!((level_db(&up, 9000.0) - level_db(&take, 9000.0)).abs() < 0.5);
+        assert!(
+            level_db(&up, 15_000.0) < -70.0,
+            "{}",
+            level_db(&up, 15_000.0)
+        );
+        // Loud input does not wrap around.
+        let loud = Pcm {
+            rate: 44_100,
+            samples: (0..4410)
+                .map(|i| if i % 2 == 0 { i16::MAX } else { i16::MIN })
+                .collect(),
+        };
+        assert_eq!(resample(&loud, 22_050).samples.len(), 2205);
     }
 
     #[test]

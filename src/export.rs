@@ -100,7 +100,7 @@ impl AssemblyWriter {
         let pcm = if pcm.rate == self.rate {
             pcm
         } else {
-            resampled = audio::resample_linear(pcm, self.rate);
+            resampled = audio::resample(pcm, self.rate);
             &resampled
         };
         for &s in &pcm.samples {
@@ -461,5 +461,38 @@ mod tests {
         }
         let book = export_book(&db, &lib, &project).unwrap();
         assert!(book.files[0].extension().unwrap() == "m4b");
+    }
+
+    #[test]
+    fn takes_at_another_rate_are_assembled_without_aliasing() {
+        // A 44.1 kHz take (made before the format changed) in a 24 kHz
+        // chapter, with energy at 14 kHz: it must not come back at 10 kHz.
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("mixed.wav");
+        let rate = 44_100usize;
+        let take = Pcm {
+            rate: rate as u32,
+            samples: (0..rate / 2)
+                .map(|i| {
+                    let t = i as f64 / rate as f64;
+                    (8000.0 * (2.0 * std::f64::consts::PI * 14_000.0 * t).sin()) as i16
+                })
+                .collect(),
+        };
+        let mut w = AssemblyWriter::create(&wav, 24000).unwrap();
+        w.append(&take).unwrap();
+        w.finish().unwrap();
+        let out = audio::read_wav(&wav).unwrap();
+        assert_eq!(out.rate, 24000);
+        let x = &out.samples[1000..out.samples.len() - 1000];
+        let w10 = 2.0 * std::f64::consts::PI * 10_000.0 / 24_000.0;
+        let (re, im) = x.iter().enumerate().fold((0.0, 0.0), |(re, im), (i, &v)| {
+            (
+                re + v as f64 * (w10 * i as f64).cos(),
+                im + v as f64 * (w10 * i as f64).sin(),
+            )
+        });
+        let alias = 2.0 * (re * re + im * im).sqrt() / x.len() as f64;
+        assert!(alias < 8000.0 * 1e-3, "10 kHz alias at {alias:.1} of 8000");
     }
 }

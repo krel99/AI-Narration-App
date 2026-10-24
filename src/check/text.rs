@@ -38,7 +38,8 @@ pub struct Thresholds {
     pub short_words: usize,
     /// This many missing/extra/wrong words in a row flag the take.
     pub bad_run: usize,
-    /// Lines with at least this many words use `long_wer`.
+    /// Lines with at least this many words use `long_wer` (but never need
+    /// fewer errors than a shorter line: see `wer_limit`).
     pub long_words: usize,
     /// Lines shorter than `long_words` flag above this WER with at least
     /// `short_min_errors` errors.
@@ -1003,9 +1004,7 @@ pub fn check(
         // A dropped, added or garbled phrase: clean TTS audio rarely gives
         // three recognition errors in a row.
         Verdict::Flag("words are missing, added or wrong in a row")
-    } else if (n < t.long_words && errors >= t.short_min_errors && wer > t.short_wer * f)
-        || (n >= t.long_words && wer > t.long_wer * f)
-    {
+    } else if errors >= t.short_min_errors && wer > wer_limit(n, t, f) {
         Verdict::Flag("many words differ from the text")
     } else if errors > 0 {
         Verdict::Minor
@@ -1019,6 +1018,20 @@ pub fn check(
         errors,
         wer,
         verdict,
+    }
+}
+
+/// The WER a line of `n` words must exceed to be flagged (`f`: the language
+/// factor). Long lines use `long_wer`, but never a limit that would flag a
+/// line for fewer errors than a shorter line needs: the errors needed only
+/// grow with the length, so two misspelt names do not flag a 15-word line
+/// when they do not flag a 14-word one (or a 17-word one).
+fn wer_limit(n: usize, t: &Thresholds, f: f32) -> f32 {
+    if n < t.long_words {
+        t.short_wer * f
+    } else {
+        let shorter = t.short_wer * f * t.long_words.saturating_sub(1) as f32 / n.max(1) as f32;
+        (t.long_wer * f).max(shorter)
     }
 }
 
@@ -1368,17 +1381,22 @@ mod tests {
 
     #[test]
     fn non_english_is_more_lenient() {
-        // 15+ words, two errors: 0.13 > 0.12 flags English, not Czech (x1.6).
+        // 16 words, three separate errors: 0.19 flags English, not Czech
+        // (limits x1.6).
         let exp = "Ráno bylo chladné a mlha ležela nad řekou, když jsme konečně vyrazili na dlouhou cestu domů.";
-        let heard = " Ráno bylo chladné a mlha ležela nad řekou, když jsme konečně vyrazili na dlouho cestu doma.";
+        let heard = " Ráno bylo chladné a mlha ležela pod řekou, když jsme konečně vyrazili na dlouho cestu doma.";
         let c = chk(exp, heard, Lang::Cs);
-        assert_eq!(c.errors, 2, "{}", render(&c, exp));
+        assert_eq!(c.errors, 3, "{}", render(&c, exp));
         assert_eq!(c.verdict, Verdict::Minor);
         let exp = "In the morning it was cold and the mist lay over the river when we left.";
+        let heard = " In the morning it was gold and the mist lay over the liver when we laughed.";
+        let c = chk(exp, heard, Lang::En);
+        assert_eq!(c.errors, 3);
+        assert!(matches!(c.verdict, Verdict::Flag(_)));
+        // Two errors are minor at this length, as on a 14-word line.
         let heard = " In the morning it was cold and the mist lay over the liver when we laughed.";
         let c = chk(exp, heard, Lang::En);
-        assert_eq!(c.errors, 2);
-        assert!(matches!(c.verdict, Verdict::Flag(_)));
+        assert_eq!((c.errors, c.verdict), (2, Verdict::Minor));
     }
 
     #[test]
@@ -1429,6 +1447,56 @@ mod tests {
             Verdict::Flag(_)
         ));
         assert!(chk("Well, see.", " We, see.", Lang::En).errors > 0);
+    }
+
+    #[test]
+    fn many_words_flags_grow_monotonically_with_line_length() {
+        const WORDS: [&str; 40] = [
+            "slowly", "for", "a", "long", "while", "as", "the", "old", "fire", "burned", "down",
+            "in", "the", "dark", "hall", "below", "them", "all", "night", "long", "and", "into",
+            "morning", "light", "came", "over", "hills", "where", "sheep", "grazed", "near",
+            "quiet", "streams", "under", "tall", "trees", "with", "green", "leaves", "today",
+        ];
+        const OTHER: [&str; 8] = [
+            "zebra", "pickle", "rocket", "tulip", "violin", "walrus", "yogurt", "kettle",
+        ];
+        let many = |c: &Check| c.verdict == Verdict::Flag("many words differ from the text");
+        for lang in [Lang::En, Lang::Cs] {
+            for errors in 1..=6usize {
+                let mut flagged_before = true;
+                for n in (3 * errors).max(5)..=WORDS.len() {
+                    let exp = WORDS[..n].join(" ");
+                    // Separate substitutions (never a run of wrong words).
+                    let heard: Vec<&str> = (0..n)
+                        .map(|i| {
+                            if i % 3 == 1 && i / 3 < errors {
+                                OTHER[i / 3]
+                            } else {
+                                WORDS[i]
+                            }
+                        })
+                        .collect();
+                    let c = chk(&exp, &heard.join(" "), lang);
+                    assert_eq!(c.errors, errors, "{lang:?} n={n}");
+                    let flagged = many(&c);
+                    assert!(
+                        flagged_before || !flagged,
+                        "{lang:?}: {errors} errors flag a {n}-word line but not a shorter one"
+                    );
+                    flagged_before = flagged;
+                }
+            }
+        }
+        // The reported case: two misspelt names never flag in English.
+        for n in 6..=28 {
+            let tail = WORDS[..n - 4].join(" ");
+            let c = chk(
+                &format!("Vortram turned to Elandriel {tail}."),
+                &format!("Voltram turned to Elendriel {tail}."),
+                Lang::En,
+            );
+            assert!(!many(&c), "n={n}: {:?}", c.verdict);
+        }
     }
 
     #[test]

@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail};
 
 use super::{AssemblyWriter, export_dir, run_ffmpeg, slug, work_rate};
 use crate::acx::{self, Levels};
+use crate::audio::Pcm;
 use crate::db::{Db, Library};
 use crate::model::*;
 use crate::retail::{self, SamplePlan, SampleSource, SampleStop};
@@ -518,6 +519,20 @@ pub fn sample_file_name(project: &Project) -> String {
 /// Export "<Book title> - Retail Sample.mp3": approved takes from
 /// `start_segment` (or the chapter start), at most `max_ms`, faded in and
 /// out, mastered like the chapters.
+/// The short ramp at the end of a sample cut inside a segment (the fade-out
+/// already brings the voice down; this only rules out a click).
+const CUT_RAMP_MS: u32 = 30;
+
+/// Ramp the last `ms` of `pcm` down to silence.
+fn fade_out_tail(pcm: &mut Pcm, ms: u32) {
+    let n = (pcm.rate as usize * ms as usize / 1000).min(pcm.samples.len());
+    let start = pcm.samples.len() - n;
+    for (k, s) in pcm.samples[start..].iter_mut().enumerate() {
+        let gain = (n - k) as f32 / n as f32;
+        *s = (*s as f32 * gain).round() as i16;
+    }
+}
+
 pub fn export_sample(
     db: &Db,
     lib: &Library,
@@ -557,11 +572,21 @@ pub fn export_sample(
             if plan.stop == SampleStop::Cut {
                 let keep = (pcm.rate as u64 * plan.speech_ms / 1000) as usize;
                 pcm.samples.truncate(keep);
+                // Never a click where the samples stop.
+                fade_out_tail(&mut pcm, CUT_RAMP_MS);
             }
             w.append(&pcm)?;
         }
+        // Inside a long segment the voice is cut mid-speech: the fade-out
+        // ends where it is cut, so it fades away instead of stopping mid-word
+        // at a third of its level. Otherwise it ends with the file.
+        let voice_end_s = w.position_ms() as f64 / 1000.0;
         w.silence(retail::SAMPLE_TAIL_MS as u32)?;
-        let total_s = w.position_ms() as f64 / 1000.0;
+        let total_s = if plan.stop == SampleStop::Cut {
+            voice_end_s
+        } else {
+            w.position_ms() as f64 / 1000.0
+        };
         w.finish()?;
         let tags = project.settings.publication.sample_tags(&project.name);
         let cover = cover(lib, project, &mut notes);
@@ -1017,5 +1042,63 @@ mod tests {
             "{joined}"
         );
         assert!(joined.contains("-brand M4B  -f mp4"));
+    }
+
+    #[test]
+    fn a_sample_cut_inside_a_segment_fades_out_where_it_is_cut() {
+        if !fixture::have_ffmpeg() {
+            eprintln!("ffmpeg not found; skipped");
+            return;
+        }
+        let book = approved_book(lighthouse());
+        let db = book.lib.open().unwrap();
+        let segs = db.chapter_segments(book.chapter.id).unwrap();
+        let take = db.take(segs[0].current_take_id.unwrap()).unwrap();
+        // One continuous 70 s voiced take, so the 1-minute cut lands in sound.
+        let rate = 24_000u32;
+        let pcm = Pcm {
+            rate,
+            samples: (0..rate as usize * 70)
+                .map(|i| {
+                    ((i as f64 * 180.0 * std::f64::consts::TAU / rate as f64).sin() * 0.4 * 32767.0)
+                        as i16
+                })
+                .collect(),
+        };
+        audio::write_wav(&book.lib.audio_path(&take.audio_path), &pcm).unwrap();
+        let mut project = book.project.clone();
+        project.settings.publication.room_tone = false;
+        let out = export_sample(&db, &book.lib, &project, &book.chapter, None, 60_000).unwrap();
+        assert_eq!(out.plan.stop, SampleStop::Cut);
+        let x = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(&out.mastered.file)
+            .args(["-ac", "1", "-ar", "44100", "-f", "f32le", "-"])
+            .output()
+            .unwrap()
+            .stdout;
+        let x: Vec<f32> = x
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let peak = |a: f64, b: f64| {
+            let (a, b) = (
+                (a * 44_100.0) as usize,
+                ((b * 44_100.0) as usize).min(x.len()),
+            );
+            x[a..b].iter().fold(0f32, |m, v| m.max(v.abs()))
+        };
+        let cut = (retail::SAMPLE_LEAD_IN_MS + out.plan.speech_ms) as f64 / 1000.0;
+        let body = peak(5.0, 30.0);
+        let db_below = |p: f32| 20.0 * (body / p.max(1e-9)).log10();
+        // Half-way through the fade it is about 6 dB down; just before the
+        // cut it is close to silence, not a third of the voice.
+        assert!((3.0..12.0).contains(&db_below(peak(cut - 1.6, cut - 1.4))));
+        assert!(
+            db_below(peak(cut - 0.06, cut)) > 25.0,
+            "{:.1} dB",
+            db_below(peak(cut - 0.06, cut))
+        );
+        assert!(db_below(peak(cut + 0.05, cut + 0.9)) > 60.0);
     }
 }

@@ -1,83 +1,12 @@
 //! Whisper's input: 16 kHz mono f32. Takes are 22.05–44.1 kHz 16-bit, so they
-//! are low-pass filtered and decimated with a Blackman-windowed sinc (16 zero
-//! crossings, cutoff 0.9 × the output Nyquist = 7.2 kHz), weights precomputed
-//! per polyphase phase. The app's `audio::resample_linear` has no anti-alias
-//! filter (a 10 kHz tone at 44.1 kHz comes through at -1.5 dB), which is fine
-//! for its purpose but not for recognition.
-
-use std::f64::consts::PI;
+//! are low-pass filtered and decimated with [`resample_poly`] (a
+//! Blackman-windowed sinc, cutoff 0.9 × the output Nyquist = 7.2 kHz), the
+//! band-limited resampler export uses too.
 
 /// Whisper's sample rate.
 pub const WHISPER_RATE: u32 = 16_000;
 
-pub fn resample_poly(input: &[f32], in_rate: u32, out_rate: u32) -> Vec<f32> {
-    if in_rate == out_rate || input.is_empty() || in_rate == 0 || out_rate == 0 {
-        return input.to_vec();
-    }
-    fn gcd(a: u64, b: u64) -> u64 {
-        if b == 0 { a } else { gcd(b, a % b) }
-    }
-    let g = gcd(in_rate as u64, out_rate as u64);
-    // Output sample i sits at input position i * m / l.
-    let (m, l) = (in_rate as u64 / g, out_rate as u64 / g);
-    let cutoff = (0.9 / (m as f64 / l as f64)).min(0.9);
-    let hw = (16.0 / cutoff).ceil() as i64;
-    let taps = (2 * hw) as usize;
-    let blackman = |x: f64| {
-        let t = (x + 1.0) * 0.5;
-        0.42 - 0.5 * (2.0 * PI * t).cos() + 0.08 * (4.0 * PI * t).cos()
-    };
-    let sinc = |x: f64| {
-        if x.abs() < 1e-12 {
-            1.0
-        } else {
-            (PI * x).sin() / (PI * x)
-        }
-    };
-    let mut table = vec![0f32; l as usize * taps];
-    for p in 0..l as usize {
-        let frac = p as f64 / l as f64;
-        let row = &mut table[p * taps..(p + 1) * taps];
-        let mut sum = 0.0;
-        let mut vals = vec![0f64; taps];
-        for (j, v) in vals.iter_mut().enumerate() {
-            let d = frac - (j as i64 - hw + 1) as f64;
-            let x = d / hw as f64;
-            *v = if x.abs() >= 1.0 {
-                0.0
-            } else {
-                cutoff * sinc(cutoff * d) * blackman(x)
-            };
-            sum += *v;
-        }
-        for (w, v) in row.iter_mut().zip(vals) {
-            *w = (v / sum) as f32;
-        }
-    }
-    let n = input.len() as i64;
-    let out_len = (input.len() as u64 * l / m) as usize;
-    let mut out = Vec::with_capacity(out_len);
-    for i in 0..out_len as u64 {
-        let center = (i * m / l) as i64;
-        let row = &table[((i * m) % l) as usize * taps..][..taps];
-        let k0 = center - hw + 1;
-        let mut acc = 0f32;
-        if k0 >= 0 && k0 + taps as i64 <= n {
-            for (a, b) in input[k0 as usize..k0 as usize + taps].iter().zip(row) {
-                acc += a * b;
-            }
-        } else {
-            for (j, w) in row.iter().enumerate() {
-                let k = k0 + j as i64;
-                if (0..n).contains(&k) {
-                    acc += input[k as usize] * w;
-                }
-            }
-        }
-        out.push(acc);
-    }
-    out
-}
+pub use crate::audio::resample_poly;
 
 /// 16-bit mono PCM at any rate → 16 kHz f32 in [-1, 1].
 pub fn to_whisper_input(samples: &[i16], rate: u32) -> Vec<f32> {
