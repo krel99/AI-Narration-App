@@ -15,7 +15,7 @@ use tokio::sync::Semaphore;
 
 use crate::audio;
 use crate::db::{Db, Library, NewTake};
-use crate::hash::take_hash;
+use crate::hash::{request_hash, take_hash};
 use crate::lang;
 use crate::llm::{self, ClaudeClient, LlmError, PromptParagraph};
 use crate::model::*;
@@ -48,9 +48,11 @@ pub struct ApiKeys {
 #[derive(Debug)]
 pub enum Command {
     /// Attribute every paragraph of the chapter whose segments are all still
-    /// untouched drafts (or that has none yet).
+    /// untouched drafts (or that has none yet). With `resume`, only the
+    /// paragraphs a stopped pass left (Continue segmenting).
     SegmentChapter {
         chapter_id: Id,
+        resume: bool,
     },
     /// Ask Claude for audio tags on the chapter's draft segments (replacing
     /// earlier tags on those drafts).
@@ -103,7 +105,8 @@ pub enum Command {
     /// Local take check (Whisper): queueing, settings and models.
     Check(crate::check::CheckCommand),
     SetKeys(ApiKeys),
-    /// Stop queued work (requests already in flight finish).
+    /// Stop queued work: no further request is sent (requests already in
+    /// flight finish and are kept).
     Cancel,
 }
 
@@ -238,6 +241,27 @@ struct Ctx {
     epoch: Arc<AtomicU64>,
     endpoints: Endpoints,
     checker: takecheck::Checker,
+    /// Segments a running generation will store takes for. The segmentation
+    /// and audio-tag passes leave them alone (checked under the database
+    /// lock, as the generation registers them), so a take is never deleted
+    /// or detached by a pass that read the chapter before it existed.
+    busy: Arc<Mutex<HashSet<Id>>>,
+}
+
+/// Marks segments busy for as long as it lives (a paragraph's generation
+/// task), panics included.
+struct BusyGuard {
+    busy: Arc<Mutex<HashSet<Id>>>,
+    ids: Vec<Id>,
+}
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        let mut busy = self.busy.lock().unwrap_or_else(|e| e.into_inner());
+        for id in &self.ids {
+            busy.remove(id);
+        }
+    }
 }
 
 /// API endpoints; overridden in tests to point at local fakes.
@@ -268,6 +292,12 @@ impl Ctx {
     fn cancelled(&self, started: u64) -> bool {
         self.epoch.load(Ordering::SeqCst) != started
     }
+
+    /// The segments being generated right now (see `busy`). Lock it inside
+    /// `db(..)`, never the other way round.
+    fn busy(&self) -> std::sync::MutexGuard<'_, HashSet<Id>> {
+        self.busy.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 pub fn spawn(
@@ -290,6 +320,7 @@ pub fn spawn(
         epoch: Arc::new(AtomicU64::new(0)),
         endpoints: Endpoints::default(),
         checker: Default::default(),
+        busy: Default::default(),
     };
     takecheck::start(&ctx, crate::check::whisper_loader());
     std::thread::Builder::new()
@@ -329,8 +360,13 @@ pub fn spawn(
 
 async fn run(ctx: &Ctx, cmd: Command) -> Result<()> {
     match cmd {
-        Command::SegmentChapter { chapter_id } => {
-            segment_chapter(ctx, chapter_id).await?;
+        Command::SegmentChapter { chapter_id, resume } => {
+            let started = ctx.epoch.load(Ordering::SeqCst);
+            segment_chapter(ctx, chapter_id, resume).await?;
+            if ctx.cancelled(started) {
+                // Cancel stopped the pass: no tag pass after it either.
+                return Ok(());
+            }
             let project = ctx.db(|db| db.project(db.chapter(chapter_id)?.project_id))?;
             if project.settings.audio_tags.enabled && lang::model_supports_tags(&project.tts_model)
             {
@@ -415,7 +451,24 @@ fn resolve_speaker(raw: &str, registry: &[Character]) -> String {
     raw.into()
 }
 
-fn store_segments(db: &mut Db, paragraph: &Paragraph, segs: &[DraftSegment]) -> Result<()> {
+/// Store a paragraph's new segments, unless it got audio in the meantime
+/// (any take, also on a draft, or a segment `busy` being generated): then it
+/// is left exactly as it is and this returns false. No paid take is ever
+/// deleted by re-segmenting.
+fn store_segments(
+    db: &mut Db,
+    busy: &HashSet<Id>,
+    paragraph: &Paragraph,
+    segs: &[DraftSegment],
+) -> Result<bool> {
+    if db
+        .paragraph_segments(paragraph.id)?
+        .iter()
+        .any(|s| busy.contains(&s.id))
+    {
+        db.set_attribution_pending(&[paragraph.id], false)?;
+        return Ok(false);
+    }
     let rows: Vec<(SegmentKind, String, String)> = segs
         .iter()
         .map(|d| {
@@ -426,12 +479,34 @@ fn store_segments(db: &mut Db, paragraph: &Paragraph, segs: &[DraftSegment]) -> 
             )
         })
         .collect();
-    db.replace_paragraph_segments(paragraph.id, &rows)
+    db.replace_untouched_paragraph(paragraph.id, &rows)
 }
 
-async fn segment_chapter(ctx: &Ctx, chapter_id: Id) -> Result<()> {
+/// Store `segs` for `paragraph` (see [`store_segments`]); counts it in
+/// `kept` when it got audio meanwhile and was left alone.
+fn store_or_keep(
+    ctx: &Ctx,
+    paragraph: &Paragraph,
+    segs: &[DraftSegment],
+    kept: &mut usize,
+) -> Result<()> {
+    let stored = ctx.db(|db| {
+        let busy = ctx.busy();
+        store_segments(db, &busy, paragraph, segs)
+    })?;
+    if !stored {
+        log::info!(
+            "P{}: got audio while being segmented; left as it is",
+            paragraph.order + 1
+        );
+        *kept += 1;
+    }
+    Ok(())
+}
+
+async fn segment_chapter(ctx: &Ctx, chapter_id: Id, resume: bool) -> Result<()> {
     let started = ctx.epoch.load(Ordering::SeqCst);
-    let (chapter, project, paragraphs, existing) = ctx.db(|db| {
+    let (chapter, project, paragraphs, existing, takes, busy, waiting) = ctx.db(|db| {
         let chapter = db.chapter(chapter_id)?;
         let project = db.project(chapter.project_id)?;
         let paragraphs = db.paragraphs(chapter_id)?;
@@ -439,22 +514,40 @@ async fn segment_chapter(ctx: &Ctx, chapter_id: Id) -> Result<()> {
         for s in db.chapter_segments(chapter_id)? {
             existing.entry(s.paragraph_id).or_default().push(s);
         }
-        Ok((chapter, project, paragraphs, existing))
+        let takes = db.take_counts(chapter_id)?;
+        let busy = ctx.busy().clone();
+        let waiting: HashSet<Id> = db.attribution_pending(chapter_id)?.into_iter().collect();
+        Ok((chapter, project, paragraphs, existing, takes, busy, waiting))
     })?;
     let lang = lang::by_code(&project.language);
     let settings = project.settings.segmentation.clone();
 
-    // Only paragraphs that are still untouched drafts may be (re)segmented;
-    // anything with audio is left alone so no credits are thrown away.
+    // Only paragraphs that are still untouched drafts may be (re)segmented:
+    // no take on any segment (a draft keeps its paid takes after a tag,
+    // speaker or text edit) and nothing being generated. Anything with audio
+    // is left alone so no credits are thrown away; storing checks again.
     let editable = |p: &Paragraph| {
         existing.get(&p.id).is_none_or(|segs| {
-            segs.iter()
-                .all(|s| s.status == SegmentStatus::Draft && s.current_take_id.is_none())
+            segs.iter().all(|s| {
+                s.status == SegmentStatus::Draft
+                    && s.current_take_id.is_none()
+                    && !takes.contains_key(&s.id)
+                    && !busy.contains(&s.id)
+            })
         })
     };
     let mut targets: Vec<usize> = Vec::new();
+    let mut kept = 0usize;
+    let mut not_editable: Vec<Id> = Vec::new();
     for (i, p) in paragraphs.iter().enumerate() {
+        // Continue segmenting: only what a stopped pass left.
+        if resume && !waiting.contains(&p.id) {
+            continue;
+        }
         if !editable(p) {
+            if waiting.contains(&p.id) {
+                not_editable.push(p.id);
+            }
             continue;
         }
         if segment::has_dialogue(&p.text, lang) {
@@ -462,9 +555,17 @@ async fn segment_chapter(ctx: &Ctx, chapter_id: Id) -> Result<()> {
         } else {
             // Pure narration needs no LLM call.
             let segs = segment::parse_paragraph(&p.text, lang);
-            ctx.db(|db| store_segments(db, p, &segs))?;
+            store_or_keep(ctx, p, &segs, &mut kept)?;
         }
     }
+    // Flag the dialogue paragraphs until they are stored, so a pass that
+    // stops (usage limit, sign-in, Cancel) can be continued without sending
+    // the finished ones again.
+    let target_ids: Vec<Id> = targets.iter().map(|&i| paragraphs[i].id).collect();
+    ctx.db(|db| {
+        db.set_attribution_pending(&not_editable, false)?;
+        db.set_attribution_pending(&target_ids, true)
+    })?;
 
     let total = targets.len();
     let mut done = 0usize;
@@ -606,8 +707,9 @@ async fn segment_chapter(ctx: &Ctx, chapter_id: Id) -> Result<()> {
                                             )?;
                                         }
                                     }
-                                    store_segments(db, p, &segs)
+                                    Ok(())
                                 })?;
+                                store_or_keep(ctx, p, &segs, &mut kept)?;
                                 pending.remove(&i);
                                 done += 1;
                             }
@@ -656,14 +758,15 @@ async fn segment_chapter(ctx: &Ctx, chapter_id: Id) -> Result<()> {
         }
         pending.extend(gave_up);
         if ctx.cancelled(started) || stopped.is_some() {
-            // Leave the rest unsegmented; running Segment again resumes.
+            // Leave the rest as it is, flagged: Continue segmenting resumes
+            // with exactly these paragraphs.
             break;
         }
         // Whatever the LLM could not do validly falls back to the parser.
         for &i in &pending {
             let p = &paragraphs[i];
             let segs = segment::parse_paragraph(&p.text, lang);
-            ctx.db(|db| store_segments(db, p, &segs))?;
+            store_or_keep(ctx, p, &segs, &mut kept)?;
             fallback += 1;
             done += 1;
         }
@@ -676,6 +779,7 @@ async fn segment_chapter(ctx: &Ctx, chapter_id: Id) -> Result<()> {
     }
 
     ctx.db(|db| db.set_chapter_status(chapter.id, ChapterStatus::Segmented))?;
+    let left = ctx.db(|db| db.attribution_pending(chapter_id))?.len();
     ctx.out.emit(Event::SegmentsChanged { chapter_id });
     ctx.out.emit(Event::SegmentationFinished {
         chapter_id,
@@ -684,10 +788,26 @@ async fn segment_chapter(ctx: &Ctx, chapter_id: Id) -> Result<()> {
         input_tokens,
         output_tokens,
     });
+    if kept > 0 {
+        ctx.out.emit(Event::Info(format!(
+            "{kept} paragraphs got audio while they were being segmented and were left as they are (no take was discarded)."
+        )));
+    }
+    let remaining = if left == 1 {
+        "1 dialogue paragraph is".to_string()
+    } else {
+        format!("{left} dialogue paragraphs are")
+    };
     if let Some(why) = stopped {
         return Err(anyhow!(
-            "{why} Paragraphs not attributed yet are left as they are; run Re-segment drafts to continue."
+            "{why} {remaining} not attributed yet and left as they are; Continue segmenting attributes only those, once Claude is available again."
         ));
+    }
+    if left > 0 && ctx.cancelled(started) {
+        ctx.out.emit(Event::Info(format!(
+            "Segmentation of \"{}\" stopped by Cancel: {remaining} not attributed yet (Continue segmenting finishes them); no audio tags were added.",
+            chapter.title
+        )));
     }
     Ok(())
 }
@@ -733,6 +853,8 @@ async fn direct_chapter(ctx: &Ctx, chapter_id: Id, untagged_only: bool) -> Resul
         .rev()
         .collect();
     let (mut done, mut tagged, mut rejected) = (0usize, 0usize, 0usize);
+    // Segments that got audio (or were edited) while Claude was answering.
+    let mut skipped = 0usize;
     let (mut input_tokens, mut output_tokens) = (0u64, 0u64);
     // Why the pass stopped early: reported after DirectionFinished, so the
     // error (e.g. a usage limit with its reset time) is the last message.
@@ -806,7 +928,24 @@ async fn direct_chapter(ctx: &Ctx, chapter_id: Id, untagged_only: bool) -> Resul
                 input_tokens += direction.input_tokens;
                 output_tokens += direction.output_tokens;
                 ctx.db(|db| {
+                    let busy = ctx.busy();
                     for s in &batch {
+                        // Read again: the answer can come minutes after the
+                        // targets were chosen. Tags go only onto a segment
+                        // that is still the draft without audio Claude saw;
+                        // writing them onto one generated (or being
+                        // generated) meanwhile would detach its paid take.
+                        let unchanged = db.segment(s.id).is_ok_and(|now| {
+                            now.status == SegmentStatus::Draft
+                                && now.current_take_id.is_none()
+                                && now.text == s.text
+                                && now.performance == s.performance
+                                && !busy.contains(&s.id)
+                        });
+                        if !unchanged {
+                            skipped += 1;
+                            continue;
+                        }
                         let new = match direction.performances.get(&s.id) {
                             Some(perf) => match tags::validate(&s.text, perf) {
                                 Ok(p) => p,
@@ -850,6 +989,11 @@ async fn direct_chapter(ctx: &Ctx, chapter_id: Id, untagged_only: bool) -> Resul
         input_tokens,
         output_tokens,
     });
+    if skipped > 0 {
+        ctx.out.emit(Event::Info(format!(
+            "{skipped} segments got audio or were edited while their audio tags were being written; they were left as they are (their takes stay current)."
+        )));
+    }
     match failed {
         Some(why) => Err(anyhow!(why)),
         None => Ok(()),
@@ -861,6 +1005,86 @@ async fn direct_chapter(ctx: &Ctx, chapter_id: Id, untagged_only: bool) -> Resul
 struct Job {
     segment_id: Id,
     chapter_id: Id,
+}
+
+/// A job that was not sent because of Cancel (not a failure).
+#[derive(Debug)]
+struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+/// One generation's counters, and which segments it reported: every segment
+/// it started gets exactly one SegmentGenerated or GenerationFailed, even
+/// when a task dies, so none is left spinning in the UI.
+#[derive(Default)]
+struct Stats {
+    /// (generated, cached, failed, credits)
+    counts: Mutex<(usize, usize, usize, i64)>,
+    reported: Mutex<HashSet<Id>>,
+}
+
+impl Stats {
+    fn counts(&self) -> std::sync::MutexGuard<'_, (usize, usize, usize, i64)> {
+        self.counts.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn report(&self, ctx: &Ctx, e: Event, segment_id: Id) {
+        self.reported
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(segment_id);
+        ctx.out.emit(e);
+    }
+
+    /// Credits spent on something that is not a take (a discarded dialogue).
+    fn add_credits(&self, credits: i64) {
+        self.counts().3 += credits;
+    }
+
+    /// `segment_id` got a take (`cached`: without a request).
+    fn generated(&self, ctx: &Ctx, segment_id: Id, cached: bool, credits: i64) {
+        {
+            let mut c = self.counts();
+            c.0 += 1;
+            c.1 += cached as usize;
+            c.3 += credits;
+        }
+        self.report(ctx, Event::SegmentGenerated { segment_id }, segment_id);
+    }
+
+    fn failed(&self, ctx: &Ctx, segment_id: Id, error: String) {
+        self.counts().2 += 1;
+        self.report(
+            ctx,
+            Event::GenerationFailed { segment_id, error },
+            segment_id,
+        );
+    }
+
+    /// Not sent because of Cancel.
+    fn cancelled(&self, ctx: &Ctx, segment_id: Id) {
+        self.report(
+            ctx,
+            Event::GenerationFailed {
+                segment_id,
+                error: "cancelled".into(),
+            },
+            segment_id,
+        );
+    }
+
+    fn was_reported(&self, segment_id: Id) -> bool {
+        self.reported
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&segment_id)
+    }
 }
 
 async fn generate(ctx: &Ctx, segment_ids: Vec<Id>, reroll: bool) -> Result<()> {
@@ -888,18 +1112,26 @@ async fn generate(ctx: &Ctx, segment_ids: Vec<Id>, reroll: bool) -> Result<()> {
         let mut by_chapter: HashMap<Id, Vec<Id>> = HashMap::new();
         for id in &segment_ids {
             if seen.insert(*id) {
-                by_chapter
-                    .entry(db.segment_chapter_id(*id)?)
-                    .or_default()
-                    .push(*id);
+                // A segment removed since (merged, re-segmented) is skipped.
+                match db.segment_chapter_id(*id) {
+                    Ok(c) => by_chapter.entry(c).or_default().push(*id),
+                    Err(e) => log::info!("segment {id} is not generated: {e:#}"),
+                }
             }
         }
+        // Registered under the database lock, as the segmentation and tag
+        // passes check it there. A segment another generation is working on
+        // is not requested twice.
+        let mut busy = ctx.busy();
         for (chapter_id, ids) in by_chapter {
             let wanted: HashSet<Id> = ids.into_iter().collect();
             let project = db.project(db.chapter(chapter_id)?.project_id)?;
             concurrency = project.settings.concurrency.max(1);
             for s in db.chapter_segments(chapter_id)? {
-                if !wanted.contains(&s.id) || s.status == SegmentStatus::Approved {
+                if !wanted.contains(&s.id)
+                    || s.status == SegmentStatus::Approved
+                    || busy.contains(&s.id)
+                {
                     continue;
                 }
                 let job = Job {
@@ -912,22 +1144,34 @@ async fn generate(ctx: &Ctx, segment_ids: Vec<Id>, reroll: bool) -> Result<()> {
                 }
             }
         }
+        // Only now that nothing can fail: the guards below release them.
+        for (_, jobs) in &groups {
+            busy.extend(jobs.iter().map(|j| j.segment_id));
+        }
         Ok(())
     })?;
+    let guards: Vec<BusyGuard> = groups
+        .iter()
+        .map(|(_, jobs)| BusyGuard {
+            busy: ctx.busy.clone(),
+            ids: jobs.iter().map(|j| j.segment_id).collect(),
+        })
+        .collect();
 
     let ids: Vec<Id> = groups
         .iter()
         .flat_map(|(_, j)| j.iter().map(|j| j.segment_id))
         .collect();
-    ctx.out.emit(Event::GenerationStarted { segment_ids: ids });
+    ctx.out.emit(Event::GenerationStarted {
+        segment_ids: ids.clone(),
+    });
     // Multi-speaker paragraphs that go through Text-to-Dialogue.
-    let through_dialogue = Arc::new(dialogue::plan_request(ctx, &segment_ids, reroll));
+    let through_dialogue = Arc::new(dialogue::plan_request(ctx, &ids, reroll));
     let semaphore = Arc::new(Semaphore::new(concurrency));
-    // (generated, cached, failed, credits)
-    let stats = Arc::new(Mutex::new((0usize, 0usize, 0usize, 0i64)));
+    let stats = Arc::new(Stats::default());
 
     let mut handles = Vec::new();
-    for (paragraph_id, jobs) in groups {
+    for ((paragraph_id, jobs), guard) in groups.into_iter().zip(guards) {
         let ctx = ctx.clone();
         let tts = tts.clone();
         let semaphore = semaphore.clone();
@@ -935,6 +1179,8 @@ async fn generate(ctx: &Ctx, segment_ids: Vec<Id>, reroll: bool) -> Result<()> {
         let as_dialogue = through_dialogue.contains(&paragraph_id);
         let plan = through_dialogue.clone();
         handles.push(tokio::spawn(async move {
+            // The paragraph's segments stay busy until its task ends.
+            let _guard = guard;
             // What dialogue does not (or cannot) generate goes per segment.
             let jobs = if as_dialogue {
                 dialogue::generate_paragraph(&ctx, &semaphore, started, &stats, &plan, jobs).await
@@ -943,32 +1189,15 @@ async fn generate(ctx: &Ctx, segment_ids: Vec<Id>, reroll: bool) -> Result<()> {
             };
             for job in jobs {
                 if ctx.cancelled(started) {
-                    ctx.out.emit(Event::GenerationFailed {
-                        segment_id: job.segment_id,
-                        error: "cancelled".into(),
-                    });
+                    stats.cancelled(&ctx, job.segment_id);
                     continue;
                 }
-                match generate_one(&ctx, &tts, &semaphore, &job, reroll).await {
+                match generate_one(&ctx, &tts, &semaphore, started, &job, reroll).await {
                     Ok((cached, credits)) => {
-                        if let Ok(mut s) = stats.lock() {
-                            s.0 += 1;
-                            s.1 += cached as usize;
-                            s.3 += credits;
-                        }
-                        ctx.out.emit(Event::SegmentGenerated {
-                            segment_id: job.segment_id,
-                        });
+                        stats.generated(&ctx, job.segment_id, cached, credits);
                     }
-                    Err(e) => {
-                        if let Ok(mut s) = stats.lock() {
-                            s.2 += 1;
-                        }
-                        ctx.out.emit(Event::GenerationFailed {
-                            segment_id: job.segment_id,
-                            error: format!("{e:#}"),
-                        });
-                    }
+                    Err(e) if e.is::<Cancelled>() => stats.cancelled(&ctx, job.segment_id),
+                    Err(e) => stats.failed(&ctx, job.segment_id, format!("{e:#}")),
                 }
                 ctx.out.emit(Event::SegmentsChanged {
                     chapter_id: job.chapter_id,
@@ -977,9 +1206,16 @@ async fn generate(ctx: &Ctx, segment_ids: Vec<Id>, reroll: bool) -> Result<()> {
         }));
     }
     for h in handles {
-        let _ = h.await;
+        if let Err(e) = h.await {
+            log::error!("a generation task ended early: {e}");
+        }
     }
-    let (generated, cached, failed, credits) = *stats.lock().map_err(|_| anyhow!("stats lock"))?;
+    for &id in &ids {
+        if !stats.was_reported(id) {
+            stats.failed(ctx, id, "internal error (see the log)".into());
+        }
+    }
+    let (generated, cached, failed, credits) = *stats.counts();
     ctx.out.emit(Event::GenerationFinished {
         generated,
         cached,
@@ -989,11 +1225,68 @@ async fn generate(ctx: &Ctx, segment_ids: Vec<Id>, reroll: bool) -> Result<()> {
     Ok(())
 }
 
+/// What became of a finished take.
+enum Placed {
+    /// It is the segment's current take.
+    Current,
+    /// The segment was approved meanwhile: it keeps its approved take.
+    Approved,
+    /// Its speaker, text, tags or settings changed meanwhile: the take is
+    /// for a version that no longer exists.
+    Changed,
+}
+
+/// Make `take_id` the current take of segment `segment_id`, but only while
+/// the segment is still what was requested (`hash` with `seed`) and not
+/// approved: a take that finishes after the user approved the segment, or
+/// changed its speaker or tags, never replaces what they decided. The take
+/// stays in the take list either way. Call inside [`Db::immediate`].
+fn place_take(
+    db: &Db,
+    project_id: Id,
+    segment_id: Id,
+    take_id: Id,
+    seed: u32,
+    hash: &str,
+) -> Result<Placed> {
+    let now = db.segment(segment_id)?;
+    if now.status == SegmentStatus::Approved {
+        return Ok(Placed::Approved);
+    }
+    let project = db.project(project_id)?;
+    if request_hash(&project, &now, seed).as_deref() != Some(hash) {
+        return Ok(Placed::Changed);
+    }
+    db.set_current_take(segment_id, take_id)?;
+    Ok(Placed::Current)
+}
+
+/// Tell the user why a finished take did not become current.
+fn report_placed(ctx: &Ctx, segment_id: Id, placed: &Placed) {
+    let why = match placed {
+        Placed::Current => return,
+        Placed::Approved => {
+            "finished after the segment was approved: the approved take stays current"
+        }
+        Placed::Changed => {
+            "finished after the segment's speaker, text, tags or voice settings changed: it is not used"
+        }
+    };
+    let number = ctx
+        .db(|db| Ok(db.paragraph(db.segment(segment_id)?.paragraph_id)?.order + 1))
+        .map(|n| format!("¶ {n}"))
+        .unwrap_or_else(|_| "a segment".into());
+    ctx.out.emit(Event::Info(format!(
+        "A take for {number} {why}. The new take is kept in the segment's take list."
+    )));
+}
+
 /// Generate (or reuse) one take. Returns (cache hit, credits used).
 async fn generate_one(
     ctx: &Ctx,
     tts: &ElevenLabsClient,
     semaphore: &Semaphore,
+    started: u64,
     job: &Job,
     reroll: bool,
 ) -> Result<(bool, i64)> {
@@ -1080,27 +1373,34 @@ async fn generate_one(
     if let Some(existing) = ctx.db(|db| db.take_by_hash(&hash))?
         && ctx.lib.audio_path(&existing.audio_path).exists()
     {
-        let take_id = ctx.db(|db| {
-            let take_id = if existing.segment_id == seg.id {
-                existing.id
-            } else {
-                db.insert_take(&NewTake {
-                    segment_id: seg.id,
-                    seed,
-                    request_id: existing.request_id.as_deref(),
-                    audio_path: &existing.audio_path,
-                    hash: &hash,
-                    credits_used: 0,
-                    credits_exact: true,
-                })?
-            };
-            db.set_current_take(seg.id, take_id)?;
-            Ok(take_id)
+        let (take_id, placed) = ctx.db(|db| {
+            db.immediate(|db| {
+                let take_id = if existing.segment_id == seg.id {
+                    existing.id
+                } else {
+                    db.insert_take(&NewTake {
+                        segment_id: seg.id,
+                        seed,
+                        request_id: existing.request_id.as_deref(),
+                        audio_path: &existing.audio_path,
+                        hash: &hash,
+                        credits_used: 0,
+                        credits_exact: true,
+                    })?
+                };
+                Ok((
+                    take_id,
+                    place_take(db, project.id, seg.id, take_id, seed, &hash)?,
+                ))
+            })
         })?;
+        report_placed(ctx, seg.id, &placed);
         if take_id != existing.id {
             autotrim::trim_new_take(ctx, &project, take_id).await;
         }
-        takecheck::new_take(ctx, take_id);
+        if matches!(placed, Placed::Current) {
+            takecheck::new_take(ctx, take_id);
+        }
         return Ok((true, 0));
     }
 
@@ -1126,6 +1426,11 @@ async fn generate_one(
     let resp = loop {
         let result = {
             let _permit = semaphore.acquire().await?;
+            // Cancel stops every request not sent yet, retries included:
+            // jobs wait here for a free slot.
+            if ctx.cancelled(started) {
+                return Err(Cancelled.into());
+            }
             tts.synthesize(&req).await
         };
         match result {
@@ -1168,26 +1473,44 @@ async fn generate_one(
             false,
         ),
     };
-    let take_id = ctx.db(|db| {
-        let take_id = db.insert_take(&NewTake {
-            segment_id: seg.id,
-            seed,
-            request_id: resp.request_id.as_deref(),
-            audio_path: &rel_path,
-            hash: &hash,
-            credits_used: credits,
-            credits_exact,
-        })?;
-        db.set_current_take(seg.id, take_id)?;
-        // What this take cost per character teaches the credit estimates.
-        // Bookkeeping only: the paid take stays current even if this fails.
-        if let Err(e) = db.record_take_cost(take_id, &project.tts_model, chars as i64) {
-            log::warn!("recording the cost of take {take_id}: {e:#}");
-        }
-        Ok(take_id)
+    let stored = ctx.db(|db| {
+        db.immediate(|db| {
+            if !db.segment_exists(seg.id)? {
+                return Ok(None);
+            }
+            let take_id = db.insert_take(&NewTake {
+                segment_id: seg.id,
+                seed,
+                request_id: resp.request_id.as_deref(),
+                audio_path: &rel_path,
+                hash: &hash,
+                credits_used: credits,
+                credits_exact,
+            })?;
+            // What this take cost per character teaches the credit estimates.
+            // Bookkeeping only: the paid take is kept even if this fails.
+            if let Err(e) = db.record_take_cost(take_id, &project.tts_model, chars as i64) {
+                log::warn!("recording the cost of take {take_id}: {e:#}");
+            }
+            Ok(Some((
+                take_id,
+                place_take(db, project.id, seg.id, take_id, seed, &hash)?,
+            )))
+        })
     })?;
+    let Some((take_id, placed)) = stored else {
+        // Deleted while the request ran (its chapter or project): nothing
+        // to attach the paid audio to.
+        ctx.out.emit(Event::Info(format!(
+            "A segment was deleted while its take was being generated ({credits} credits); the audio file stays in the library's audio folder."
+        )));
+        return Ok((false, credits));
+    };
+    report_placed(ctx, seg.id, &placed);
     autotrim::trim_new_take(ctx, &project, take_id).await;
-    takecheck::new_take(ctx, take_id);
+    if matches!(placed, Placed::Current) {
+        takecheck::new_take(ctx, take_id);
+    }
     Ok((false, credits))
 }
 
@@ -1197,6 +1520,7 @@ mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
 
     mod costs;
+    mod races;
     mod retail;
     mod voices;
 
@@ -1300,6 +1624,7 @@ mod tests {
                 elevenlabs: elevenlabs.into(),
             },
             checker: Default::default(),
+            busy: Default::default(),
         };
         (ctx, rx)
     }
@@ -1326,7 +1651,7 @@ mod tests {
         let cid = db.import_chapter(project_id, "One", TEXT).unwrap();
         for p in db.paragraphs(cid).unwrap() {
             let segs = segment::parse_paragraph(&p.text, lang::by_code("en"));
-            store_segments(db, &p, &segs).unwrap();
+            store_segments(db, &HashSet::new(), &p, &segs).unwrap();
         }
         for s in db.chapter_segments(cid).unwrap() {
             if s.kind == SegmentKind::Dialogue {
@@ -1530,7 +1855,7 @@ mod tests {
             })
             .unwrap();
 
-        rt().block_on(segment_chapter(&ctx, cid)).unwrap();
+        rt().block_on(segment_chapter(&ctx, cid, false)).unwrap();
         let reqs = requests.lock().unwrap().clone();
         assert_eq!(reqs.len(), 2);
         let first: serde_json::Value = serde_json::from_str(&reqs[0].1).unwrap();
@@ -1608,7 +1933,7 @@ mod tests {
                 let cid = db.import_chapter(pid, "One", VALE)?;
                 for par in db.paragraphs(cid)? {
                     let segs = segment::parse_paragraph(&par.text, lang::by_code("en"));
-                    store_segments(db, &par, &segs)?;
+                    store_segments(db, &HashSet::new(), &par, &segs)?;
                 }
                 for s in db.chapter_segments(cid)? {
                     if s.kind == SegmentKind::Dialogue {
@@ -1722,7 +2047,7 @@ mod tests {
                 db.import_chapter(pid, "One", STORY)
             })
             .unwrap();
-        rt().block_on(segment_chapter(&ctx, cid)).unwrap();
+        rt().block_on(segment_chapter(&ctx, cid, false)).unwrap();
         assert_eq!(requests.lock().unwrap().len(), 1);
         let segs = ctx.db(|db| db.chapter_segments(cid)).unwrap();
         assert_eq!(segs.len(), 5);

@@ -72,12 +72,13 @@ pub(super) async fn trim_new_take(ctx: &Ctx, project: &Project, take_id: Id) {
     }
     match detect(ctx, &project.settings.trim, take_id).await {
         Ok(Some(range)) => {
-            // The take is already current, so its segment may have been
-            // approved (locked) while the audio was analysed: then it stays
-            // exactly as it was approved.
+            // The take may be current, so its segment may have been approved
+            // (locked) while the audio was analysed: then it stays exactly as
+            // it was approved. Another take of a locked segment is not part
+            // of what was approved and gets its trim.
             let stored = ctx.db(|db| {
-                let segment_id = db.take(take_id)?.segment_id;
-                if db.segment(segment_id)?.status == SegmentStatus::Approved {
+                let seg = db.segment(db.take(take_id)?.segment_id)?;
+                if seg.status == SegmentStatus::Approved && seg.current_take_id == Some(take_id) {
                     return Ok(false);
                 }
                 db.set_take_trim(take_id, Some(range))?;

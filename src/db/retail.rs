@@ -491,10 +491,20 @@ mod tests {
         assert!(db.stale_reports(pid).unwrap().contains(&cid));
         db.set_segment_status(seg, SegmentStatus::Approved).unwrap();
         assert!(db.stale_reports(pid).unwrap().is_empty());
-        // Picking the older take again (no new take is created).
-        db.set_current_take(seg, t1).unwrap();
+        // An approved segment is locked: its take cannot be switched.
+        assert!(!db.set_current_take(seg, t1).unwrap());
+        assert!(db.stale_reports(pid).unwrap().is_empty());
+        // Unapproving, picking the older take and approving it (no new take
+        // is created).
+        let switch = |db: &Db, t| {
+            db.set_segment_status(seg, SegmentStatus::Generated)
+                .unwrap();
+            assert!(db.set_current_take(seg, t).unwrap());
+            db.set_segment_status(seg, SegmentStatus::Approved).unwrap();
+        };
+        switch(&db, t1);
         assert!(db.stale_reports(pid).unwrap().contains(&cid));
-        db.set_current_take(seg, t2).unwrap();
+        switch(&db, t2);
         assert!(db.stale_reports(pid).unwrap().is_empty());
         // A silence trim of the current take changes the exported audio.
         db.set_take_trim(t2, Some((40, 900))).unwrap();

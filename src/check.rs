@@ -152,6 +152,16 @@ pub struct TakeCheck {
     /// Model that produced the transcript; empty for a length-only check.
     pub model: String,
     pub checked_at: String,
+    /// What the take was compared with ([`text_key`] of its segment then);
+    /// empty for results stored before this was recorded.
+    pub text_key: String,
+}
+
+/// What a check compares a take with: the segment's text and audio tags. A
+/// result whose key differs (the segment was merged, split or re-tagged
+/// since) says nothing about the current text and is checked again.
+pub fn text_key(text: &str, performance: Option<&str>) -> String {
+    format!("{text}\u{1f}{}", performance.unwrap_or(""))
 }
 
 impl TakeCheck {
@@ -166,17 +176,24 @@ impl TakeCheck {
     pub fn is_flagged(&self) -> bool {
         self.status == CheckStatus::Flagged
     }
+
+    /// Whether this result was made against `key` (results from before keys
+    /// were recorded count as current).
+    pub fn is_for(&self, key: &str) -> bool {
+        self.text_key.is_empty() || self.text_key == key
+    }
 }
 
-/// Whether a take with result `existing` needs checking when the current
-/// setup transcribes with `model` (empty: words cannot be checked now, only
-/// the length). Failed checks are retried; dismissed flags stay dismissed;
-/// a result from another model is replaced, but never by a length-only one.
-/// `db::Db::takes_to_check` applies the same rule in SQL.
-pub fn needs_check(existing: Option<&TakeCheck>, model: &str) -> bool {
+/// Whether a take with result `existing` needs checking against the text
+/// `key` ([`text_key`]) when the current setup transcribes with `model`
+/// (empty: words cannot be checked now, only the length). Failed checks and
+/// checks made against another text are redone; dismissed flags stay
+/// dismissed; a result from another model is replaced, but never by a
+/// length-only one. `db::Db::takes_to_check` applies the same rule in SQL.
+pub fn needs_check(existing: Option<&TakeCheck>, model: &str, key: &str) -> bool {
     match existing {
         None => true,
-        Some(c) if c.status == CheckStatus::Error => true,
+        Some(c) if c.status == CheckStatus::Error || !c.is_for(key) => true,
         Some(c) if c.status == CheckStatus::Dismissed || model.is_empty() => false,
         Some(c) => c.model != model,
     }

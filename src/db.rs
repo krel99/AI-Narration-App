@@ -50,7 +50,8 @@ CREATE TABLE IF NOT EXISTS paragraph (
     chapter_id         INTEGER NOT NULL REFERENCES chapter(id) ON DELETE CASCADE,
     ord                INTEGER NOT NULL,
     text               TEXT NOT NULL,
-    scene_break_before INTEGER NOT NULL DEFAULT 0
+    scene_break_before INTEGER NOT NULL DEFAULT 0,
+    attribution_pending INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS segment (
     id                INTEGER PRIMARY KEY,
@@ -85,7 +86,8 @@ CREATE TABLE IF NOT EXISTS take_check (
     wer        REAL,
     issues     TEXT NOT NULL DEFAULT '[]',
     model      TEXT NOT NULL DEFAULT '',
-    checked_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+    checked_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    text_key   TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS take_hash ON take(hash);
 CREATE INDEX IF NOT EXISTS take_segment ON take(segment_id);
@@ -170,6 +172,8 @@ pub struct ChapterStats {
     pub paid_takes: usize,
     /// Segments with at least one paid take.
     pub segments_with_paid_takes: usize,
+    /// Dialogue paragraphs a stopped segmentation pass left unattributed.
+    pub attribution_pending: usize,
 }
 
 impl ChapterStats {
@@ -346,7 +350,37 @@ impl Db {
         if !has_dialogue_group {
             conn.execute_batch("ALTER TABLE take ADD COLUMN dialogue_group TEXT")?;
         }
+        // Libraries created before "Continue segmenting" lack the flag of
+        // dialogue paragraphs a stopped segmentation pass left.
+        let has_pending: bool = conn
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('paragraph') WHERE name = 'attribution_pending'",
+            )?
+            .exists([])?;
+        if !has_pending {
+            conn.execute_batch(
+                "ALTER TABLE paragraph ADD COLUMN attribution_pending INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
+        takecheck::init(&conn)?;
         Ok(Self { conn })
+    }
+
+    /// Run `f` in an IMMEDIATE transaction: other connections (the UI's)
+    /// cannot write between its reads and writes. `f` must not open a
+    /// transaction of its own.
+    pub fn immediate<T>(&self, f: impl FnOnce(&Self) -> Result<T>) -> Result<T> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        match f(self) {
+            Ok(v) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(v)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     // ---- projects -------------------------------------------------------
@@ -649,6 +683,13 @@ impl Db {
             .with_context(|| format!("segment {id}"))
     }
 
+    pub fn segment_exists(&self, id: Id) -> Result<bool> {
+        Ok(self
+            .conn
+            .prepare("SELECT 1 FROM segment WHERE id = ?1")?
+            .exists([id])?)
+    }
+
     /// The chapter a segment belongs to.
     pub fn segment_chapter_id(&self, segment_id: Id) -> Result<Id> {
         Ok(self.conn.query_row(
@@ -658,8 +699,70 @@ impl Db {
         )?)
     }
 
-    /// Replace a paragraph's segments (used by the segmentation pass).
+    /// Replace the segments of a paragraph that is still untouched by audio:
+    /// every segment a draft and no take on any of them (a draft can keep
+    /// paid takes after a tag, speaker or text edit). Checked in the same
+    /// transaction as the replacement, so a take stored meanwhile (by a
+    /// generation running at the same time) is never deleted. Returns false
+    /// when the paragraph was left as it is. Either way it is no longer
+    /// waiting for attribution.
+    pub fn replace_untouched_paragraph(
+        &mut self,
+        paragraph_id: Id,
+        segs: &[(SegmentKind, String, String)],
+    ) -> Result<bool> {
+        let tx = self.conn.transaction()?;
+        let touched: bool = tx
+            .prepare(
+                "SELECT 1 FROM segment s WHERE s.paragraph_id = ?1
+                   AND (s.status != 'draft' OR s.current_take_id IS NOT NULL
+                        OR EXISTS (SELECT 1 FROM take t WHERE t.segment_id = s.id))",
+            )?
+            .exists([paragraph_id])?;
+        tx.execute(
+            "UPDATE paragraph SET attribution_pending = 0 WHERE id = ?1",
+            [paragraph_id],
+        )?;
+        if !touched {
+            tx.execute(
+                "DELETE FROM segment WHERE paragraph_id = ?1",
+                [paragraph_id],
+            )?;
+            insert_segments(&tx, paragraph_id, segs)?;
+        }
+        tx.commit()?;
+        Ok(!touched)
+    }
+
+    /// Mark (or unmark) paragraphs as waiting for speaker attribution, so a
+    /// stopped pass can be continued without sending finished ones again.
+    pub fn set_attribution_pending(&mut self, paragraph_ids: &[Id], pending: bool) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        for id in paragraph_ids {
+            tx.execute(
+                "UPDATE paragraph SET attribution_pending = ?2 WHERE id = ?1",
+                params![id, pending as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The chapter's paragraphs a stopped segmentation pass left unattributed.
+    pub fn attribution_pending(&self, chapter_id: Id) -> Result<Vec<Id>> {
+        let mut st = self.conn.prepare(
+            "SELECT id FROM paragraph WHERE chapter_id = ?1 AND attribution_pending != 0
+             ORDER BY ord",
+        )?;
+        Ok(st
+            .query_map([chapter_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Replace a paragraph's segments, takes included (fixtures and tests;
+    /// the segmentation pass uses [`Db::replace_untouched_paragraph`]).
     /// Refuses to touch a paragraph that already has approved segments.
+    #[cfg(test)]
     pub fn replace_paragraph_segments(
         &mut self,
         paragraph_id: Id,
@@ -680,13 +783,7 @@ impl Db {
             "DELETE FROM segment WHERE paragraph_id = ?1",
             [paragraph_id],
         )?;
-        for (i, (kind, speaker, text)) in segs.iter().enumerate() {
-            tx.execute(
-                "INSERT INTO segment (paragraph_id, ord, kind, speaker, text, status)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'draft')",
-                params![paragraph_id, i as i64, kind.as_str(), speaker, text],
-            )?;
-        }
+        insert_segments(&tx, paragraph_id, segs)?;
         tx.commit()?;
         Ok(())
     }
@@ -737,20 +834,21 @@ impl Db {
         Ok(())
     }
 
-    /// Make `take_id` the segment's current take. Picking a take also moves an
-    /// unapproved segment to generated.
-    pub fn set_current_take(&self, segment_id: Id, take_id: Id) -> Result<()> {
-        self.conn.execute(
-            "UPDATE segment SET current_take_id = ?2,
-                    status = CASE WHEN status = 'approved' THEN status ELSE 'generated' END
-             WHERE id = ?1",
+    /// Make `take_id` the segment's current take and move the segment to
+    /// generated. An approved segment is locked: it keeps the take it was
+    /// approved with (returns false).
+    pub fn set_current_take(&self, segment_id: Id, take_id: Id) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE segment SET current_take_id = ?2, status = 'generated'
+             WHERE id = ?1 AND status != 'approved'",
             params![segment_id, take_id],
-        )?;
-        Ok(())
+        )? > 0)
     }
 
     /// Merge segment `id` with the next segment in its paragraph. The merged
-    /// text is cut from the paragraph so the original spacing survives.
+    /// text is cut from the paragraph so the original spacing survives. Both
+    /// halves' takes (paid audio, with their checks, trims and costs) stay in
+    /// the merged segment's take list; none becomes current.
     pub fn merge_with_next(&mut self, id: Id) -> Result<()> {
         let seg = self.segment(id)?;
         let para = self.paragraph(seg.paragraph_id)?;
@@ -782,6 +880,10 @@ impl Db {
             "UPDATE segment SET text = ?2, performance = ?3, status = 'draft', current_take_id = NULL
              WHERE id = ?1",
             params![id, merged, performance],
+        )?;
+        tx.execute(
+            "UPDATE take SET segment_id = ?1 WHERE segment_id = ?2",
+            params![id, next.id],
         )?;
         tx.execute("DELETE FROM segment WHERE id = ?1", [next.id])?;
         tx.commit()?;
@@ -879,6 +981,28 @@ impl Db {
         Ok(())
     }
 
+    /// The cached take the per-segment path reuses for `seg`'s first take
+    /// (not a re-roll): the take of its seed-1 request, when that is the
+    /// seed generation picks (the segment has not used it yet) and the audio
+    /// file is still there. Generation and the Generate estimate share it.
+    pub fn cached_first_take(
+        &self,
+        lib: &Library,
+        project: &Project,
+        seg: &Segment,
+    ) -> Result<Option<Take>> {
+        let seed = crate::worker::FIRST_TAKE_SEED;
+        if self.takes(seg.id)?.iter().any(|t| t.seed == seed) {
+            return Ok(None);
+        }
+        let Some(hash) = crate::hash::request_hash(project, seg, seed) else {
+            return Ok(None);
+        };
+        Ok(self
+            .take_by_hash(&hash)?
+            .filter(|t| lib.audio_path(&t.audio_path).exists()))
+    }
+
     /// Any existing take with this hash, from any segment.
     pub fn take_by_hash(&self, hash: &str) -> Result<Option<Take>> {
         let sql = format!("SELECT {TAKE_COLS} FROM take WHERE hash = ?1 ORDER BY id LIMIT 1");
@@ -916,8 +1040,29 @@ impl Db {
         s.credits_estimated = estimated > 0;
         s.paid_takes = paid as usize;
         s.segments_with_paid_takes = segs_paid as usize;
+        let pending: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM paragraph WHERE chapter_id = ?1 AND attribution_pending != 0",
+            [chapter_id],
+            |r| r.get(0),
+        )?;
+        s.attribution_pending = pending as usize;
         Ok(s)
     }
+}
+
+fn insert_segments(
+    tx: &rusqlite::Transaction,
+    paragraph_id: Id,
+    segs: &[(SegmentKind, String, String)],
+) -> Result<()> {
+    for (i, (kind, speaker, text)) in segs.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO segment (paragraph_id, ord, kind, speaker, text, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'draft')",
+            params![paragraph_id, i as i64, kind.as_str(), speaker, text],
+        )?;
+    }
+    Ok(())
 }
 
 fn insert_paragraphs(
@@ -1086,6 +1231,61 @@ mod tests {
                 .unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn merging_keeps_both_halves_paid_takes() {
+        let (mut db, mut project, cid) = setup();
+        project.voice_map.insert(NARRATOR.into(), "v".into());
+        segment_paragraph(&mut db, &project, cid);
+        let segs = db.chapter_segments(cid).unwrap();
+        let (a, b) = (segs[1].id, segs[2].id);
+        let take = |seg: Id, hash: &str, credits: i64| {
+            let t = db
+                .insert_take(&NewTake {
+                    segment_id: seg,
+                    seed: 1,
+                    request_id: None,
+                    audio_path: &format!("{hash}.wav"),
+                    hash,
+                    credits_used: credits,
+                    credits_exact: true,
+                })
+                .unwrap();
+            db.record_take_cost(t, "eleven_v4", 10).unwrap();
+            db.set_current_take(seg, t).unwrap();
+            t
+        };
+        let ta = take(a, "ha", 16);
+        let tb1 = take(b, "hb1", 20);
+        let tb2 = take(b, "hb2", 20);
+        db.set_take_trim(tb1, Some((50, 400))).unwrap();
+        let before = db.chapter_stats(cid, &project).unwrap();
+        let costs = |db: &Db| -> i64 {
+            db.conn
+                .query_row("SELECT COUNT(*) FROM take_cost", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(costs(&db), 3);
+
+        db.merge_with_next(a).unwrap();
+        // Every paid take is still there, now in the merged segment's list.
+        let ids: Vec<Id> = db.takes(a).unwrap().iter().map(|t| t.id).collect();
+        assert_eq!(ids, vec![ta, tb1, tb2]);
+        assert_eq!(db.take(tb1).unwrap().trim_ms, Some((50, 400)));
+        let after = db.chapter_stats(cid, &project).unwrap();
+        assert_eq!(
+            (after.credits_used, after.paid_takes),
+            (before.credits_used, before.paid_takes)
+        );
+        assert_eq!(costs(&db), 3);
+        let merged = db.segment(a).unwrap();
+        assert_eq!(
+            (merged.status, merged.current_take_id),
+            (SegmentStatus::Draft, None)
+        );
+        // The second half's audio is found again after splitting back.
+        assert_eq!(db.take_by_hash("hb1").unwrap().unwrap().id, tb1);
     }
 
     #[test]

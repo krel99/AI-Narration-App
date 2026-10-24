@@ -49,7 +49,7 @@ fn claude_code_backend_attributes_and_tags_end_to_end() {
         })
         .unwrap();
 
-    rt().block_on(segment_chapter(&ctx, cid)).unwrap();
+    rt().block_on(segment_chapter(&ctx, cid, false)).unwrap();
     assert_eq!(fake.calls(), 1);
     let prompt = fake.read("stdin.0");
     assert!(prompt.contains("[P2 TARGET]") && prompt.contains("- vortram: Vortram; the old man"));
@@ -167,11 +167,17 @@ fn usage_limit_stops_the_pass_without_falling_back() {
 
     // Through the command, so the automatic audio-tag pass would follow.
     let err = rt()
-        .block_on(run(&ctx, Command::SegmentChapter { chapter_id: cid }))
+        .block_on(run(
+            &ctx,
+            Command::SegmentChapter {
+                chapter_id: cid,
+                resume: false,
+            },
+        ))
         .unwrap_err()
         .to_string();
     assert!(err.contains("resets 3:45pm"), "{err}");
-    assert!(err.contains("Re-segment drafts"), "{err}");
+    assert!(err.contains("Continue segmenting"), "{err}");
     assert_eq!(fake.calls(), 1, "no second window, no audio-tag pass");
     let segs = ctx.db(|db| db.chapter_segments(cid)).unwrap();
     assert_eq!(
@@ -186,11 +192,17 @@ fn usage_limit_stops_the_pass_without_falling_back() {
             .any(|e| matches!(e, Event::SegmentationFinished { .. }))
     );
 
-    // After the reset, running it again (Re-segment drafts) attributes the
-    // paragraphs that were left over.
+    // After the reset, Continue segmenting attributes the paragraphs that
+    // were left over.
+    assert_eq!(
+        ctx.db(|db| db.attribution_pending(cid)).unwrap().len(),
+        2,
+        "both dialogue paragraphs wait for attribution"
+    );
     fake.set("out.json", &success(story_segments(), 0.01));
     fake.set("exit", "0");
-    rt().block_on(segment_chapter(&ctx, cid)).unwrap();
+    rt().block_on(segment_chapter(&ctx, cid, true)).unwrap();
+    assert!(ctx.db(|db| db.attribution_pending(cid)).unwrap().is_empty());
     assert_eq!(fake.calls(), 3, "one call per dialogue window");
     let segs = ctx.db(|db| db.chapter_segments(cid)).unwrap();
     let got: Vec<(&str, &str)> = segs
@@ -207,6 +219,126 @@ fn usage_limit_stops_the_pass_without_falling_back() {
             (NARRATOR, "said the old man."),
         ]
     );
+}
+
+#[test]
+fn continue_segmenting_sends_only_what_a_stopped_pass_left() {
+    // Window 1 (P2) is attributed, window 2 (P3) hits the usage limit.
+    let fake = FakeClaude::new();
+    fake.set("out.0.json", &success(story_segments(), 0.01));
+    fake.set(
+        "out.1.json",
+        &json!({
+            "type": "result", "subtype": "success", "is_error": true,
+            "terminal_reason": "api_error", "api_error_status": 429,
+            "api_error": "usage_limit_reached", "modelUsage": {},
+            "result": "You've hit your session limit · resets 3:45pm"
+        })
+        .to_string(),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let lib = Library::new(dir.path().to_path_buf());
+    let (ctx, _events) = test_ctx(&lib, "http://unused", "http://unused");
+    use_claude_code(&ctx, fake.bin());
+    let (pid, cid) = ctx
+        .db(|db| {
+            let pid = db.create_project("Book", "en")?;
+            let mut p = db.project(pid)?;
+            p.settings.segmentation.chunk_paragraphs = 1;
+            p.settings.audio_tags.enabled = false;
+            db.update_project(&p)?;
+            Ok((pid, db.import_chapter(pid, "One", STORY)?))
+        })
+        .unwrap();
+    let err = rt()
+        .block_on(segment_chapter(&ctx, cid, false))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("1 dialogue paragraph is not attributed yet"),
+        "{err}"
+    );
+    assert_eq!(fake.calls(), 2);
+    let stats = ctx
+        .db(|db| db.chapter_stats(cid, &db.project(pid)?))
+        .unwrap();
+    assert_eq!(stats.attribution_pending, 1, "the toolbar offers Continue");
+
+    // After the reset: Continue segmenting sends only P3.
+    fake.set("out.json", &success(story_segments(), 0.01));
+    rt().block_on(segment_chapter(&ctx, cid, true)).unwrap();
+    assert_eq!(fake.calls(), 3, "one more call, for the paragraph left");
+    let last = fake.read("stdin.2");
+    assert!(
+        last.contains("[P3 TARGET]") && !last.contains("[P2 TARGET]"),
+        "{last}"
+    );
+    let speakers: Vec<String> = ctx
+        .db(|db| db.chapter_segments(cid))
+        .unwrap()
+        .iter()
+        .map(|s| s.speaker.clone())
+        .collect();
+    assert_eq!(
+        speakers,
+        [NARRATOR, "guard", NARRATOR, "vortram", NARRATOR],
+        "P2's attribution is kept as it was"
+    );
+    assert!(ctx.db(|db| db.attribution_pending(cid)).unwrap().is_empty());
+    // Nothing left: continuing again sends nothing.
+    rt().block_on(segment_chapter(&ctx, cid, true)).unwrap();
+    assert_eq!(fake.calls(), 3);
+}
+
+#[test]
+fn a_refused_api_key_stops_the_pass_once() {
+    // Every window would fail the same way: one request, one message, and
+    // the dialogue is left for a later run instead of the parser.
+    let (url, requests) = serve(|_, _, _| {
+        (
+            401,
+            vec![],
+            br#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#
+                .to_vec(),
+        )
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let lib = Library::new(dir.path().to_path_buf());
+    let (ctx, events) = test_ctx(&lib, &url, "http://unused");
+    let text = "Dawn.\n\n\"One?\" asked A.\n\n\"Two,\" said B.\n\n\"Three!\" cried C.";
+    let cid = ctx
+        .db(|db| {
+            let pid = db.create_project("Book", "en")?;
+            let mut p = db.project(pid)?;
+            p.settings.segmentation.chunk_paragraphs = 1;
+            db.update_project(&p)?;
+            db.import_chapter(pid, "One", text)
+        })
+        .unwrap();
+    let err = rt()
+        .block_on(run(
+            &ctx,
+            Command::SegmentChapter {
+                chapter_id: cid,
+                resume: false,
+            },
+        ))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("the API key was refused"), "{err}");
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "no audio-tag pass either"
+    );
+    let errors = events
+        .try_iter()
+        .filter(|e| matches!(e, Event::Error(_)))
+        .count();
+    assert_eq!(errors, 0, "reported once, as run()'s error");
+    let segs = ctx.db(|db| db.chapter_segments(cid)).unwrap();
+    assert!(segs.iter().all(|s| s.speaker != UNKNOWN_SPEAKER));
+    assert_eq!(ctx.db(|db| db.attribution_pending(cid)).unwrap().len(), 3);
 }
 
 /// The attribution of STORY's two dialogue paragraphs.
@@ -250,7 +382,7 @@ fn usage_limit_stops_the_audio_tag_pass() {
             let cid = db.import_chapter(pid, "One", STORY)?;
             for p in db.paragraphs(cid)? {
                 let segs = segment::parse_paragraph(&p.text, lang::by_code("en"));
-                store_segments(db, &p, &segs)?;
+                store_segments(db, &HashSet::new(), &p, &segs)?;
             }
             Ok(cid)
         })
@@ -336,7 +468,7 @@ fn missing_claude_code_falls_back_to_the_parser() {
             db.import_chapter(pid, "One", STORY)
         })
         .unwrap();
-    rt().block_on(segment_chapter(&ctx, cid)).unwrap();
+    rt().block_on(segment_chapter(&ctx, cid, false)).unwrap();
     let segs = ctx.db(|db| db.chapter_segments(cid)).unwrap();
     assert_eq!(
         segs.iter().filter(|s| s.speaker == UNKNOWN_SPEAKER).count(),
@@ -414,7 +546,7 @@ fn api_backend_usage_is_recorded_at_list_price() {
             db.import_chapter(pid, "One", STORY)
         })
         .unwrap();
-    rt().block_on(segment_chapter(&ctx, cid)).unwrap();
+    rt().block_on(segment_chapter(&ctx, cid, false)).unwrap();
     let rows = usage_rows(&ctx);
     assert_eq!(rows.len(), 1);
     let (pass, backend, model, output, cost) = rows[0].clone();

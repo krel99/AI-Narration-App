@@ -8,13 +8,12 @@
 //! per-segment path as before.
 
 use std::collections::HashSet;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Result, anyhow};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, SemaphorePermit};
 
-use super::{Ctx, Event, FIRST_TAKE_SEED, Job, backoff, takecheck};
+use super::{Ctx, Event, FIRST_TAKE_SEED, Job, Stats, backoff, takecheck};
 use crate::audio::{self, Pcm};
 use crate::db::{Db, DialogueGroup, DialoguePart};
 use crate::dialogue::client::{self, CallError, Request};
@@ -24,20 +23,42 @@ use crate::model::*;
 use crate::trim;
 use crate::tts::TtsError;
 
-/// `generate`'s counters: (generated, cached, failed, credits).
-pub(super) type Stats = Mutex<(usize, usize, usize, i64)>;
-
 /// The paragraphs of one Generate run that go through dialogue.
-#[derive(Default)]
 pub(super) struct RunPlan {
     paragraphs: HashSet<Id>,
     /// Billed dialogues discarded so far in this run.
     discarded: AtomicUsize,
+    /// One permit per billed dialogue this run may still throw away. A
+    /// dialogue holds one from before it is sent until it validated, and a
+    /// billed discard keeps it for good; at the limit the semaphore closes
+    /// and the rest goes per segment. So at most MAX_DISCARDED_PER_RUN
+    /// dialogues are billed and discarded, however many requests run at
+    /// once (and at most that many dialogues are in flight together).
+    slots: Semaphore,
 }
 
 impl RunPlan {
+    fn new(paragraphs: HashSet<Id>) -> Self {
+        Self {
+            paragraphs,
+            discarded: AtomicUsize::new(0),
+            slots: Semaphore::new(MAX_DISCARDED_PER_RUN),
+        }
+    }
+
     pub(super) fn contains(&self, paragraph_id: &Id) -> bool {
         self.paragraphs.contains(paragraph_id)
+    }
+
+    /// A billed dialogue was thrown away: its slot is used up. Returns
+    /// whether this one reached the limit.
+    fn discard(&self, slot: SemaphorePermit<'_>) -> bool {
+        slot.forget();
+        let n = self.discarded.fetch_add(1, Ordering::SeqCst) + 1;
+        if n >= MAX_DISCARDED_PER_RUN {
+            self.slots.close();
+        }
+        n == MAX_DISCARDED_PER_RUN
     }
 }
 
@@ -45,7 +66,7 @@ impl RunPlan {
 /// problems only mean per-segment generation.
 pub(super) fn plan_request(ctx: &Ctx, segment_ids: &[Id], reroll: bool) -> RunPlan {
     if reroll {
-        return RunPlan::default();
+        return RunPlan::new(HashSet::new());
     }
     let requested: HashSet<Id> = segment_ids.iter().copied().collect();
     let planned = ctx.db(|db| {
@@ -66,13 +87,10 @@ pub(super) fn plan_request(ctx: &Ctx, segment_ids: &[Id], reroll: bool) -> RunPl
         }
         Ok(out)
     });
-    RunPlan {
-        paragraphs: planned.unwrap_or_else(|e| {
-            log::warn!("planning dialogue paragraphs: {e:#}");
-            HashSet::new()
-        }),
-        discarded: AtomicUsize::new(0),
-    }
+    RunPlan::new(planned.unwrap_or_else(|e| {
+        log::warn!("planning dialogue paragraphs: {e:#}");
+        HashSet::new()
+    }))
 }
 
 enum Outcome {
@@ -90,8 +108,13 @@ enum Spent {
     /// ElevenLabs refused the request: not billed.
     Refused,
     /// Answered and billed: the `character-cost` header (`exact`), or the
-    /// characters as an estimate.
-    Billed { credits: i64, exact: bool },
+    /// characters as an estimate. `at_limit`: this discard reached the
+    /// run's limit.
+    Billed {
+        credits: i64,
+        exact: bool,
+        at_limit: bool,
+    },
 }
 
 /// Generate one qualifying paragraph through dialogue. Returns the jobs that
@@ -112,19 +135,11 @@ pub(super) async fn generate_paragraph(
         return jobs;
     }
     let chapter_id = jobs[0].chapter_id;
-    match run(ctx, semaphore, plan, &jobs).await {
+    match run(ctx, semaphore, started, plan, &jobs).await {
         Ok(Outcome::Done { cached, credits }) => {
-            if let Ok(mut s) = stats.lock() {
-                s.0 += jobs.len();
-                if cached {
-                    s.1 += jobs.len();
-                }
-                s.3 += credits;
-            }
+            stats.add_credits(credits);
             for job in &jobs {
-                ctx.out.emit(Event::SegmentGenerated {
-                    segment_id: job.segment_id,
-                });
+                stats.generated(ctx, job.segment_id, cached, 0);
             }
             ctx.out.emit(Event::SegmentsChanged { chapter_id });
             vec![]
@@ -133,11 +148,9 @@ pub(super) async fn generate_paragraph(
             log::warn!("dialogue paragraph: {why}; generating per segment");
             if !matches!(spent, Spent::Nothing) {
                 let mut paid = match spent {
-                    Spent::Billed { credits, exact } => {
+                    Spent::Billed { credits, exact, .. } => {
                         // The discarded dialogue counts in this run's credits used.
-                        if let Ok(mut s) = stats.lock() {
-                            s.3 += credits;
-                        }
+                        stats.add_credits(credits);
                         let about = if exact { "" } else { "about " };
                         format!(
                             " The dialogue was billed ({about}{credits} credits); the segments are billed again."
@@ -145,9 +158,7 @@ pub(super) async fn generate_paragraph(
                     }
                     _ => String::new(),
                 };
-                if matches!(spent, Spent::Billed { .. })
-                    && plan.discarded.fetch_add(1, Ordering::SeqCst) + 1 == MAX_DISCARDED_PER_RUN
-                {
+                if matches!(spent, Spent::Billed { at_limit: true, .. }) {
                     paid.push_str(&format!(
                         " After {MAX_DISCARDED_PER_RUN} such paragraphs, the rest of this generation goes per segment."
                     ));
@@ -170,14 +181,8 @@ pub(super) async fn generate_paragraph(
             jobs
         }
         Err(e) => {
-            if let Ok(mut s) = stats.lock() {
-                s.2 += jobs.len();
-            }
             for job in &jobs {
-                ctx.out.emit(Event::GenerationFailed {
-                    segment_id: job.segment_id,
-                    error: format!("{e:#}"),
-                });
+                stats.failed(ctx, job.segment_id, format!("{e:#}"));
             }
             ctx.out.emit(Event::SegmentsChanged { chapter_id });
             vec![]
@@ -214,12 +219,22 @@ fn estimate_credits(ctx: &Ctx, model: &str, chars: usize) -> i64 {
 }
 
 /// The cost of a billed dialogue that is discarded: the header, or an
-/// estimate at the learned rate (as for the takes' credits).
-fn billed(ctx: &Ctx, model: &str, character_cost: Option<i64>, inputs: &[Input]) -> Spent {
+/// estimate at the learned rate (as for the takes' credits). Uses up the
+/// dialogue's `slot` (see [`RunPlan::slots`]).
+fn billed(
+    ctx: &Ctx,
+    plan: &RunPlan,
+    slot: SemaphorePermit<'_>,
+    model: &str,
+    character_cost: Option<i64>,
+    inputs: &[Input],
+) -> Spent {
+    let at_limit = plan.discard(slot);
     match character_cost {
         Some(credits) => Spent::Billed {
             credits,
             exact: true,
+            at_limit,
         },
         None => Spent::Billed {
             credits: estimate_credits(
@@ -228,6 +243,7 @@ fn billed(ctx: &Ctx, model: &str, character_cost: Option<i64>, inputs: &[Input])
                 inputs.iter().map(|i| i.text.chars().count()).sum(),
             ),
             exact: false,
+            at_limit,
         },
     }
 }
@@ -247,7 +263,13 @@ fn hashes(
     (group, takes)
 }
 
-async fn run(ctx: &Ctx, semaphore: &Semaphore, plan: &RunPlan, jobs: &[Job]) -> Result<Outcome> {
+async fn run(
+    ctx: &Ctx,
+    semaphore: &Semaphore,
+    started: u64,
+    plan: &RunPlan,
+    jobs: &[Job],
+) -> Result<Outcome> {
     let chapter_id = jobs[0].chapter_id;
     // Read fresh: the paragraph may have changed since the request was planned.
     let (project, segs, previous_text, future_text, previous_ids) = ctx.db(|db| {
@@ -323,6 +345,24 @@ async fn run(ctx: &Ctx, semaphore: &Semaphore, plan: &RunPlan, jobs: &[Job]) -> 
             credits: 0,
         });
     }
+    // Every line already has a take made one by one (a library from before
+    // dialogue, dialogue off, a fallback, a chapter imported again to fix a
+    // typo): the per-segment path reuses them for nothing, while a dialogue
+    // would bill the whole paragraph again.
+    let all_cached = ctx.db(|db| {
+        for s in &segs {
+            if db.cached_first_take(&ctx.lib, &project, s)?.is_none() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    })?;
+    if all_cached {
+        return Ok(Outcome::PerSegment {
+            why: "every line already has a cached take".into(),
+            spent: Spent::Nothing,
+        });
+    }
     let taken = |db: &Db, hashes: &[String]| -> Result<bool> {
         for h in hashes {
             if db.take_by_hash(h)?.is_some() || lib.audio_path(&format!("{h}.wav")).exists() {
@@ -365,15 +405,23 @@ async fn run(ctx: &Ctx, semaphore: &Semaphore, plan: &RunPlan, jobs: &[Job]) -> 
         future_text,
         previous_request_ids: previous_ids,
     };
+    // Held until the dialogue is validated (see RunPlan::slots); closed
+    // once this run has discarded as many billed dialogues as it may.
+    let Ok(slot) = plan.slots.acquire().await else {
+        return Ok(Outcome::PerSegment {
+            why: "earlier dialogues of this generation could not be cut".into(),
+            spent: Spent::Nothing,
+        });
+    };
     let mut attempt = 0u32;
     let reply = loop {
         let result = {
             let _permit = semaphore.acquire().await?;
-            // Checked when the request would go out: paragraphs wait here
-            // for a free slot while earlier dialogues are being validated.
-            if plan.discarded.load(Ordering::SeqCst) >= MAX_DISCARDED_PER_RUN {
+            // Cancel stops every request not sent yet, retries included:
+            // paragraphs wait here for a free slot.
+            if ctx.cancelled(started) {
                 return Ok(Outcome::PerSegment {
-                    why: "earlier dialogues of this generation could not be cut".into(),
+                    why: "cancelled".into(),
                     spent: Spent::Nothing,
                 });
             }
@@ -421,7 +469,7 @@ async fn run(ctx: &Ctx, semaphore: &Semaphore, plan: &RunPlan, jobs: &[Job]) -> 
             }) => {
                 return Ok(Outcome::PerSegment {
                     why: format!("unusable dialogue response: {message}"),
-                    spent: billed(ctx, &model, character_cost, &inputs),
+                    spent: billed(ctx, plan, slot, &model, character_cost, &inputs),
                 });
             }
         }
@@ -469,10 +517,11 @@ async fn run(ctx: &Ctx, semaphore: &Semaphore, plan: &RunPlan, jobs: &[Job]) -> 
         Err(why) => {
             return Ok(Outcome::PerSegment {
                 why: format!("the dialogue could not be cut reliably: {why}"),
-                spent: billed(ctx, &model, reply_cost, &inputs),
+                spent: billed(ctx, plan, slot, &model, reply_cost, &inputs),
             });
         }
     };
+    drop(slot);
 
     let shares = dialogue::split_credits(total, &chars);
     let parts: Vec<DialoguePart> = segs
@@ -490,15 +539,23 @@ async fn run(ctx: &Ctx, semaphore: &Semaphore, plan: &RunPlan, jobs: &[Job]) -> 
         })
         .collect();
     let stored = ctx.db(|db| {
+        let current = unchanged(db, &project, &segs, &group, seed)?;
         let stored = db.store_dialogue_takes(
             &DialogueGroup {
                 group: &group,
                 seed,
                 request_id: request_id.as_deref(),
                 credits_exact,
+                make_current: current,
             },
             &parts,
         )?;
+        if !current {
+            ctx.out.emit(Event::Info(
+                "A multi-speaker paragraph changed (speaker, text, tags or voices) while its dialogue was being generated: its new takes are kept in the take lists but not used."
+                    .into(),
+            ));
+        }
         // Each take's model and spoken characters teach the credit
         // estimates, as for per-segment takes. Bookkeeping only: the paid
         // takes stay current even if this fails.
@@ -516,6 +573,43 @@ async fn run(ctx: &Ctx, semaphore: &Semaphore, plan: &RunPlan, jobs: &[Job]) -> 
         cached: false,
         credits: total,
     })
+}
+
+/// Whether the paragraph of `segs` is still what was requested as `group`
+/// (its segments, speakers' voices, texts, tags and settings), so its new
+/// takes may become current.
+fn unchanged(db: &Db, planned: &Project, segs: &[Segment], group: &str, seed: u32) -> Result<bool> {
+    let project = db.project(planned.id)?;
+    let mut now = Vec::with_capacity(segs.len());
+    for s in segs {
+        if !db.segment_exists(s.id)? {
+            return Ok(false);
+        }
+        now.push(db.segment(s.id)?);
+    }
+    if now
+        .iter()
+        .map(|s| s.paragraph_id)
+        .collect::<HashSet<_>>()
+        .len()
+        != 1
+        || db.paragraph_segments(now[0].paragraph_id)?.len() != now.len()
+    {
+        return Ok(false);
+    }
+    let refs: Vec<&Segment> = now.iter().collect();
+    let Some(inputs) = dialogue::inputs(&project, &refs) else {
+        return Ok(false);
+    };
+    let settings = dialogue::settings_for(&project.tts_model, &project.default_voice_settings);
+    let (g, _) = hashes(
+        &inputs,
+        &settings,
+        &project.tts_model,
+        seed,
+        &project.settings.output_format,
+    );
+    Ok(g == group)
 }
 
 /// One cut take on disk.
@@ -615,12 +709,14 @@ async fn store_cache_hit(
         })
         .collect();
     let stored = ctx.db(|db| {
+        let current = unchanged(db, project, segs, group, seed)?;
         db.store_dialogue_takes(
             &DialogueGroup {
                 group,
                 seed,
                 request_id: takes[0].request_id.as_deref(),
                 credits_exact: true,
+                make_current: current,
             },
             &parts,
         )

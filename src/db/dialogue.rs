@@ -15,6 +15,9 @@ pub struct DialogueGroup<'a> {
     pub request_id: Option<&'a str>,
     /// The credits came from the `character-cost` header.
     pub credits_exact: bool,
+    /// Make each take its segment's current take. False when the paragraph
+    /// changed while the request ran: the takes are only kept.
+    pub make_current: bool,
 }
 
 /// One segment's take of a dialogue paragraph.
@@ -32,10 +35,11 @@ pub struct DialoguePart<'a> {
 }
 
 impl Db {
-    /// Store a dialogue paragraph's takes in one transaction and make each
-    /// its segment's current take. A segment approved in the meantime keeps
-    /// the take it was approved with (the new take is still kept). Returns
-    /// each part's take id and whether the row is new.
+    /// Store a dialogue paragraph's takes in one transaction and (with
+    /// `make_current`) make each its segment's current take. A segment
+    /// approved in the meantime keeps the take it was approved with (the new
+    /// take is still kept). Returns each part's take id and whether the row
+    /// is new.
     pub fn store_dialogue_takes(
         &mut self,
         g: &DialogueGroup,
@@ -67,11 +71,13 @@ impl Db {
                     (tx.last_insert_rowid(), true)
                 }
             };
-            tx.execute(
-                "UPDATE segment SET current_take_id = ?2, status = 'generated'
-                 WHERE id = ?1 AND status != 'approved'",
-                params![p.segment_id, id],
-            )?;
+            if g.make_current {
+                tx.execute(
+                    "UPDATE segment SET current_take_id = ?2, status = 'generated'
+                     WHERE id = ?1 AND status != 'approved'",
+                    params![p.segment_id, id],
+                )?;
+            }
             out.push((id, new));
         }
         tx.commit()?;
@@ -123,6 +129,7 @@ mod tests {
             seed: 1,
             request_id: Some("req-d"),
             credits_exact: true,
+            make_current: true,
         };
         let parts: Vec<DialoguePart> = ids
             .iter()
@@ -236,6 +243,7 @@ mod tests {
                     seed: 1,
                     request_id: None,
                     credits_exact: false,
+                    make_current: true,
                 },
                 &[DialoguePart {
                     segment_id: ids[0],

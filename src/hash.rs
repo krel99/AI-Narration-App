@@ -4,7 +4,7 @@
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::model::VoiceSettings;
+use crate::model::{Project, Segment, VoiceSettings};
 
 #[derive(Serialize)]
 struct TakeInputs<'a> {
@@ -36,6 +36,25 @@ pub fn take_hash(
     };
     let json = serde_json::to_vec(&inputs).expect("take inputs serialize");
     hex::encode(Sha256::digest(&json))
+}
+
+/// The take hash of `seg`'s text-to-speech request with `seed`, from the
+/// project and the segment as they are now; None while its speaker has no
+/// voice.
+pub fn request_hash(project: &Project, seg: &Segment, seed: u32) -> Option<String> {
+    let voice = project.voice_for(&seg.speaker)?;
+    let settings = seg
+        .settings_override
+        .clone()
+        .unwrap_or_else(|| project.default_voice_settings.clone());
+    Some(take_hash(
+        seg.spoken_text(&project.tts_model),
+        voice,
+        &settings,
+        &project.tts_model,
+        seed,
+        &project.settings.output_format,
+    ))
 }
 
 #[cfg(test)]

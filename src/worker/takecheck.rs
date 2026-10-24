@@ -563,20 +563,23 @@ fn check_take(env: &mut Env, job: Job, cfg: &CheckConfig) -> Result<Option<Id>> 
         return Ok(None);
     };
     let key = model_key(env.lib, env.has_loader, cfg);
+    let seg = db.segment(take.segment_id)?;
+    // The take is judged against what its segment says now.
+    let text_key = check::text_key(&seg.text, seg.performance.as_deref());
     if !job.force {
-        if !check::needs_check(db.take_check(take.id)?.as_ref(), &key) {
+        if !check::needs_check(db.take_check(take.id)?.as_ref(), &key, &text_key) {
             return Ok(None);
         }
         // A cache hit plays the same file with the same text: reuse its check.
-        if let Some(shared) = db.shared_take_check(take.id, &key)? {
+        if let Some(shared) = db.shared_take_check(take.id, &key, &text_key)? {
             db.set_take_check(&TakeCheck {
                 take_id: take.id,
+                text_key,
                 ..shared
             })?;
             return Ok(Some(take.segment_id));
         }
     }
-    let seg = db.segment(take.segment_id)?;
     let project = db.project(db.chapter(db.segment_chapter_id(seg.id)?)?.project_id)?;
     let store = |status, transcript, wer, issues, model: &str| -> Result<Option<Id>> {
         db.set_take_check(&TakeCheck {
@@ -587,6 +590,7 @@ fn check_take(env: &mut Env, job: Job, cfg: &CheckConfig) -> Result<Option<Id>> 
             issues,
             model: model.to_string(),
             checked_at: String::new(),
+            text_key: text_key.clone(),
         })?;
         Ok(Some(seg.id))
     };

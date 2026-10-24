@@ -71,6 +71,21 @@ impl std::fmt::Display for TtsError {
 
 impl std::error::Error for TtsError {}
 
+/// Longest pause a Retry-After header can ask for; longer waits back off
+/// normally instead.
+const MAX_RETRY_AFTER_S: f64 = 300.0;
+
+/// A Retry-After value in seconds. Negative, infinite, NaN or huge values
+/// (and HTTP dates) give `None`, i.e. the normal backoff: never a panic.
+pub fn parse_retry_after(value: &str) -> Option<Duration> {
+    value
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|s| s.is_finite() && (0.0..=MAX_RETRY_AFTER_S).contains(s))
+        .map(Duration::from_secs_f64)
+}
+
 fn error_message(body: &str) -> String {
     let v: Option<Value> = serde_json::from_str(body).ok();
     v.as_ref()
@@ -124,9 +139,7 @@ impl ElevenLabsClient {
                 .map(str::to_string)
         };
         if status.as_u16() == 429 {
-            let retry_after = header("retry-after")
-                .and_then(|s| s.parse::<f64>().ok())
-                .map(Duration::from_secs_f64);
+            let retry_after = header("retry-after").and_then(|s| parse_retry_after(&s));
             let body = resp.text().await.unwrap_or_default();
             return Err(TtsError::RateLimited {
                 retry_after,
@@ -195,6 +208,25 @@ mod tests {
         assert!(v.get("next_text").is_none());
         assert!(v.get("previous_request_ids").is_none());
         assert_eq!(v["voice_settings"]["similarity_boost"], 0.75);
+    }
+
+    #[test]
+    fn retry_after_values_never_panic() {
+        assert_eq!(parse_retry_after("2"), Some(Duration::from_secs(2)));
+        assert_eq!(parse_retry_after(" 0.5 "), Some(Duration::from_millis(500)));
+        assert_eq!(parse_retry_after("0"), Some(Duration::ZERO));
+        for odd in [
+            "-1",
+            "inf",
+            "-inf",
+            "NaN",
+            "1e300",
+            "301",
+            "Wed, 21 Oct 2026 07:28:00 GMT",
+            "",
+        ] {
+            assert_eq!(parse_retry_after(odd), None, "{odd}");
+        }
     }
 
     #[test]

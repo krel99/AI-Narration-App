@@ -467,18 +467,7 @@ impl ClaudeClient {
             Err(e) => return (Err(LlmError::Transient(Via::Api, e.to_string())), vec![]),
         };
         if !status.is_success() {
-            let msg = serde_json::from_str::<Value>(&text)
-                .ok()
-                .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
-                .unwrap_or(text);
-            let msg = format!("HTTP {}: {msg}", status.as_u16());
-            let err =
-                if status.as_u16() == 429 || status.as_u16() == 529 || status.is_server_error() {
-                    LlmError::Transient(Via::Api, msg)
-                } else {
-                    LlmError::Fatal(Via::Api, msg)
-                };
-            return (Err(err), vec![]);
+            return (Err(api_error(status.as_u16(), &text)), vec![]);
         }
         let v: Value = match serde_json::from_str(&text) {
             Ok(v) => v,
@@ -580,27 +569,102 @@ pub struct Direction {
     pub cost_usd: Option<f64>,
 }
 
-/// Usage of a Messages API response, priced from the list-price table.
+/// The error of a failed Messages API call. A refused key, a missing
+/// permission or an empty credit balance fails every request of the pass
+/// the same way, so those stop it (as Claude Code's sign-in and usage-limit
+/// errors do) instead of failing, and falling back, window by window.
+fn api_error(status: u16, body: &str) -> LlmError {
+    let v = serde_json::from_str::<Value>(body).ok();
+    let kind = v
+        .as_ref()
+        .and_then(|v| v["error"]["type"].as_str())
+        .unwrap_or("")
+        .to_string();
+    let msg = v
+        .as_ref()
+        .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
+        .unwrap_or_else(|| body.chars().take(300).collect());
+    let detail = format!("HTTP {status}: {msg}");
+    let billing = status == 402
+        || kind == "billing_error"
+        || (status == 400 && msg.to_lowercase().contains("credit balance"));
+    if status == 401 || kind == "authentication_error" {
+        LlmError::Auth(format!(
+            "Claude API: the API key was refused ({detail}). Check the key in Settings, or choose Claude Code."
+        ))
+    } else if status == 403 || kind == "permission_error" {
+        LlmError::Auth(format!(
+            "Claude API: this API key may not use the model ({detail}). Check the key's workspace in the Claude Console."
+        ))
+    } else if billing {
+        LlmError::UsageLimit(format!(
+            "Claude API: the account has no credit left ({detail}). Add credit in the Claude Console, or choose Claude Code."
+        ))
+    } else if status == 429 || status == 529 || (500..600).contains(&status) {
+        LlmError::Transient(Via::Api, detail)
+    } else {
+        LlmError::Fatal(Via::Api, detail)
+    }
+}
+
+/// Usage of a Messages API response, priced from the list-price table. With
+/// server-side fallback, `usage.iterations` lists every attempt (a declined
+/// attempt is billed too, at its own model's rates) while the top-level
+/// usage covers only the attempt that answered: one row per model then.
 fn api_usage(v: &Value, requested_model: &str) -> Vec<CallUsage> {
     let u = &v["usage"];
     if !u.is_object() {
         return vec![];
     }
-    let n = |k: &str| u[k].as_u64().unwrap_or(0);
-    let model = v["model"].as_str().unwrap_or(requested_model).to_string();
-    let (input, output) = (n("input_tokens"), n("output_tokens"));
-    let (cache_read, cache_write) = (
-        n("cache_read_input_tokens"),
-        n("cache_creation_input_tokens"),
-    );
-    vec![CallUsage {
-        cost_usd: crate::costs::claude_cost_usd(&model, input, output, cache_read, cache_write),
-        model,
-        input_tokens: input,
-        output_tokens: output,
-        cache_read_tokens: cache_read,
-        cache_write_tokens: cache_write,
-    }]
+    let served_by = v["model"].as_str().unwrap_or(requested_model);
+    let row = |u: &Value, model: &str| {
+        let n = |k: &str| u[k].as_u64().unwrap_or(0);
+        let (input, output) = (n("input_tokens"), n("output_tokens"));
+        let (cache_read, cache_write) = (
+            n("cache_read_input_tokens"),
+            n("cache_creation_input_tokens"),
+        );
+        CallUsage {
+            cost_usd: crate::costs::claude_cost_usd(model, input, output, cache_read, cache_write),
+            model: model.to_string(),
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: cache_read,
+            cache_write_tokens: cache_write,
+        }
+    };
+    let Some(iterations) = u["iterations"].as_array().filter(|a| !a.is_empty()) else {
+        return vec![row(u, served_by)];
+    };
+    // Each attempt at its own model: named on the entry, or else the
+    // requested model for the first attempt and the serving one for a
+    // fallback attempt.
+    let mut out: Vec<CallUsage> = Vec::new();
+    for it in iterations {
+        let model =
+            it["model"]
+                .as_str()
+                .unwrap_or(if it["type"].as_str() == Some("fallback_message") {
+                    served_by
+                } else {
+                    requested_model
+                });
+        let r = row(it, model);
+        match out.iter_mut().find(|o| o.model == r.model) {
+            Some(o) => {
+                o.input_tokens += r.input_tokens;
+                o.output_tokens += r.output_tokens;
+                o.cache_read_tokens += r.cache_read_tokens;
+                o.cache_write_tokens += r.cache_write_tokens;
+                o.cost_usd = match (o.cost_usd, r.cost_usd) {
+                    (Some(a), Some(b)) => Some(a + b),
+                    _ => None,
+                };
+            }
+            None => out.push(r),
+        }
+    }
+    out
 }
 
 /// Characters of the fixed part of each request (system prompt + schema),
@@ -747,6 +811,88 @@ mod tests {
             LlmError::Transient(Via::Api, "HTTP 529".into()).to_string(),
             "temporary Claude API error: HTTP 529"
         );
+    }
+
+    #[test]
+    fn api_errors_that_fail_every_request_stop_the_pass() {
+        let body = |kind: &str, m: &str| {
+            json!({"type": "error", "error": {"type": kind, "message": m}}).to_string()
+        };
+        for (status, b) in [
+            (401, body("authentication_error", "invalid x-api-key")),
+            (403, body("permission_error", "not allowed")),
+            (402, body("billing_error", "payment required")),
+            (
+                400,
+                body(
+                    "invalid_request_error",
+                    "Your credit balance is too low to access the Anthropic API.",
+                ),
+            ),
+        ] {
+            let e = api_error(status, &b);
+            assert!(e.stops_pass(), "{status}: {e:?}");
+            let m = e.to_string();
+            assert!(
+                m.starts_with("Claude API: ") && m.contains(&format!("HTTP {status}")),
+                "{m}"
+            );
+        }
+        assert!(matches!(
+            api_error(400, &body("invalid_request_error", "bad schema")),
+            LlmError::Fatal(Via::Api, _)
+        ));
+        for status in [429, 500, 529] {
+            assert!(matches!(
+                api_error(status, "not json"),
+                LlmError::Transient(Via::Api, _)
+            ));
+        }
+    }
+
+    #[test]
+    fn api_usage_counts_every_billed_attempt() {
+        // No fallback: the top-level usage, at the model that answered.
+        let v = json!({"model": "claude-opus-5-5", "usage": {
+            "input_tokens": 100, "output_tokens": 50, "cache_read_input_tokens": 7}});
+        let u = api_usage(&v, "claude-opus-5-5");
+        assert_eq!(u.len(), 1);
+        assert_eq!(
+            (
+                u[0].model.as_str(),
+                u[0].input_tokens,
+                u[0].output_tokens,
+                u[0].cache_read_tokens
+            ),
+            ("claude-opus-5-5", 100, 50, 7)
+        );
+        // Declined part-way, then answered by the fallback model: both
+        // attempts are billed, each at its own model.
+        let v = json!({"model": "claude-opus-5", "usage": {
+        "input_tokens": 1000, "output_tokens": 300,
+        "iterations": [
+            {"type": "message", "input_tokens": 1000, "output_tokens": 120},
+            {"type": "fallback_message", "input_tokens": 1000, "output_tokens": 300}
+        ]}});
+        let u = api_usage(&v, "claude-opus-5-5");
+        let got: Vec<(&str, u64, u64)> = u
+            .iter()
+            .map(|c| (c.model.as_str(), c.input_tokens, c.output_tokens))
+            .collect();
+        assert_eq!(
+            got,
+            [("claude-opus-5-5", 1000, 120), ("claude-opus-5", 1000, 300)]
+        );
+        // A model named on an entry wins; repeated models add up.
+        let v = json!({"model": "m-b", "usage": {"iterations": [
+            {"type": "message", "model": "m-a", "input_tokens": 10, "output_tokens": 1},
+            {"type": "compaction", "model": "m-a", "input_tokens": 5, "output_tokens": 2},
+            {"type": "fallback_message", "model": "m-b", "input_tokens": 3, "output_tokens": 3}
+        ]}});
+        let u = api_usage(&v, "m-a");
+        assert_eq!(u.len(), 2);
+        assert_eq!((u[0].input_tokens, u[0].output_tokens), (15, 3));
+        assert_eq!(u[1].model, "m-b");
     }
 
     #[test]

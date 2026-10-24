@@ -1,5 +1,6 @@
 //! Text-to-Dialogue generation against a fake ElevenLabs server.
 
+use std::collections::HashSet;
 use std::sync::mpsc::Receiver;
 
 use base64::Engine;
@@ -137,7 +138,7 @@ fn import(s: &Setup, text: &str, speakers: &[&str]) -> (Id, Vec<Segment>) {
             let cid = db.import_chapter(s.project_id, "One", text)?;
             for p in db.paragraphs(cid)? {
                 let segs = segment::parse_paragraph(&p.text, lang::by_code(&lang_code));
-                store_segments(db, &p, &segs)?;
+                store_segments(db, &HashSet::new(), &p, &segs)?;
             }
             let mut k = 0;
             for seg in db.chapter_segments(cid)? {
@@ -565,8 +566,13 @@ fn repeated_billed_fallbacks_stop_dialogue_for_the_run() {
     assert_eq!(segs.len(), 18);
     rt().block_on(generate(&s.ctx, ids(&segs), false)).unwrap();
     let sent = dialogue_bodies(&requests).len();
-    // Two discarded, plus at most what was already waiting to be validated.
-    assert!((2..=4).contains(&sent), "{sent} dialogue requests");
+    // Exactly the two that may be discarded: nothing else was sent while
+    // they were being validated.
+    assert_eq!(
+        sent,
+        crate::dialogue::MAX_DISCARDED_PER_RUN,
+        "{sent} dialogue requests"
+    );
     assert_eq!(tts_count(&requests), 18, "every segment per segment");
     for seg in &segs {
         assert_eq!(current(&s.ctx, seg.id).dialogue_group, None);
@@ -826,5 +832,194 @@ fn non_ascii_paragraphs_validate_per_character() {
     assert_eq!(tts_count(&requests), 0);
     for seg in &segs {
         assert!(current(&s.ctx, seg.id).dialogue_group.is_some());
+    }
+}
+
+/// Like `serve`, but every connection is answered on its own thread, dialogue
+/// requests after 400 ms, as a real server handles concurrent requests.
+fn serve_concurrent(
+    handler: impl Fn(usize, &str, &str) -> Reply + Send + Sync + 'static,
+) -> (String, Requests) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let log: Requests = Default::default();
+    let log2 = log.clone();
+    let handler = std::sync::Arc::new(handler);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let log2 = log2.clone();
+            let handler = handler.clone();
+            std::thread::spawn(move || {
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                let mut len = 0usize;
+                loop {
+                    let mut h = String::new();
+                    reader.read_line(&mut h).unwrap();
+                    if h.trim().is_empty() {
+                        break;
+                    }
+                    if let Some((k, v)) = h.split_once(':')
+                        && k.eq_ignore_ascii_case("content-length")
+                    {
+                        len = v.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0u8; len];
+                reader.read_exact(&mut body).unwrap();
+                let body = String::from_utf8_lossy(&body).to_string();
+                let n = {
+                    let mut l = log2.lock().unwrap();
+                    l.push((path.clone(), body.clone()));
+                    l.len() - 1
+                };
+                if path.starts_with("/text-to-dialogue/") {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                }
+                let (status, headers, payload) = handler(n, &path, &body);
+                let mut head = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n",
+                    payload.len()
+                );
+                for (k, v) in headers {
+                    head.push_str(&format!("{k}: {v}\r\n"));
+                }
+                head.push_str("\r\n");
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&payload);
+            });
+        }
+    });
+    (url, log)
+}
+
+#[test]
+fn the_discard_limit_holds_with_concurrent_requests() {
+    // Every dialogue fails validation, with the default concurrency (3) and
+    // a server that works on several requests at once: still only
+    // MAX_DISCARDED_PER_RUN dialogues are billed and thrown away, as the
+    // Generate dialog promises.
+    let (url, requests) = serve_concurrent(|n, path, body| {
+        let v: Value = serde_json::from_str(body).unwrap();
+        if path.starts_with("/text-to-dialogue/") {
+            return dialogue_reply(n, &v, &|s| {
+                let t = s.segments[1].start_time_seconds;
+                s.segments[1].end_time_seconds = t;
+                s.segments[2].start_time_seconds = t;
+            });
+        }
+        let chars = v["text"].as_str().unwrap().chars().count();
+        let pcm: Vec<u8> = (0..240i16).flat_map(|s| (s * 50).to_le_bytes()).collect();
+        (
+            200,
+            vec![
+                ("request-id".into(), format!("tts-{n}")),
+                ("character-cost".into(), chars.to_string()),
+            ],
+            pcm,
+        )
+    });
+    let s = setup(&url, "en", |_| {});
+    assert_eq!(
+        s.ctx
+            .db(|db| db.project(s.project_id))
+            .unwrap()
+            .settings
+            .concurrency,
+        3
+    );
+    let text: Vec<String> = (1..=10)
+        .map(|i| format!("“Who goes there, {i}?” asked guard {i}. “Only me, {i}.”"))
+        .collect();
+    let (_, segs) = import(&s, &text.join("\n\n"), &["guard", "vortram"]);
+    rt().block_on(generate(&s.ctx, ids(&segs), false)).unwrap();
+    let max = crate::dialogue::MAX_DISCARDED_PER_RUN;
+    assert_eq!(dialogue_bodies(&requests).len(), max);
+    let events: Vec<Event> = s.events.try_iter().collect();
+    let billed_twice = events
+        .iter()
+        .filter(|e| matches!(e, Event::Info(m) if m.contains("billed (")))
+        .count();
+    assert_eq!(billed_twice, max);
+    assert_eq!(tts_count(&requests), segs.len(), "the rest per segment");
+    let reported = events
+        .iter()
+        .filter(|e| matches!(e, Event::SegmentGenerated { .. }))
+        .count();
+    assert_eq!(reported, segs.len());
+}
+
+#[test]
+fn cancel_stops_dialogues_waiting_for_a_request_slot() {
+    // Cancel is pressed while the first dialogue is on its way: the
+    // paragraphs waiting for a request slot send nothing, neither as a
+    // dialogue nor per segment.
+    let epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let e2 = epoch.clone();
+    let (url, requests) = fake_eleven(move |n, body| {
+        e2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        dialogue_reply(n, body, &|_| {})
+    });
+    let mut s = setup(&url, "en", |p| p.settings.concurrency = 1);
+    s.ctx.epoch = epoch;
+    let text: Vec<String> = (1..=8)
+        .map(|i| format!("“Who goes there, {i}?” asked guard {i}. “Only me, {i}.”"))
+        .collect();
+    let (_, segs) = import(&s, &text.join("\n\n"), &["guard", "vortram"]);
+    rt().block_on(generate(&s.ctx, ids(&segs), false)).unwrap();
+    assert_eq!(
+        dialogue_bodies(&requests).len(),
+        1,
+        "only the one already sent"
+    );
+    assert_eq!(tts_count(&requests), 0);
+    let events: Vec<Event> = s.events.try_iter().collect();
+    let cancelled = events
+        .iter()
+        .filter(|e| matches!(e, Event::GenerationFailed { error, .. } if error == "cancelled"))
+        .count();
+    assert_eq!(cancelled, segs.len() - 3);
+    let done = events.iter().find_map(|e| match e {
+        Event::GenerationFinished {
+            generated, failed, ..
+        } => Some((*generated, *failed)),
+        _ => None,
+    });
+    assert_eq!(
+        done,
+        Some((3, 0)),
+        "the sent dialogue is kept; cancelled is no failure"
+    );
+}
+
+#[test]
+fn lines_with_per_segment_takes_are_not_billed_again_as_a_dialogue() {
+    // A chapter generated one segment at a time (dialogue off, or a library
+    // from before dialogue), then the same text again with dialogue on (a
+    // chapter imported again to fix a typo): every line is reused for
+    // nothing instead of paying for a dialogue.
+    let (url, requests) = fake_eleven(|n, body| dialogue_reply(n, body, &|_| {}));
+    let s = setup(&url, "en", |p| p.settings.dialogue.enabled = false);
+    let (_, first) = import(&s, CHAPTER, &["guard", "vortram"]);
+    rt().block_on(generate(&s.ctx, ids(&first), false)).unwrap();
+    assert_eq!(tts_count(&requests), 5);
+    s.ctx
+        .db(|db| {
+            let mut p = db.project(s.project_id)?;
+            p.settings.dialogue.enabled = true;
+            db.update_project(&p)
+        })
+        .unwrap();
+    let _ = s.events.try_iter().count();
+    let (_, again) = import(&s, CHAPTER, &["guard", "vortram"]);
+    rt().block_on(generate(&s.ctx, ids(&again), false)).unwrap();
+    assert_eq!(requests.lock().unwrap().len(), 5, "no new request");
+    assert_eq!(finished(&s.events), (5, 5, 0, 0));
+    for seg in &again {
+        assert_eq!(current(&s.ctx, seg.id).credits_used, 0);
     }
 }

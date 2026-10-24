@@ -11,7 +11,22 @@ use crate::check::{CheckStatus, TakeCheck};
 use crate::model::Id;
 
 const CHECK_COLS: &str =
-    "c.take_id, c.status, c.transcript, c.wer, c.issues, c.model, c.checked_at";
+    "c.take_id, c.status, c.transcript, c.wer, c.issues, c.model, c.checked_at, c.text_key";
+
+/// SQL for [`crate::check::text_key`] of segment `s`.
+const SEGMENT_TEXT_KEY: &str = "(s.text || char(31) || COALESCE(s.performance, ''))";
+
+/// Libraries created before checks recorded their text lack `text_key`
+/// (their results count as made against the current text).
+pub(super) fn init(conn: &rusqlite::Connection) -> Result<()> {
+    let has: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('take_check') WHERE name = 'text_key'")?
+        .exists([])?;
+    if !has {
+        conn.execute_batch("ALTER TABLE take_check ADD COLUMN text_key TEXT NOT NULL DEFAULT ''")?;
+    }
+    Ok(())
+}
 
 /// A check row whose columns start at index `o`.
 fn row_check_at(r: &Row, o: usize) -> rusqlite::Result<TakeCheck> {
@@ -25,6 +40,7 @@ fn row_check_at(r: &Row, o: usize) -> rusqlite::Result<TakeCheck> {
         issues: from_json(&issues),
         model: r.get(o + 5)?,
         checked_at: r.get(o + 6)?,
+        text_key: r.get(o + 7)?,
     })
 }
 
@@ -36,10 +52,10 @@ impl Db {
     /// Store (or replace) a take's check result; `checked_at` is set to now.
     pub fn set_take_check(&self, c: &TakeCheck) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO take_check (take_id, status, transcript, wer, issues, model)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO take_check (take_id, status, transcript, wer, issues, model, text_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(take_id) DO UPDATE SET status = ?2, transcript = ?3, wer = ?4,
-                 issues = ?5, model = ?6,
+                 issues = ?5, model = ?6, text_key = ?7,
                  checked_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
             params![
                 c.take_id,
@@ -47,7 +63,8 @@ impl Db {
                 c.transcript,
                 c.wer.map(|w| w as f64),
                 json(&c.issues),
-                c.model
+                c.model,
+                c.text_key
             ],
         )?;
         Ok(())
@@ -58,12 +75,16 @@ impl Db {
         Ok(self.conn.query_row(&sql, [take_id], row_check).optional()?)
     }
 
-    /// Check results of the chapter's CURRENT takes, by segment id.
+    /// Check results of the chapter's CURRENT takes, by segment id. A result
+    /// made against another text (the segment was merged, split or re-tagged
+    /// since, and an older take picked) is left out: it says nothing about
+    /// the current text, and Check chapter redoes it.
     pub fn chapter_checks(&self, chapter_id: Id) -> Result<HashMap<Id, TakeCheck>> {
         let sql = format!(
             "SELECT s.id, {CHECK_COLS} FROM take_check c
              JOIN segment s ON s.current_take_id = c.take_id
-             JOIN paragraph p ON p.id = s.paragraph_id WHERE p.chapter_id = ?1"
+             JOIN paragraph p ON p.id = s.paragraph_id WHERE p.chapter_id = ?1
+               AND (c.text_key = '' OR c.text_key = {SEGMENT_TEXT_KEY})"
         );
         let mut st = self.conn.prepare(&sql)?;
         let rows = st.query_map([chapter_id], |r| {
@@ -76,15 +97,16 @@ impl Db {
     /// transcribes with `model` (empty: length only), in reading order.
     /// Same rule as [`crate::check::needs_check`].
     pub fn takes_to_check(&self, chapter_id: Id, model: &str) -> Result<Vec<Id>> {
-        let mut st = self.conn.prepare(
+        let mut st = self.conn.prepare(&format!(
             "SELECT s.current_take_id FROM segment s
              JOIN paragraph p ON p.id = s.paragraph_id
              LEFT JOIN take_check c ON c.take_id = s.current_take_id
              WHERE p.chapter_id = ?1 AND s.current_take_id IS NOT NULL
                AND (c.take_id IS NULL OR c.status = 'error'
+                    OR (c.text_key != '' AND c.text_key != {SEGMENT_TEXT_KEY})
                     OR (?2 != '' AND c.status != 'dismissed' AND c.model != ?2))
-             ORDER BY p.ord, s.ord",
-        )?;
+             ORDER BY p.ord, s.ord"
+        ))?;
         Ok(st
             .query_map(params![chapter_id, model], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?)
@@ -99,18 +121,25 @@ impl Db {
     }
 
     /// A finished check by `model` of another take with the same hash, i.e.
-    /// the same audio file and the same spoken text (a cache hit).
-    pub fn shared_take_check(&self, take_id: Id, model: &str) -> Result<Option<TakeCheck>> {
+    /// the same audio file and the same spoken text (a cache hit), made
+    /// against the text `key`.
+    pub fn shared_take_check(
+        &self,
+        take_id: Id,
+        model: &str,
+        key: &str,
+    ) -> Result<Option<TakeCheck>> {
         let sql = format!(
             "SELECT {CHECK_COLS} FROM take t
              JOIN take o ON o.hash = t.hash AND o.id != t.id
              JOIN take_check c ON c.take_id = o.id
              WHERE t.id = ?1 AND c.model = ?2 AND c.status != 'error'
+               AND (c.text_key = '' OR c.text_key = ?3)
              ORDER BY c.checked_at DESC, c.take_id DESC LIMIT 1"
         );
         Ok(self
             .conn
-            .query_row(&sql, params![take_id, model], row_check)
+            .query_row(&sql, params![take_id, model, key], row_check)
             .optional()?)
     }
 }
@@ -137,6 +166,7 @@ mod tests {
             }],
             model: model.into(),
             checked_at: String::new(),
+            text_key: String::new(),
         }
     }
 
@@ -237,12 +267,47 @@ mod tests {
                 let sql = db.takes_to_check(cid, current).unwrap().contains(&t0);
                 assert_eq!(
                     sql,
-                    needs_check(Some(&r), current),
+                    needs_check(Some(&r), current, &crate::check::text_key("A.", None)),
                     "{status:?} by {model:?}, now {current:?}"
                 );
             }
         }
-        assert!(needs_check(None, ""));
+        assert!(needs_check(None, "", ""));
+    }
+
+    /// A check made against an earlier text (the segment was merged, and an
+    /// older take picked again) neither shows nor counts, and is redone.
+    #[test]
+    fn checks_against_another_text_are_redone() {
+        let mut db = Db::open_in_memory().unwrap();
+        let (cid, segs, takes) = setup(&mut db);
+        let t0 = takes[1];
+        let key = crate::check::text_key;
+        for status in [CheckStatus::Ok, CheckStatus::Dismissed] {
+            db.set_take_check(&TakeCheck {
+                text_key: key("A.", None),
+                ..result(t0, status, "small")
+            })
+            .unwrap();
+            assert!(db.chapter_checks(cid).unwrap().contains_key(&segs[0]));
+            assert!(!db.takes_to_check(cid, "small").unwrap().contains(&t0));
+        }
+        // The segment's text or tags change; the old take is current again.
+        db.set_segment_performance(segs[0], Some("[sighs] A."))
+            .unwrap();
+        db.set_current_take(segs[0], t0).unwrap();
+        let stored = db.take_check(t0).unwrap().unwrap();
+        let now = key("A.", Some("[sighs] A."));
+        assert!(needs_check(Some(&stored), "small", &now));
+        assert!(needs_check(Some(&stored), "", &now), "even length-only");
+        assert!(!db.chapter_checks(cid).unwrap().contains_key(&segs[0]));
+        assert!(db.takes_to_check(cid, "small").unwrap().contains(&t0));
+        assert!(db.takes_to_check(cid, "").unwrap().contains(&t0));
+        // Results from before the text was recorded count as current.
+        db.set_take_check(&result(t0, CheckStatus::Ok, "small"))
+            .unwrap();
+        assert!(db.chapter_checks(cid).unwrap().contains_key(&segs[0]));
+        assert!(!db.takes_to_check(cid, "small").unwrap().contains(&t0));
     }
 
     #[test]
@@ -261,26 +326,37 @@ mod tests {
                 credits_exact: true,
             })
             .unwrap();
-        assert_eq!(db.shared_take_check(hit, "small").unwrap(), None);
+        let k = crate::check::text_key("C.", None);
+        assert_eq!(db.shared_take_check(hit, "small", &k).unwrap(), None);
         db.set_take_check(&result(takes[1], CheckStatus::Error, "small"))
             .unwrap();
         assert_eq!(
-            db.shared_take_check(hit, "small").unwrap(),
+            db.shared_take_check(hit, "small", &k).unwrap(),
             None,
             "failed checks are not shared"
         );
         db.set_take_check(&result(takes[1], CheckStatus::Flagged, "small"))
             .unwrap();
         assert_eq!(
-            db.shared_take_check(hit, "small").unwrap().unwrap().take_id,
+            db.shared_take_check(hit, "small", &k)
+                .unwrap()
+                .unwrap()
+                .take_id,
             takes[1]
         );
-        assert_eq!(db.shared_take_check(hit, "base").unwrap(), None);
+        assert_eq!(db.shared_take_check(hit, "base", &k).unwrap(), None);
         assert_eq!(
-            db.shared_take_check(takes[1], "small").unwrap(),
+            db.shared_take_check(takes[1], "small", &k).unwrap(),
             None,
             "not itself"
         );
+        // A check made against another text is not shared.
+        db.set_take_check(&TakeCheck {
+            text_key: crate::check::text_key("A.", None),
+            ..result(takes[1], CheckStatus::Flagged, "small")
+        })
+        .unwrap();
+        assert_eq!(db.shared_take_check(hit, "small", &k).unwrap(), None);
         // Deleting the chapter deletes its takes and their checks.
         db.delete_chapter(cid).unwrap();
         assert_eq!(db.take_check(takes[1]).unwrap(), None);
@@ -319,5 +395,29 @@ mod tests {
             .unwrap();
         drop(db);
         assert!(lib.open().unwrap().take_check(takes[1]).unwrap().is_some());
+    }
+
+    #[test]
+    fn old_check_tables_gain_the_text_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = Library::new(dir.path().to_path_buf());
+        std::fs::create_dir_all(&lib.root).unwrap();
+        let old = SCHEMA.replace(
+                "    checked_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),\n    text_key   TEXT NOT NULL DEFAULT ''\n",
+                "    checked_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))\n",
+            );
+        assert_ne!(old, SCHEMA, "the old schema has no text_key");
+        Connection::open(lib.db_path())
+            .unwrap()
+            .execute_batch(&old)
+            .unwrap();
+        let mut db = lib.open().unwrap();
+        let (cid, segs, takes) = setup(&mut db);
+        db.set_take_check(&result(takes[1], CheckStatus::Ok, "small"))
+            .unwrap();
+        assert_eq!(db.take_check(takes[1]).unwrap().unwrap().text_key, "");
+        assert!(db.chapter_checks(cid).unwrap().contains_key(&segs[0]));
+        drop(db);
+        lib.open().unwrap();
     }
 }

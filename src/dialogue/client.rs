@@ -220,10 +220,7 @@ pub async fn convert_with_timestamps(
         .await
         .map_err(|e| CallError::Api(TtsError::Transient(e.to_string())))?;
     if status.as_u16() == 429 {
-        let retry_after = header("retry-after")
-            .and_then(|s| s.parse::<f64>().ok())
-            .filter(|s| s.is_finite() && *s >= 0.0)
-            .map(Duration::from_secs_f64);
+        let retry_after = header("retry-after").and_then(|s| crate::tts::parse_retry_after(&s));
         return Err(CallError::Api(TtsError::RateLimited {
             retry_after,
             message: error_message(&body),

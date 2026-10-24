@@ -101,8 +101,11 @@ struct GeneratePlan {
     title: String,
     ids: Vec<Id>,
     reroll: bool,
+    /// Spoken characters to be generated (cached takes left out).
     chars: usize,
     unassigned: usize,
+    /// Segments whose first take is reused from the cache, for nothing.
+    cached: usize,
 }
 
 struct VoiceRow {
@@ -789,7 +792,9 @@ impl App {
     }
 
     fn plan_generation(&mut self, reroll: bool) {
-        let Some(project) = &self.project else { return };
+        let Some(project) = self.project.clone() else {
+            return;
+        };
         let wanted = if reroll {
             SegmentStatus::Rejected
         } else {
@@ -805,7 +810,9 @@ impl App {
             reroll,
             chars: 0,
             unassigned: 0,
+            cached: 0,
         };
+        let mut cached: HashSet<Id> = HashSet::new();
         for s in &self.view.segments {
             if s.status != wanted || self.in_flight.contains(&s.id) {
                 continue;
@@ -814,13 +821,42 @@ impl App {
                 plan.unassigned += 1;
                 continue;
             }
-            plan.chars += s.spoken_text(&project.tts_model).chars().count();
+            // The same rule generation uses: a first take whose audio exists.
+            if !reroll
+                && self
+                    .db
+                    .cached_first_take(&self.lib, &project, s)
+                    .ok()
+                    .flatten()
+                    .is_some()
+            {
+                cached.insert(s.id);
+            }
             plan.ids.push(s.id);
         }
+        // A multi-speaker dialogue bills all its lines, unless every one is
+        // cached (then it goes per segment, for nothing).
+        let requested: HashSet<Id> = plan.ids.iter().copied().collect();
+        for para in crate::dialogue::plan(&project, &self.view.segments, &requested, reroll) {
+            if !para.iter().all(|id| cached.contains(id)) {
+                for id in para {
+                    cached.remove(&id);
+                }
+            }
+        }
+        plan.cached = cached.len();
+        plan.chars = self
+            .view
+            .segments
+            .iter()
+            .filter(|s| requested.contains(&s.id) && !cached.contains(&s.id))
+            .map(|s| s.spoken_text(&project.tts_model).chars().count())
+            .sum();
         self.dialogs.generate = Some(plan);
     }
 
-    fn segment_chapter(&mut self, chapter_id: Id) {
+    /// Segment (or with `resume`, continue segmenting) a chapter.
+    fn segment_chapter(&mut self, chapter_id: Id, resume: bool) {
         if self.cfg.claude_backend == crate::config::ClaudeBackend::ApiKey
             && self.cfg.api_keys().anthropic.is_empty()
         {
@@ -829,7 +865,8 @@ impl App {
                 "No Anthropic API key: dialogue will be split by the parser only, with speaker 'unknown'. Add a key, or choose Claude Code in Settings.".into(),
             );
         }
-        self.worker.send(Command::SegmentChapter { chapter_id });
+        self.worker
+            .send(Command::SegmentChapter { chapter_id, resume });
         self.tab = Tab::Review;
     }
 
@@ -1297,7 +1334,7 @@ impl App {
                             .clicked()
                             && (!self.draft.dirty() || self.save_text(false))
                             && let Some(id) = self.draft.chapter_id {
-                                self.segment_chapter(id);
+                                self.segment_chapter(id, false);
                             }
                         if ui
                             .add_enabled(self.draft.dirty() && !paragraphs.is_empty(), egui::Button::new("Save"))
@@ -1386,6 +1423,14 @@ impl App {
                     ui.label(format!("Segmenting {d}/{t} dialogue paragraphs…"));
                 }
                 None => {
+                    if st.attribution_pending > 0
+                        && ui
+                            .add(primary_button(ui, &format!("Continue segmenting ({})", st.attribution_pending)))
+                            .on_hover_text("Attribute the dialogue paragraphs a stopped pass left; paragraphs already attributed are not sent again")
+                            .clicked()
+                    {
+                        self.segment_chapter(cid, true);
+                    }
                     if ui
                         .button("Re-segment drafts")
                         .on_hover_text("Re-run speaker attribution for paragraphs that have no audio yet")
@@ -1474,7 +1519,7 @@ impl App {
                     if let Some(cid) = self.view.chapter_id
                         && ui.add(primary_button(ui, "Segment speakers")).clicked()
                     {
-                        self.segment_chapter(cid);
+                        self.segment_chapter(cid, false);
                     }
                 }
             });
@@ -1685,6 +1730,17 @@ impl App {
         let locked = seg.status == SegmentStatus::Approved;
         let range = self.view.paragraph_range(i);
         let last_in_para = i + 1 == range.end;
+        // Merging or splitting a segment whose take is on its way would leave
+        // the paid take without its segment.
+        let in_flight = |j: usize| {
+            self.view
+                .segments
+                .get(j)
+                .is_some_and(|s| self.in_flight.contains(&s.id))
+        };
+        let busy_here = in_flight(i);
+        let busy_next = busy_here || in_flight(i + 1);
+        let busy_prev = busy_here || (i > 0 && in_flight(i - 1));
         let dark = ui.visuals().dark_mode;
         if self
             .tag_edit
@@ -1772,13 +1828,18 @@ impl App {
                         self.play_paragraph(i);
                     }
                     ui.separator();
-                    if ui.add_enabled(!locked && !last_in_para, egui::Button::new("Merge with next")).clicked() {
+                    if ui
+                        .add_enabled(!locked && !last_in_para && !busy_next, egui::Button::new("Merge with next"))
+                        .on_disabled_hover_text("Not while a take of these segments is being generated")
+                        .clicked()
+                    {
                         let r = self.db.merge_with_next(seg.id);
                         self.try_db(r);
                         self.dirty = true;
                     }
                     if ui
-                        .add_enabled(!locked && i > range.start, egui::Button::new("Merge with previous"))
+                        .add_enabled(!locked && i > range.start && !busy_prev, egui::Button::new("Merge with previous"))
+                        .on_disabled_hover_text("Not while a take of these segments is being generated")
                         .clicked()
                     {
                         let prev = self.view.segments[i - 1].id;
@@ -1788,7 +1849,11 @@ impl App {
                         }
                         self.dirty = true;
                     }
-                    if ui.add_enabled(!locked, egui::Button::new("Split…")).clicked() {
+                    if ui
+                        .add_enabled(!locked && !busy_here, egui::Button::new("Split…"))
+                        .on_disabled_hover_text("Not while this segment's take is being generated")
+                        .clicked()
+                    {
                         self.dialogs.split = Some((seg.id, seg.text.clone(), None));
                     }
                 });
@@ -2457,16 +2522,46 @@ impl App {
         };
         let mut go = false;
         let mut cancel = false;
+        // A Claude pass still working on this chapter leaves alone whatever
+        // is generated meanwhile (no take is ever detached or deleted): say
+        // what that means before credits are spent.
+        let open = self.view.chapter_id;
+        let pass_note = if self.segmenting.is_some_and(|(c, _, _)| Some(c) == open) {
+            Some(
+                "Speakers are still being attributed in this chapter: paragraphs generated now keep their current segments and speakers.",
+            )
+        } else if self.directing.is_some_and(|(c, _, _)| Some(c) == open) {
+            Some(
+                "Audio tags are still being added to this chapter: segments generated now are spoken without the tags still to come.",
+            )
+        } else {
+            None
+        };
         egui::Window::new(&plan.title)
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
                 ui.set_max_width(480.0);
-                ui.label(format!(
-                    "{} segments, {} characters.",
-                    plan.ids.len(),
-                    crate::costs::fmt_int(plan.chars as i64)
-                ));
+                if let Some(note) = pass_note {
+                    ui.add(
+                        egui::Label::new(RichText::new(note).color(theme::palette(ui).warning))
+                            .wrap(),
+                    );
+                }
+                if plan.cached > 0 {
+                    ui.label(format!(
+                        "{} segments: {} reuse cached takes for free, {} characters to generate.",
+                        plan.ids.len(),
+                        plan.cached,
+                        crate::costs::fmt_int(plan.chars as i64)
+                    ));
+                } else {
+                    ui.label(format!(
+                        "{} segments, {} characters.",
+                        plan.ids.len(),
+                        crate::costs::fmt_int(plan.chars as i64)
+                    ));
+                }
                 self.generate_estimate_ui(ui, plan.chars);
                 if plan.unassigned > 0 {
                     ui.colored_label(
@@ -2544,11 +2639,11 @@ impl App {
             && let Some(yes) = confirm(
                 ctx,
                 "Re-segment",
-                "Re-run attribution (and audio tags) for paragraphs whose segments are all untouched drafts? Paragraphs with any audio are kept as they are. Manual edits in draft paragraphs are replaced.",
+                "Re-run attribution (and audio tags) for paragraphs whose segments are all untouched drafts? Paragraphs with any audio, a draft's older takes included, are kept as they are, and so are paragraphs being generated. Manual edits in the other draft paragraphs are replaced.",
             )
         {
             if yes {
-                self.segment_chapter(cid);
+                self.segment_chapter(cid, false);
             }
             self.dialogs.resegment = None;
         }
