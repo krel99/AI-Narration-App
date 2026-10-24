@@ -469,6 +469,7 @@ impl App {
         self.takes_for = None;
         self.reload_cost_stats();
         self.reload_checks();
+        self.reload_trims();
     }
 
     fn selected_segment(&self) -> Option<&Segment> {

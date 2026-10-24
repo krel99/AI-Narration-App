@@ -75,7 +75,10 @@ pub(super) async fn export_chapter(ctx: &Ctx, chapter_id: Id, draft: bool) -> Re
         let chapter = db.chapter(chapter_id)?;
         let project = db.project(chapter.project_id)?;
         // What the export is made of, to tell later whether it is outdated.
-        let takes_key = retail::segments_key(&db.chapter_segments(chapter_id)?);
+        let takes_key = retail::segments_key(
+            &db.chapter_segments(chapter_id)?,
+            &db.chapter_trims(chapter_id)?,
+        );
         let res = export::export_chapter(&db, &lib, &project, &chapter, draft)?;
         if !draft {
             db.set_chapter_status(chapter_id, ChapterStatus::Exported)?;

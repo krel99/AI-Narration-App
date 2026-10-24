@@ -178,10 +178,12 @@ impl App {
     /// selected segment's, so it is updated in place instead of reloaded).
     fn store_trim(&mut self, ctx: &egui::Context, take_id: Id, trim: Option<(u32, u32)>) {
         let r = self.db.set_take_trim(take_id, trim);
-        if self.try_db(r).is_some()
-            && let Some(t) = self.takes.iter_mut().find(|t| t.id == take_id)
-        {
-            t.trim_ms = trim;
+        if self.try_db(r).is_some() {
+            // The open chapter's ACX report goes "outdated" on a trim change.
+            self.trim_changed(take_id, trim);
+            if let Some(t) = self.takes.iter_mut().find(|t| t.id == take_id) {
+                t.trim_ms = trim;
+            }
         }
         ctx.request_repaint();
     }

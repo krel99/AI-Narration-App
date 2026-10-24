@@ -3,6 +3,7 @@
 //! "Retail & ACX" window with every chapter's measurements, and the retail
 //! sample dialog.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use eframe::egui::{self, Color32, RichText};
@@ -26,6 +27,9 @@ pub(super) struct RetailUi {
     /// The last cover inspected, by resolved path (covers in the library
     /// are named by content, so a new picture gets a new path).
     cover: Option<(PathBuf, Result<CoverInfo, String>)>,
+    /// Silence trims of the open chapter's takes, for its report's
+    /// fingerprint (refreshed with the view and on every trim edit).
+    pub(super) trims: HashMap<Id, (u32, u32)>,
 }
 
 struct SampleDialog {
@@ -98,13 +102,32 @@ impl App {
         }
     }
 
-    /// The chapter's segments, takes or approvals changed since its report.
+    /// The open chapter's take trims, for its report's fingerprint.
+    pub(super) fn reload_trims(&mut self) {
+        self.retail.trims = match self.view.chapter_id {
+            Some(cid) => self.db.chapter_trims(cid).unwrap_or_else(|e| {
+                log::warn!("loading trims: {e:#}");
+                HashMap::new()
+            }),
+            None => HashMap::new(),
+        };
+    }
+
+    /// A take's trim was edited in the waveform.
+    pub(super) fn trim_changed(&mut self, take_id: Id, trim: Option<(u32, u32)>) {
+        match trim {
+            Some(t) => self.retail.trims.insert(take_id, t),
+            None => self.retail.trims.remove(&take_id),
+        };
+    }
+
+    /// The chapter's segments, takes, approvals or trims changed since its report.
     /// The open chapter is compared with the segments on screen, so the chip
     /// follows an approval right away; other chapters use the stored check.
     fn report_stale(&self, chapter_id: Id, r: &FileReport) -> bool {
         match &r.takes_key {
             Some(key) if self.view.chapter_id == Some(chapter_id) => {
-                *key != retail::segments_key(&self.view.segments)
+                *key != retail::segments_key(&self.view.segments, &self.retail.trims)
             }
             _ => self.retail.state.stale.contains(&chapter_id),
         }

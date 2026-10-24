@@ -213,15 +213,21 @@ impl Db {
     /// segments, in one query (the same order as `Db::chapter_segments`).
     pub fn takes_keys(&self, project_id: Id) -> Result<HashMap<Id, String>> {
         let mut st = self.conn.prepare(
-            "SELECT p.chapter_id, s.id, s.current_take_id, s.status = 'approved'
+            "SELECT p.chapter_id, s.id, s.current_take_id, s.status = 'approved',
+                    t.trim_start_ms, t.trim_end_ms
              FROM segment s JOIN paragraph p ON p.id = s.paragraph_id
              JOIN chapter c ON c.id = p.chapter_id
+             LEFT JOIN take t ON t.id = s.current_take_id
              WHERE c.project_id = ?1
              ORDER BY p.chapter_id, p.ord, s.ord",
         )?;
-        let mut by_chapter: HashMap<Id, Vec<(Id, Option<Id>, bool)>> = HashMap::new();
+        let mut by_chapter: HashMap<Id, Vec<crate::retail::KeyPart>> = HashMap::new();
         for row in st.query_map([project_id], |r| {
-            Ok((r.get::<_, Id>(0)?, (r.get(1)?, r.get(2)?, r.get(3)?)))
+            let trim = match (r.get::<_, Option<i64>>(4)?, r.get::<_, Option<i64>>(5)?) {
+                (Some(a), Some(b)) => Some((a.max(0) as u32, b.max(0) as u32)),
+                _ => None,
+            };
+            Ok((r.get::<_, Id>(0)?, (r.get(1)?, r.get(2)?, r.get(3)?, trim)))
         })? {
             let (chapter_id, seg) = row?;
             by_chapter.entry(chapter_id).or_default().push(seg);
@@ -232,7 +238,28 @@ impl Db {
             .collect())
     }
 
-    /// Chapters whose segments, current takes or approvals no longer match
+    /// Silence trims of the chapter's takes that have one, by take id (for
+    /// `retail::segments_key`).
+    pub fn chapter_trims(&self, chapter_id: Id) -> Result<HashMap<Id, (u32, u32)>> {
+        let mut st = self.conn.prepare(
+            "SELECT t.id, t.trim_start_ms, t.trim_end_ms FROM take t
+             JOIN segment s ON s.id = t.segment_id
+             JOIN paragraph p ON p.id = s.paragraph_id
+             WHERE p.chapter_id = ?1 AND t.trim_start_ms IS NOT NULL AND t.trim_end_ms IS NOT NULL",
+        )?;
+        let rows = st.query_map([chapter_id], |r| {
+            Ok((
+                r.get::<_, Id>(0)?,
+                (
+                    r.get::<_, i64>(1)?.max(0) as u32,
+                    r.get::<_, i64>(2)?.max(0) as u32,
+                ),
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Chapters whose segments, current takes, approvals or trims no longer match
     /// their report (`retail::takes_key`). Reports stored before the key
     /// existed fall back to "a take was created after the measurement".
     pub fn stale_reports(&self, project_id: Id) -> Result<std::collections::HashSet<Id>> {
@@ -445,7 +472,12 @@ mod tests {
         let t2 = take(&db, "h2");
         db.set_current_take(seg, t2).unwrap();
         db.set_segment_status(seg, SegmentStatus::Approved).unwrap();
-        let key = |db: &Db| crate::retail::segments_key(&db.chapter_segments(cid).unwrap());
+        let key = |db: &Db| {
+            crate::retail::segments_key(
+                &db.chapter_segments(cid).unwrap(),
+                &db.chapter_trims(cid).unwrap(),
+            )
+        };
         // The one-query keys agree with the per-chapter ones.
         assert_eq!(db.takes_keys(pid).unwrap().get(&cid), Some(&key(&db)));
         let mut r = report(-20.0, -73.0);
@@ -463,6 +495,15 @@ mod tests {
         db.set_current_take(seg, t1).unwrap();
         assert!(db.stale_reports(pid).unwrap().contains(&cid));
         db.set_current_take(seg, t2).unwrap();
+        assert!(db.stale_reports(pid).unwrap().is_empty());
+        // A silence trim of the current take changes the exported audio.
+        db.set_take_trim(t2, Some((40, 900))).unwrap();
+        assert!(db.stale_reports(pid).unwrap().contains(&cid));
+        assert_eq!(db.takes_keys(pid).unwrap().get(&cid), Some(&key(&db)));
+        db.set_take_trim(t2, None).unwrap();
+        assert!(db.stale_reports(pid).unwrap().is_empty());
+        // A trim of a take that is not current changes nothing.
+        db.set_take_trim(t1, Some((40, 900))).unwrap();
         assert!(db.stale_reports(pid).unwrap().is_empty());
         // A take created later but not made current changes nothing.
         db.conn

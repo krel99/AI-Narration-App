@@ -64,7 +64,11 @@ fn chapter_export_is_checked_and_reported() {
 
     // The report remembers what the export was made of.
     let segs = ctx.db(|db| db.chapter_segments(cid)).unwrap();
-    assert_eq!(report.takes_key, Some(crate::retail::segments_key(&segs)));
+    let trims = ctx.db(|db| db.chapter_trims(cid)).unwrap();
+    assert_eq!(
+        report.takes_key,
+        Some(crate::retail::segments_key(&segs, &trims))
+    );
     let pid = book.project.id;
     assert!(ctx.db(|db| db.stale_reports(pid)).unwrap().is_empty());
 

@@ -3,6 +3,7 @@
 //! cover-art checks; the retail-sample planner; and the book-level lines of
 //! the ACX report. Pure logic: the ffmpeg side lives in `export/mastering.rs`.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -610,26 +611,41 @@ pub fn plan_sample(
 
 // ---- outdated reports -------------------------------------------------------------
 
+/// One segment's part of [`takes_key`]: segment id, current take, approved,
+/// and the current take's silence trim.
+pub type KeyPart = (Id, Option<Id>, bool, Option<(u32, u32)>);
+
 /// Fingerprint of what a chapter export is made of: every segment in
-/// reading order with its current take and whether it is approved. A
-/// stored report whose key no longer matches is "outdated" (a new take,
-/// an older take picked again, an approval changed, segments re-split).
-pub fn takes_key(segments: impl IntoIterator<Item = (Id, Option<Id>, bool)>) -> String {
+/// reading order with its current take, whether it is approved and the
+/// take's silence trim (trims change the exported audio). A stored report
+/// whose key no longer matches is "outdated" (a new take, an older take
+/// picked again, an approval or a trim changed, segments re-split). An
+/// untrimmed take hashes as before trims existed, so older keys still match.
+pub fn takes_key(segments: impl IntoIterator<Item = KeyPart>) -> String {
     use sha2::Digest;
     let mut h = sha2::Sha256::new();
-    for (id, take, approved) in segments {
-        h.update(format!("{id}:{}:{}\n", take.unwrap_or(0), approved as u8));
+    for (id, take, approved, trim) in segments {
+        let trim = trim.map_or(String::new(), |(a, b)| format!(":{a}-{b}"));
+        h.update(format!(
+            "{id}:{}:{}{trim}\n",
+            take.unwrap_or(0),
+            approved as u8
+        ));
     }
     hex::encode(h.finalize())[..16].to_string()
 }
 
-/// [`takes_key`] of a chapter's segments as `Db::chapter_segments` lists them.
-pub fn segments_key(segments: &[Segment]) -> String {
-    takes_key(
-        segments
-            .iter()
-            .map(|s| (s.id, s.current_take_id, s.status == SegmentStatus::Approved)),
-    )
+/// [`takes_key`] of a chapter's segments as `Db::chapter_segments` lists them,
+/// with the trims of their takes (`Db::chapter_trims`).
+pub fn segments_key(segments: &[Segment], trims: &HashMap<Id, (u32, u32)>) -> String {
+    takes_key(segments.iter().map(|s| {
+        (
+            s.id,
+            s.current_take_id,
+            s.status == SegmentStatus::Approved,
+            s.current_take_id.and_then(|t| trims.get(&t).copied()),
+        )
+    }))
 }
 
 // ---- book-level checks ------------------------------------------------------------
@@ -1347,19 +1363,29 @@ mod tests {
     }
 
     #[test]
-    fn takes_key_follows_takes_and_approvals() {
+    fn takes_key_follows_takes_approvals_and_trims() {
+        let key = |parts: &[(Id, Option<Id>, bool)]| {
+            takes_key(parts.iter().map(|&(s, t, a)| (s, t, a, None)))
+        };
         let base = [(1, Some(10), true), (2, Some(20), true)];
-        let k = takes_key(base);
+        let k = key(&base);
         assert_eq!(k.len(), 16);
-        assert_eq!(k, takes_key(base));
-        assert_ne!(k, takes_key([(1, Some(10), true), (2, Some(21), true)]));
-        assert_ne!(k, takes_key([(1, Some(10), true), (2, Some(20), false)]));
-        assert_ne!(k, takes_key([(2, Some(20), true), (1, Some(10), true)]));
-        assert_ne!(k, takes_key([(1, Some(10), true)]));
-        assert_ne!(
-            takes_key([(1, None, false)]),
-            takes_key([(1, Some(10), false)])
-        );
+        assert_eq!(k, key(&base));
+        assert_ne!(k, key(&[(1, Some(10), true), (2, Some(21), true)]));
+        assert_ne!(k, key(&[(1, Some(10), true), (2, Some(20), false)]));
+        assert_ne!(k, key(&[(2, Some(20), true), (1, Some(10), true)]));
+        assert_ne!(k, key(&[(1, Some(10), true)]));
+        assert_ne!(key(&[(1, None, false)]), key(&[(1, Some(10), false)]));
+        // A trim changes the exported audio, so it changes the key.
+        let trimmed = |t| takes_key([(1, Some(10), true, None), (2, Some(20), true, t)]);
+        assert_ne!(k, trimmed(Some((40, 900))));
+        assert_ne!(trimmed(Some((40, 900))), trimmed(Some((40, 910))));
+        assert_eq!(k, trimmed(None));
+        // Keys stored before trims existed still match untrimmed takes.
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        h.update("1:10:1\n2:20:1\n");
+        assert_eq!(k, hex::encode(h.finalize())[..16]);
     }
 
     fn chapter(title: &str, text: &str) -> Chapter {
