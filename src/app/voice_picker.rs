@@ -18,8 +18,11 @@ use crate::worker::Command;
 
 /// Player queue id of a voice preview; segment ids are positive.
 pub(super) const PREVIEW_ID: Id = -1;
-/// Height of a picker row (name and chips, two description lines, "Used by").
-const ROW_H: f32 = 78.0;
+/// Height of a picker row: name and chips, two description lines and
+/// "Used by" must fit inside it (see the layout test).
+const ROW_H: f32 = 84.0;
+/// Vertical padding inside a picker row.
+const ROW_PAD_Y: f32 = 4.0;
 const MAX_LABEL_CHIPS: usize = 5;
 /// Label keys shown as chips, in this order (any others follow).
 const LABEL_ORDER: [&str; 6] = [
@@ -35,6 +38,8 @@ const LABEL_ORDER: [&str; 6] = [
 pub(super) struct VoiceUi {
     /// The API key the list was loaded with; another key loads it again.
     loaded_key: Option<String>,
+    /// The API key of the load in flight.
+    requested_key: Option<String>,
     loading: bool,
     error: Option<String>,
     /// Assigned voices outside the account list, found by id.
@@ -52,12 +57,34 @@ pub(super) struct VoiceUi {
     preview_error: Option<(String, String)>,
 }
 
+impl VoiceUi {
+    /// Bookkeeping for a finished load. The list belongs to the key it was
+    /// requested with, not to whatever key is set now; returns true when the
+    /// key changed meanwhile, so the list should be loaded again.
+    fn load_finished(&mut self, outcome: Result<(), String>, current_key: &str) -> bool {
+        self.loading = false;
+        let requested = self.requested_key.take();
+        match outcome {
+            Ok(()) => {
+                self.loaded_key = Some(requested.clone().unwrap_or_else(|| current_key.into()));
+                self.error = None;
+            }
+            Err(e) => self.error = Some(e),
+        }
+        !current_key.is_empty() && requested.is_some_and(|k| k != current_key)
+    }
+}
+
 struct Picker {
     /// The Voices editor row being assigned.
     key: String,
     speaker: String,
     filter: voices::Filter,
     focus_search: bool,
+    /// Frames left in which the window is raised again: opened by a click
+    /// in the Voices dialog, both windows ask to be on top in that frame and
+    /// egui then keeps their old order, which can hide the picker.
+    raise: u8,
 }
 
 /// What the preview buttons show this frame.
@@ -314,6 +341,155 @@ pub(super) fn list_status(ui: &mut egui::Ui, count: usize, state: &VoiceUi) -> b
     refresh
 }
 
+/// What a click in a picker row asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowAction {
+    Assign,
+    Preview,
+}
+
+/// What every picker row needs besides its voice.
+struct RowCtx<'a> {
+    now: &'a PreviewNow,
+    /// The open dialog's (speaker key, voice id) rows, for "Used by".
+    assignments: &'a [(String, String)],
+    /// The speaker being assigned: its key and how it is named.
+    key: &'a str,
+    speaker: &'a str,
+    /// Its voice id in the dialog now.
+    current: &'a str,
+}
+
+struct RowOut {
+    action: Option<RowAction>,
+    /// The row's padded inside and what its text column took; the text
+    /// must fit, or the last line is cut off (checked by the layout test).
+    #[cfg_attr(not(test), allow(dead_code))]
+    inner: egui::Rect,
+    #[cfg_attr(not(test), allow(dead_code))]
+    text: egui::Rect,
+    /// ▶ and Assign, which must stay inside the row.
+    #[cfg_attr(not(test), allow(dead_code))]
+    buttons: egui::Rect,
+}
+
+/// One voice of the picker list. It takes exactly `ROW_H` (plus the usual
+/// item spacing), which is what `show_rows` assumes when it places the
+/// visible rows: the contents go into a child `Ui` that does not move the
+/// list's cursor again.
+fn picker_row(ui: &mut egui::Ui, v: &VoiceInfo, c: &RowCtx) -> RowOut {
+    let p = *theme::palette(ui);
+    let is_current = !c.current.is_empty() && v.voice_id == c.current;
+    let w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, ROW_H), Sense::hover());
+    let fill = if is_current {
+        p.accent_soft
+    } else if resp.hovered() {
+        ui.visuals().faint_bg_color
+    } else {
+        p.card
+    };
+    ui.painter().rect_filled(rect, 6.0, fill);
+    ui.painter().rect_stroke(
+        rect,
+        6.0,
+        egui::Stroke::new(1.0, p.border),
+        egui::StrokeKind::Inside,
+    );
+    let inner = rect.shrink2(Vec2::new(10.0, ROW_PAD_Y));
+    let mut row = ui.new_child(
+        UiBuilder::new()
+            .scope_id(egui::Id::unique(("voice_picker_row", &v.voice_id)))
+            .max_rect(inner)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    let mut action = None;
+    let buttons_w = 120.0;
+    let text_w = (inner.width() - buttons_w).max(160.0);
+    let text = row
+        .allocate_ui_with_layout(
+            Vec2::new(text_w, inner.height()),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_width(text_w);
+                let clip = ui.max_rect().intersect(ui.clip_rect());
+                ui.set_clip_rect(clip);
+                ui.spacing_mut().item_spacing.y = 2.0;
+                // Name and chips on one line of a fixed size: chips that do
+                // not fit are cut off rather than widening the column (which
+                // would re-wrap the description wider than the row and push
+                // the buttons out of the window).
+                let (line, _) = ui.allocate_exact_size(
+                    Vec2::new(text_w, ui.spacing().interact_size.y),
+                    Sense::hover(),
+                );
+                let mut l = ui.new_child(
+                    UiBuilder::new()
+                        .max_rect(line)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                );
+                l.set_clip_rect(line.intersect(clip));
+                l.spacing_mut().item_spacing.x = 4.0;
+                l.add(egui::Label::new(RichText::new(&v.name).strong().size(14.5)).truncate())
+                    .on_hover_text(summary(v));
+                if is_current {
+                    chip(&mut l, "current", p.approved);
+                }
+                if let Some(cat) = &v.category {
+                    chip(&mut l, cat.replace('_', " "), p.accent);
+                }
+                for label in label_chips(v) {
+                    chip(&mut l, label, p.muted);
+                }
+                let (text, color) = match &v.description {
+                    Some(d) => (d.clone(), ui.visuals().text_color()),
+                    None => ("No description".to_string(), p.muted),
+                };
+                let mut job = egui::text::LayoutJob::simple(
+                    text,
+                    egui::FontId::proportional(12.5),
+                    color,
+                    text_w,
+                );
+                job.wrap.max_rows = 2;
+                job.wrap.overflow_character = Some('…');
+                ui.add(egui::Label::new(job).selectable(false));
+                let users = voices::used_by(
+                    c.assignments.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+                    &v.voice_id,
+                    c.key,
+                );
+                if !users.is_empty() {
+                    let text = format!("Used by: {}", users.join(", "));
+                    ui.add(
+                        egui::Label::new(RichText::new(&text).small().color(p.warning)).truncate(),
+                    )
+                    .on_hover_text(text);
+                }
+            },
+        )
+        .response
+        .rect;
+    let buttons = row.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if ui
+            .add(primary_button(ui, "Assign"))
+            .on_hover_text(format!("Use {} for {}", v.name, c.speaker))
+            .clicked()
+        {
+            action = Some(RowAction::Assign);
+        }
+        if preview_button(ui, v, c.now) {
+            action = Some(RowAction::Preview);
+        }
+    });
+    RowOut {
+        action,
+        inner,
+        text,
+        buttons: buttons.response.rect,
+    }
+}
+
 impl App {
     /// Hook: the Voices dialog opened. Loads the list once per API key
     /// (again after an error); otherwise the list in memory is used.
@@ -333,11 +509,13 @@ impl App {
         if self.voice_ui.loading {
             return;
         }
-        if self.cfg.api_keys().elevenlabs.is_empty() {
+        let key = self.cfg.api_keys().elevenlabs;
+        if key.is_empty() {
             self.voice_ui.error = Some("Set the ElevenLabs API key in Settings first.".into());
             return;
         }
         let ui = &mut self.voice_ui;
+        ui.requested_key = Some(key);
         ui.loading = true;
         ui.error = None;
         ui.others.clear();
@@ -348,8 +526,8 @@ impl App {
     }
 
     pub(super) fn on_voices(&mut self, result: Result<Vec<VoiceInfo>, String>) {
-        self.voice_ui.loading = false;
-        match result {
+        let current = self.cfg.api_keys().elevenlabs;
+        let outcome = match result {
             Ok(list) => {
                 self.note(
                     false,
@@ -359,13 +537,15 @@ impl App {
                     ),
                 );
                 self.voices = list;
-                self.voice_ui.loaded_key = Some(self.cfg.api_keys().elevenlabs);
-                self.voice_ui.error = None;
+                Ok(())
             }
             Err(e) => {
                 self.note(true, e.clone());
-                self.voice_ui.error = Some(e);
+                Err(e)
             }
+        };
+        if self.voice_ui.load_finished(outcome, &current) && self.dialogs.voices.is_some() {
+            self.refresh_voices();
         }
     }
 
@@ -462,6 +642,7 @@ impl App {
                     speaker,
                     filter: Default::default(),
                     focus_search: true,
+                    raise: 2,
                 });
                 if self.voice_ui.loaded_key.is_none() && !self.voice_ui.loading {
                     self.refresh_voices();
@@ -563,7 +744,7 @@ impl App {
         let mut refresh = false;
         let mut assign: Option<String> = None;
         let mut preview: Option<VoiceInfo> = None;
-        egui::Window::new(format!("Choose a voice for {}", picker.speaker))
+        let window = egui::Window::new(format!("Choose a voice for {}", picker.speaker))
             .id(egui::Id::unique("voice_picker"))
             .open(&mut open)
             .collapsible(false)
@@ -575,7 +756,7 @@ impl App {
                     let search = ui.add(
                         egui::TextEdit::singleline(&mut picker.filter.query)
                             .hint_text("Search name, labels, description")
-                            .desired_width(280.0),
+                            .desired_width((ui.available_width() - 290.0).clamp(150.0, 280.0)),
                     );
                     if picker.focus_search {
                         search.request_focus();
@@ -669,105 +850,31 @@ impl App {
                     ui.label(RichText::new("No voices match.").color(p.muted));
                     return;
                 }
+                let row = RowCtx {
+                    now: &now,
+                    assignments: &assignments,
+                    key: &picker.key,
+                    speaker: &picker.speaker,
+                    current: &current,
+                };
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show_rows(ui, ROW_H, shown.len(), |ui, range| {
                         for &i in &shown[range] {
-                            let v = &voices[i];
-                            let is_current = !current.is_empty() && v.voice_id == current;
-                            let w = ui.available_width();
-                            let (rect, resp) =
-                                ui.allocate_exact_size(Vec2::new(w, ROW_H), Sense::hover());
-                            let fill = if is_current {
-                                p.accent_soft
-                            } else if resp.hovered() {
-                                ui.visuals().faint_bg_color
-                            } else {
-                                p.card
-                            };
-                            ui.painter().rect_filled(rect, 6.0, fill);
-                            ui.painter().rect_stroke(
-                                rect,
-                                6.0,
-                                egui::Stroke::new(1.0, p.border),
-                                egui::StrokeKind::Inside,
-                            );
-                            let inner = rect.shrink2(Vec2::new(10.0, 6.0));
-                            ui.scope_builder(
-                                UiBuilder::new()
-                                    .max_rect(inner)
-                                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                                |ui| {
-                                    let buttons_w = 120.0;
-                                    let text_w = (inner.width() - buttons_w).max(160.0);
-                                    ui.allocate_ui_with_layout(
-                                        Vec2::new(text_w, inner.height()),
-                                        egui::Layout::top_down(egui::Align::Min),
-                                        |ui| {
-                                            ui.set_width(text_w);
-                                            let clip = ui.max_rect().intersect(ui.clip_rect());
-                                            ui.set_clip_rect(clip);
-                                            ui.spacing_mut().item_spacing.y = 2.0;
-                                            ui.horizontal(|ui| {
-                                                ui.spacing_mut().item_spacing.x = 4.0;
-                                                ui.label(RichText::new(&v.name).strong().size(14.5));
-                                                if let Some(c) = &v.category {
-                                                    chip(ui, c.replace('_', " "), p.accent);
-                                                }
-                                                for l in label_chips(v) {
-                                                    chip(ui, l, p.muted);
-                                                }
-                                                if is_current {
-                                                    chip(ui, "current", p.approved);
-                                                }
-                                            });
-                                            let (text, color) = match &v.description {
-                                                Some(d) => (d.clone(), ui.visuals().text_color()),
-                                                None => ("No description".to_string(), p.muted),
-                                            };
-                                            let mut job = egui::text::LayoutJob::simple(
-                                                text,
-                                                egui::FontId::proportional(12.5),
-                                                color,
-                                                text_w,
-                                            );
-                                            job.wrap.max_rows = 2;
-                                            job.wrap.overflow_character = Some('…');
-                                            ui.add(egui::Label::new(job).selectable(false));
-                                            let users = voices::used_by(
-                                                assignments.iter().map(|(k, v)| (k.as_str(), v.as_str())),
-                                                &v.voice_id,
-                                                &picker.key,
-                                            );
-                                            if !users.is_empty() {
-                                                ui.label(
-                                                    RichText::new(format!("Used by: {}", users.join(", ")))
-                                                        .small()
-                                                        .color(p.warning),
-                                                );
-                                            }
-                                        },
-                                    );
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            if ui
-                                                .add(primary_button(ui, "Assign"))
-                                                .on_hover_text(format!("Use {} for {}", v.name, picker.speaker))
-                                                .clicked()
-                                            {
-                                                assign = Some(v.voice_id.clone());
-                                            }
-                                            if preview_button(ui, v, &now) {
-                                                preview = Some(v.clone());
-                                            }
-                                        },
-                                    );
-                                },
-                            );
+                            match picker_row(ui, &voices[i], &row).action {
+                                Some(RowAction::Assign) => assign = Some(voices[i].voice_id.clone()),
+                                Some(RowAction::Preview) => preview = Some(voices[i].clone()),
+                                None => {}
+                            }
                         }
                     });
             });
+        if picker.raise > 0 {
+            picker.raise -= 1;
+            if let Some(r) = &window {
+                ctx.move_to_top(r.response.layer_id);
+            }
+        }
         let key = picker.key.clone();
         if !open {
             self.voice_ui.picker = None;
@@ -842,6 +949,130 @@ mod tests {
         );
         assert!(resolve(&voices, &state, "zz").is_none());
         assert!(resolve(&voices, &state, "").is_none());
+    }
+
+    fn labelled(id: &str) -> VoiceInfo {
+        VoiceInfo {
+            voice_id: id.into(),
+            name: "Bradford - Expressive and Articulate Storyteller".into(),
+            category: Some("professional".into()),
+            labels: [
+                ("gender", "male"),
+                ("age", "middle_aged"),
+                ("accent", "british-essex"),
+                ("descriptive", "professional"),
+                ("use_case", "informative_educational"),
+            ]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+            description: Some("Clipped, authoritative officer with a dry edge. ".repeat(12)),
+            ..Default::default()
+        }
+    }
+
+    /// `show_rows` places the visible rows assuming each takes `ROW_H` plus
+    /// the item spacing; a row that moves the cursor by anything else makes
+    /// rows touch, leaves a gap at the end of the list and jumps while
+    /// scrolling. Its text (name, two description lines, "Used by") must
+    /// fit inside it, and a long name with many chips must not widen the
+    /// text and push ▶ / Assign out of the row, at the picker's narrowest
+    /// and at a wide size.
+    #[test]
+    fn picker_rows_take_their_height_and_their_text_fits() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx, false);
+        let now = PreviewNow::default();
+        let assignments: Vec<(String, String)> =
+            [("narrator", "v1"), ("vale", "v2"), ("voss", "v3")]
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+        let row = RowCtx {
+            now: &now,
+            assignments: &assignments,
+            key: "mara",
+            speaker: "Mara",
+            current: "v2",
+        };
+        let voices: Vec<VoiceInfo> = (1..=3).map(|i| labelled(&format!("v{i}"))).collect();
+        for width in [480.0, 1000.0] {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(width, 700.0),
+                )),
+                ..Default::default()
+            };
+            let mut rows = 0;
+            let mut output = ctx.run_ui(input, |ui| {
+                let spacing = ui.spacing().item_spacing.y;
+                let top = ui.cursor().min.y;
+                for (n, v) in voices.iter().enumerate() {
+                    let out = picker_row(ui, v, &row);
+                    assert_eq!(out.action, None);
+                    let moved = ui.cursor().min.y - top;
+                    assert!(
+                        (moved - (n + 1) as f32 * (ROW_H + spacing)).abs() < 0.01,
+                        "row {n} at width {width}: cursor moved {moved}"
+                    );
+                    assert!(
+                        out.text.max.y <= out.inner.max.y + 0.5,
+                        "width {width}: text {:?} overflows the row {:?}",
+                        out.text,
+                        out.inner
+                    );
+                    assert!(
+                        out.text.height() > 55.0,
+                        "name, two description lines and Used by: {:?}",
+                        out.text
+                    );
+                    assert!(
+                        out.text.max.x <= out.buttons.min.x + 0.5,
+                        "width {width}: text {:?} runs into the buttons {:?}",
+                        out.text,
+                        out.buttons
+                    );
+                    assert!(
+                        out.buttons.max.x <= out.inner.max.x + 0.5 && out.buttons.width() > 60.0,
+                        "width {width}: buttons {:?} outside the row {:?}",
+                        out.buttons,
+                        out.inner
+                    );
+                    rows += 1;
+                }
+            });
+            output.textures_delta.clear();
+            assert!(rows >= 3);
+        }
+    }
+
+    #[test]
+    fn a_list_belongs_to_the_key_it_was_requested_with() {
+        let mut state = VoiceUi {
+            requested_key: Some("old".into()),
+            loading: true,
+            ..Default::default()
+        };
+        // The key changed in Settings while the list was loading.
+        assert!(state.load_finished(Ok(()), "new"), "load again");
+        assert_eq!(state.loaded_key.as_deref(), Some("old"));
+        assert!(!state.loading && state.error.is_none());
+
+        state.requested_key = Some("new".into());
+        assert!(!state.load_finished(Ok(()), "new"));
+        assert_eq!(state.loaded_key.as_deref(), Some("new"));
+
+        // An error for the current key is shown, not retried in a loop.
+        state.requested_key = Some("new".into());
+        assert!(!state.load_finished(Err("HTTP 500".into()), "new"));
+        assert_eq!(state.error.as_deref(), Some("HTTP 500"));
+        // An error for a key that is no longer set is retried with the new one.
+        state.requested_key = Some("typo".into());
+        assert!(state.load_finished(Err("rejected".into()), "fixed"));
+        // The key was removed meanwhile: nothing to load.
+        state.requested_key = Some("gone".into());
+        assert!(!state.load_finished(Ok(()), ""));
     }
 
     #[test]

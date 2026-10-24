@@ -359,22 +359,29 @@ casting.
   `description`, `preview_url`); a voice without `voice_id` is skipped, not
   the page. `category` stays a string. Labels are lowercased by key.
 - **Loading.** When the Voices dialog opens with a key set, once per key (and
-  again after an error); *Refresh* reloads. The list lives in memory only.
+  again after an error); *Refresh* reloads. A list belongs to the key it was
+  requested with; if the key changes while it loads, it is loaded again. The list lives in memory only.
   Errors are shown inline: 401 `missing_permissions` / 403
   `insufficient_permissions` as "the API key lacks the voices_read
   permission", other 401s as a rejected key, network errors without the URL.
 - **Assigned ids outside the list** (a default voice picked earlier, a pasted
   id) are looked up with `GET /v1/voices/{id}` once no text field has focus:
-  found ones show their name, a 404 shows "⚠ unknown id", and other failures
+  found ones show their name, a 404 (or a 400 whose detail is
+  `voice_not_found`, also recorded) shows "⚠ unknown id", and other failures
   leave "not in your voices" (retried on Refresh). The id is always kept as
   typed; generation decides.
 - **Picker** (`app/voice_picker.rs`, logic in `voices.rs`). Search splits the
   query into words, and every word must begin a word of the name,
   category, description, label values or language names (so "male" does not
-  match "female"). Facets (category, gender, age, accent, language) list
+  match "female"); a run-together word also offers its parts ("DeepCalm" →
+  "calm", "Read2024" → "2024"), and the voice id counts as one whole word.
+  Facets (category, gender, age, accent, language) list
   only values present in the loaded voices; languages come from the
   `language` label and `verified_languages`, normalised to codes. The list is
-  virtualised (`show_rows`). *Assign* only edits the open Voices dialog;
+  virtualised (`show_rows`): every row takes exactly its fixed height (its
+  contents go into a child `Ui` that does not move the list's cursor), which
+  is what `show_rows` assumes, and the name line, two description lines and
+  "Used by" fit inside it (a layout test checks both). *Assign* only edits the open Voices dialog;
   *Save* there writes `voice_map` as before. "Used by" counts the dialog's
   current, unsaved rows.
 - **Previews.** Sources in order: `preview_url`, verified-language previews

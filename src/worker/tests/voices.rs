@@ -374,3 +374,114 @@ fn previews_fall_back_to_the_uploaded_sample() {
         "This voice has no preview."
     );
 }
+
+#[test]
+fn voice_paging_stops_on_a_repeated_or_missing_token() {
+    // A server that always says has_more with the same token.
+    let (url, seen) = serve_get(|_| {
+        let body = json!({"voices": [voice_json("v1", "Vale")], "has_more": true, "next_page_token": "same"});
+        (200, body.to_string().into_bytes())
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let lib = Library::new(dir.path().to_path_buf());
+    let (ctx, events) = test_ctx(&lib, "http://unused", &url);
+    rt().block_on(jobs::fetch_voices(&ctx)).unwrap();
+    assert_eq!(paths(&seen).len(), 2, "the repeated token is not followed");
+    assert_eq!(voices_event(&events).unwrap().len(), 1);
+
+    // has_more without a token.
+    let (url, seen) = serve_get(|_| {
+        let body = json!({"voices": [voice_json("v1", "Vale")], "has_more": true, "next_page_token": null});
+        (200, body.to_string().into_bytes())
+    });
+    let (ctx, events) = test_ctx(&lib, "http://unused", &url);
+    rt().block_on(jobs::fetch_voices(&ctx)).unwrap();
+    assert_eq!(paths(&seen).len(), 1);
+    assert_eq!(voices_event(&events).unwrap().len(), 1);
+}
+
+#[test]
+fn a_403_insufficient_permissions_is_a_missing_permission() {
+    let (url, _) = serve_get(|_| {
+        (
+            403,
+            br#"{"detail":{"type":"authorization_error","code":"insufficient_permissions","message":"The API key is missing the permission voices_read"}}"#.to_vec(),
+        )
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let lib = Library::new(dir.path().to_path_buf());
+    let (ctx, events) = test_ctx(&lib, "http://unused", &url);
+    rt().block_on(jobs::fetch_voices(&ctx)).unwrap();
+    let err = voices_event(&events).unwrap_err();
+    assert!(err.contains("lacks the voices_read permission"), "{err}");
+}
+
+#[test]
+fn lookups_treat_a_400_voice_not_found_as_unknown() {
+    let (url, _) = serve_get(|path| {
+        match path {
+        // Recorded for unknown ids, besides the 404.
+        "/voices/gone400" => (
+            400,
+            br#"{"detail":{"status":"voice_not_found","message":"A voice with voice_id 'gone400' was not found."}}"#.to_vec(),
+        ),
+        // Any other 400 says nothing about the voice.
+        "/voices/odd400" => (400, br#"{"detail":{"status":"invalid_request"}}"#.to_vec()),
+        _ => (404, vec![]),
+    }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let lib = Library::new(dir.path().to_path_buf());
+    let (ctx, events) = test_ctx(&lib, "http://unused", &url);
+    let ids = ["gone400", "odd400", "gone404"].map(String::from).to_vec();
+    rt().block_on(jobs::lookup_voices(&ctx, ids)).unwrap();
+    let (found, missing) = events
+        .try_iter()
+        .find_map(|e| match e {
+            Event::VoicesLookedUp { found, missing } => Some((found, missing)),
+            _ => None,
+        })
+        .unwrap();
+    assert!(found.is_empty());
+    assert_eq!(missing, ["gone400", "gone404"]);
+}
+
+#[test]
+fn public_previews_play_without_an_api_key() {
+    let file = preview_file();
+    let served = file.clone();
+    let (url, seen) = serve_get(move |path| {
+        if path.starts_with("/previews/") {
+            (200, served.clone())
+        } else {
+            (500, vec![])
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let lib = Library::new(dir.path().to_path_buf());
+    let (ctx, events) = test_ctx(&lib, "http://unused", &url);
+    ctx.keys.write().unwrap().elevenlabs.clear();
+    let voice = VoiceInfo {
+        voice_id: "lib1".into(),
+        preview_url: Some(format!("{url}/previews/lib1.mp3")),
+        ..Default::default()
+    };
+    rt().block_on(jobs::preview_voice(&ctx, voice, "en".into()))
+        .unwrap();
+    assert!(preview_event(&events).1.is_ok());
+
+    // An uploaded sample needs the key: no request is made without one.
+    let clone = VoiceInfo {
+        voice_id: "clone2".into(),
+        sample: Some(crate::tts::voices::VoiceSample {
+            sample_id: "s1".into(),
+            mime_type: None,
+        }),
+        ..Default::default()
+    };
+    rt().block_on(jobs::preview_voice(&ctx, clone, "en".into()))
+        .unwrap();
+    let err = preview_event(&events).1.unwrap_err();
+    assert!(err.contains("no ElevenLabs API key"), "{err}");
+    assert_eq!(paths(&seen), ["/previews/lib1.mp3"]);
+}

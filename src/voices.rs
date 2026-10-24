@@ -149,8 +149,30 @@ fn words(text: &str) -> impl Iterator<Item = String> + '_ {
         .map(str::to_lowercase)
 }
 
+/// A word and, when it runs words together ("DeepCalm", "Studio2024"), its
+/// parts as well, so "calm" and "2024" find them too.
+fn with_parts(word: &str, out: &mut Vec<String>) {
+    out.push(word.to_lowercase());
+    let chars: Vec<char> = word.chars().collect();
+    let mut start = 0;
+    for i in 1..chars.len() {
+        let (a, b) = (chars[i - 1], chars[i]);
+        let boundary = (a.is_lowercase() && b.is_uppercase())
+            || (a.is_alphabetic() && b.is_numeric())
+            || (a.is_numeric() && b.is_alphabetic());
+        if boundary {
+            out.push(chars[start..i].iter().collect::<String>().to_lowercase());
+            start = i;
+        }
+    }
+    if start > 0 {
+        out.push(chars[start..].iter().collect::<String>().to_lowercase());
+    }
+}
+
 /// The words the search box looks at: name, category, description, label
-/// values and language names.
+/// values and language names, plus the voice id as a whole (a pasted id
+/// finds its voice).
 fn haystack(v: &VoiceInfo) -> Vec<String> {
     let mut parts: Vec<String> = vec![v.name.clone()];
     parts.extend(v.category.clone());
@@ -159,16 +181,23 @@ fn haystack(v: &VoiceInfo) -> Vec<String> {
     for code in Facet::Language.values(v) {
         parts.push(facet_display(Facet::Language, &code));
     }
-    parts
-        .iter()
-        .flat_map(|p| words(p).collect::<Vec<_>>())
-        .collect()
+    let mut out = vec![v.voice_id.to_lowercase()];
+    for p in &parts {
+        for w in p
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+        {
+            with_parts(w, &mut out);
+        }
+    }
+    out
 }
 
 /// Whether a voice passes the filter. Every word of the query must begin a
 /// word (case-insensitively) of the name, labels, description or category,
-/// so "brit" finds "British" and "male" does not find "female"; every chosen
-/// facet value must be one of the voice's.
+/// so "brit" finds "British" and "male" does not find "female" (the parts of
+/// a run-together name count as words: "calm" finds "DeepCalm"); every
+/// chosen facet value must be one of the voice's.
 pub fn matches(v: &VoiceInfo, filter: &Filter) -> bool {
     for f in Facet::ALL {
         if let Some(want) = filter.get(f)
@@ -507,6 +536,34 @@ mod tests {
         assert_eq!(names(&voices, &f), ["Commander Voss"]);
         f.query = "  ".into();
         assert!(!f.is_active());
+    }
+
+    #[test]
+    fn search_finds_run_together_names_and_pasted_ids() {
+        let mut voices = list();
+        voices.push(voice("pDeep0000000000000001", "DeepCalm", "cloned", &[]));
+        voices.push(voice(
+            "cStudio00000000000001",
+            "StudioRead2024",
+            "cloned",
+            &[],
+        ));
+        let mut f = Filter {
+            query: "calm".into(),
+            ..Default::default()
+        };
+        assert_eq!(names(&voices, &f), ["DeepCalm"]);
+        f.query = "deepcalm".into();
+        assert_eq!(names(&voices, &f), ["DeepCalm"]);
+        f.query = "read 2024".into();
+        assert_eq!(names(&voices, &f), ["StudioRead2024"]);
+        f.query = "pDeep0000000000000001".into();
+        assert_eq!(names(&voices, &f), ["DeepCalm"], "a pasted voice id");
+        // Still word starts: no match inside a word or an id.
+        f.query = "eep".into();
+        assert!(names(&voices, &f).is_empty());
+        f.query = "0001".into();
+        assert!(names(&voices, &f).is_empty());
     }
 
     #[test]

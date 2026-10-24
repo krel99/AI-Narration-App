@@ -135,7 +135,9 @@ async fn preview_pcm(
             anyhow::Ok(pcm)
         })
         .await
-        .map_err(|e| e.to_string())?;
+        // A decoder that panics on a malformed file is one bad source, not
+        // the end of the fallback chain.
+        .unwrap_or_else(|e| Err(anyhow!("the decoder failed: {e}")));
         match decoded {
             Ok(pcm) => return Ok(pcm),
             Err(e) => last_error = format!("can't play the preview: {e:#}"),

@@ -71,7 +71,8 @@ voices there on the web, then press *⟳ Refresh*
   kept as you typed it.
 - **Choose a voice for …** lists your voices with their category, labels and
   description. Search matches the start of any word in the name, labels,
-  description or category (`brit narr`); the Category, Gender, Age, Accent
+  description or category (`brit narr`; `calm` also finds *DeepCalm*, and
+  a pasted voice id finds its voice); the Category, Gender, Age, Accent
   and Language filters offer only the values your voices have. *Used by:
   vale, narrator* marks voices other speakers already have. *Assign* puts the
   voice into the dialog; *Save* there keeps it.

@@ -202,14 +202,25 @@ fn check(status: u16, body: &[u8], scope: &'static str) -> Result<(), AccountErr
     })
 }
 
+/// "No such voice": a 404, or a 400 whose `detail` says `voice_not_found`
+/// (both have been recorded for unknown voice ids).
+fn is_voice_not_found(status: u16, body: &[u8]) -> bool {
+    if status == 404 {
+        return true;
+    }
+    if status != 400 {
+        return false;
+    }
+    let v: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+    ["status", "code"]
+        .iter()
+        .any(|k| v["detail"][*k].as_str() == Some("voice_not_found"))
+}
+
 impl ElevenLabsClient {
-    /// GET with the API key; the body, up to `MAX_AUDIO_BYTES`.
-    async fn get_bytes(
-        &self,
-        url: Url,
-        keyed: bool,
-        scope: &'static str,
-    ) -> Result<(u16, Vec<u8>), AccountError> {
+    /// GET (with the API key if `keyed`): the status and the body, up to
+    /// `MAX_AUDIO_BYTES`. The caller checks the status.
+    async fn get_bytes(&self, url: Url, keyed: bool) -> Result<(u16, Vec<u8>), AccountError> {
         let mut req = self.http.get(url).timeout(Duration::from_secs(30));
         if keyed {
             req = req.header("xi-api-key", &self.api_key);
@@ -225,9 +236,6 @@ impl ElevenLabsClient {
         let body = resp.bytes().await.map_err(network)?.to_vec();
         if body.len() > MAX_AUDIO_BYTES {
             return Err(AccountError::Transport("response too large".into()));
-        }
-        if status != 404 {
-            check(status, &body, scope)?;
         }
         Ok((status, body))
     }
@@ -251,7 +259,7 @@ impl ElevenLabsClient {
                     q.append_pair("next_page_token", t);
                 }
             }
-            let (status, body) = self.get_bytes(url, true, "voices_read").await?;
+            let (status, body) = self.get_bytes(url, true).await?;
             check(status, &body, "voices_read")?;
             let v: Value = serde_json::from_slice(&body).map_err(transport)?;
             let page = parse_page(&v);
@@ -290,10 +298,11 @@ impl ElevenLabsClient {
             return Ok(None);
         }
         let url = Url::parse(&format!("{}/voices/{voice_id}", self.base)).map_err(transport)?;
-        let (status, body) = self.get_bytes(url, true, "voices_read").await?;
-        if status == 404 {
+        let (status, body) = self.get_bytes(url, true).await?;
+        if is_voice_not_found(status, &body) {
             return Ok(None);
         }
+        check(status, &body, "voices_read")?;
         let v: Value = serde_json::from_slice(&body).map_err(transport)?;
         Ok(VoiceInfo::from_json(&v))
     }
@@ -305,7 +314,7 @@ impl ElevenLabsClient {
         if !matches!(url.scheme(), "https" | "http") {
             return Err(AccountError::Transport("not an http(s) URL".into()));
         }
-        let (status, body) = self.get_bytes(url, false, "voices_read").await?;
+        let (status, body) = self.get_bytes(url, false).await?;
         check(status, &body, "voices_read")?;
         Ok(body)
     }
@@ -325,7 +334,7 @@ impl ElevenLabsClient {
             self.base
         ))
         .map_err(transport)?;
-        let (status, body) = self.get_bytes(url, true, "voices_read").await?;
+        let (status, body) = self.get_bytes(url, true).await?;
         check(status, &body, "voices_read")?;
         Ok(body)
     }
